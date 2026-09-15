@@ -47,7 +47,7 @@ async def on_message(message):
                     """
 
                     response = gemini_client.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model='gemini-1.5-flash',
                         contents=[image, prompt]
                     )
                     
