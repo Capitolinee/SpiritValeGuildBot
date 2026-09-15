@@ -1,21 +1,40 @@
 import os
 import io
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
 from discord.ext import commands
 from google import genai
 from PIL import Image
 
-# 從環境變數讀取金鑰與 Token
+# --- 1. 背景 HTTP 伺服器（讓 Render Web Service 保持健康連線） ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format, *args):
+        return  # 關閉 HTTP log 保持主控台乾淨
+
+def run_health_check_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# 啟動背景執行緒跑 HTTP Server
+threading.Thread(target=run_health_check_server, daemon=True).start()
+
+# --- 2. 讀取環境變數 ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not GEMINI_API_KEY or not DISCORD_TOKEN:
-    raise ValueError("⚠️ 找不到 GEMINI_API_KEY 或 DISCORD_TOKEN，請檢查環境變數設定！")
+    raise ValueError("⚠️ 找不到 GEMINI_API_KEY 或 DISCORD_TOKEN，請檢查 Environment 變數設定！")
 
-# 初始化 Gemini Client
+# --- 3. 初始化 Gemini Client & Discord Bot ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 初始化 Discord Bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
