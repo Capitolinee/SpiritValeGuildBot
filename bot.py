@@ -170,20 +170,62 @@ def normalize_name(name: str) -> str:
     return normalized
 
 
-def upsert_member(records: dict, name: str, author: str, timestamp: str):
-    """新增或更新一位隊員（依正規化後的名字去重，能自動抓出形似字元造成的重複）。"""
+def find_user_by_character_name(records: dict, name: str):
+    """
+    依角色名字（正規化後）反查是哪個 Discord 使用者登記過這個角色。
+    回傳 (discord_user_id, 登記時的原始名字) 或 (None, None)。
+    """
     target_key = normalize_name(name)
+    profiles = records.get("profiles", {})
+    for user_id, entry in profiles.items():
+        characters = [entry] if isinstance(entry, dict) else entry
+        for c in characters:
+            if normalize_name(c.get("name", "")) == target_key:
+                return user_id, c.get("name")
+    return None, None
+
+
+def get_member_display(m: dict, guild: discord.Guild = None) -> str:
+    """列出隊員時的顯示文字：能對應到 Discord 帳號就顯示 Discord 顯示名稱，否則顯示原始角色名字。"""
+    uid = m.get("discord_user_id")
+    if uid:
+        member = guild.get_member(int(uid)) if guild else None
+        if member:
+            return member.display_name
+        return f"（已離開的使用者 {uid}）"
+    return m.get("name", "未知")
+
+
+def upsert_member(records: dict, name: str, author: str, timestamp: str):
+    """
+    新增或更新一筆出席記錄。
+    如果這個角色名字有對應到已登記的 Discord 帳號，出席次數會記在該帳號上
+    （同一人換不同角色出席也會算同一人）；沒對應到的話就照角色名字去重（含形似字元正規化）。
+    """
+    user_id, _ = find_user_by_character_name(records, name)
+    name_key = normalize_name(name)
+
     for m in records.setdefault("members", []):
-        if normalize_name(m.get("name", "")) == target_key:
+        existing_uid = m.get("discord_user_id")
+        if user_id:
+            if existing_uid == user_id:
+                m["count"] = m.get("count", 1) + 1
+                m["recorded_at"] = timestamp
+                m["recorded_by"] = author
+                m["name"] = name  # 更新成這次辨識到的角色名字（該帳號最近使用的角色）
+                return
+        elif not existing_uid and normalize_name(m.get("name", "")) == name_key:
             m["count"] = m.get("count", 1) + 1
             m["recorded_at"] = timestamp
             m["recorded_by"] = author
             return
+
     records["members"].append({
         "name": name,
         "count": 1,
         "recorded_at": timestamp,
         "recorded_by": author,
+        "discord_user_id": user_id,
     })
 
 
@@ -225,7 +267,7 @@ async def raw_member_list(ctx):
         return
 
     lines = [
-        f"[{i}] {m.get('name', '未知')}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
+        f"[{i}] {get_member_display(m, ctx.guild)}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
         for i, m in enumerate(members)
     ]
     text = "\n".join(lines)
@@ -369,8 +411,8 @@ async def list_members(ctx):
         return
 
     lines = [
-        f"- {m.get('name', '未知')}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
-        for m in sorted(members, key=lambda x: x.get("name", ""))
+        f"- {get_member_display(m, ctx.guild)}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
+        for m in sorted(members, key=lambda x: get_member_display(x, ctx.guild))
     ]
     text = "\n".join(lines)
 
@@ -625,6 +667,46 @@ async def dedupe_members(ctx):
     await ctx.send(f"✅ 已自動合併以下重複記錄：\n```{text}```")
 
 
+@bot.command(name="syncmembers")
+async def sync_members(ctx):
+    """
+    把現有的隊員記錄，依照目前登記的角色資料（!profile）重新對應到 Discord 帳號，
+    並把同一人底下的記錄合併次數。適合在補登角色資料後執行一次。
+    """
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        members = records.get("members", [])
+
+        merged = {}
+        for m in members:
+            uid = m.get("discord_user_id")
+            if not uid:
+                found_uid, _ = find_user_by_character_name(records, m.get("name", ""))
+                uid = found_uid
+
+            key = uid if uid else f"name:{normalize_name(m.get('name', ''))}"
+
+            if key in merged:
+                base = merged[key]
+                base["count"] = base.get("count", 1) + m.get("count", 1)
+                if m.get("recorded_at", "") > base.get("recorded_at", ""):
+                    base["recorded_at"] = m["recorded_at"]
+                    base["recorded_by"] = m.get("recorded_by")
+                    base["name"] = m.get("name", base.get("name"))
+                if uid:
+                    base["discord_user_id"] = uid
+            else:
+                new_entry = dict(m)
+                if uid:
+                    new_entry["discord_user_id"] = uid
+                merged[key] = new_entry
+
+        records["members"] = list(merged.values())
+        await asyncio.to_thread(github_save_records, records, sha, "依角色資料重新同步隊員記錄")
+
+    await ctx.send(f"✅ 已同步完成，目前共 {len(records['members'])} 筆隊員記錄。")
+
+
 @bot.command(name="clearmembers")
 async def clear_members(ctx):
     """清除所有隊員記錄（需二次確認）。"""
@@ -795,25 +877,52 @@ class NameModal(discord.ui.Modal):
         )
 
 
+def get_user_characters(records: dict, user_id: str) -> list:
+    """
+    取得某個 Discord 使用者底下的角色清單（可能有多隻角色）。
+    也相容舊格式（以前一個人只存一筆 dict，不是 list）。
+    """
+    profiles = records.setdefault("profiles", {})
+    entry = profiles.get(user_id)
+    if entry is None:
+        entry = []
+        profiles[user_id] = entry
+    elif isinstance(entry, dict):
+        entry = [entry]
+        profiles[user_id] = entry
+    return entry
+
+
 async def finalize_profile(interaction: discord.Interaction, name: str, job: str, jobs: dict):
-    """把最終選定的名字＋職業寫入 GitHub，並顯示確認卡片。"""
+    """把最終選定的名字＋職業寫入 GitHub。同名角色會更新職業，不同名則新增一隻角色。"""
     info = get_job_info(jobs, job)
     image_url = info.get("image", "")
     now = datetime.now(timezone.utc).isoformat()
+    user_id = str(interaction.user.id)
+    target_key = normalize_name(name)
 
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        records.setdefault("profiles", {})[str(interaction.user.id)] = {
-            "name": name,
-            "job": job,
-            "recorded_at": now,
-        }
+        characters = get_user_characters(records, user_id)
+
+        updated = False
+        for c in characters:
+            if normalize_name(c.get("name", "")) == target_key:
+                c["name"] = name
+                c["job"] = job
+                c["recorded_at"] = now
+                updated = True
+                break
+        if not updated:
+            characters.append({"name": name, "job": job, "recorded_at": now})
+
         await asyncio.to_thread(
-            github_save_records, records, sha, f"設定角色資料：{name}（{job}）"
+            github_save_records, records, sha,
+            f"{'更新' if updated else '新增'}角色資料：{name}（{job}）"
         )
 
     embed = discord.Embed(
-        title="✅ 已設定角色資料",
+        title="✅ 已更新角色資料" if updated else "✅ 已新增角色資料",
         description=f"名字：**{name}**\n職業：**{job}**",
         color=discord.Color.green(),
     )
@@ -897,20 +1006,57 @@ async def set_profile(ctx):
 
 @bot.command(name="profiles")
 async def list_profiles(ctx):
-    """列出目前所有人設定的角色資料。"""
+    """列出目前所有人設定的角色資料（每人可能有多隻角色）。"""
     records, _ = await asyncio.to_thread(github_get_records)
     profiles = records.get("profiles", {})
     if not profiles:
         await ctx.send("目前還沒有人設定角色資料，用 `!profile` 開始設定。")
         return
 
-    lines = [
-        f"<@{user_id}>：{p.get('name')}（{p.get('job')}）"
-        for user_id, p in profiles.items()
-    ]
+    lines = []
+    for user_id, entry in profiles.items():
+        characters = [entry] if isinstance(entry, dict) else entry
+        if not characters:
+            continue
+        char_text = "、".join(f"{c.get('name')}（{c.get('job')}）" for c in characters)
+        lines.append(f"<@{user_id}>：{char_text}")
+
     text = "\n".join(lines)
     for i in range(0, len(text), 1800):
         await ctx.send(f"**🧑‍🤝‍🧑 角色資料：**\n{text[i:i+1800]}")
+
+
+@bot.command(name="myprofiles")
+async def my_profiles(ctx):
+    """列出自己名下的所有角色（含編號，供 !delprofile 刪除使用）。"""
+    records, _ = await asyncio.to_thread(github_get_records)
+    characters = get_user_characters(records, str(ctx.author.id))
+    if not characters:
+        await ctx.send("你還沒有設定任何角色，用 `!profile` 開始設定。")
+        return
+
+    lines = [
+        f"[{i}] {c.get('name')}（{c.get('job')}）"
+        for i, c in enumerate(characters)
+    ]
+    await ctx.send("**🧑 你目前的角色：**\n```" + "\n".join(lines) + "```")
+
+
+@bot.command(name="delprofile")
+async def delete_profile(ctx, index: int):
+    """刪除自己名下指定編號的角色。用法：!delprofile 0（編號用 !myprofiles 查）"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        characters = get_user_characters(records, str(ctx.author.id))
+        if index < 0 or index >= len(characters):
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !myprofiles 確認編號。")
+            return
+        removed = characters.pop(index)
+        await asyncio.to_thread(
+            github_save_records, records, sha,
+            f"刪除角色：{removed.get('name')}（{removed.get('job')}）"
+        )
+    await ctx.send(f"🗑️ 已刪除角色：{removed.get('name')}（{removed.get('job')}）")
 
 
 @bot.event
