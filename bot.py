@@ -506,6 +506,83 @@ class ConfirmView(discord.ui.View):
                 pass
 
 
+class ClearConfirmView(discord.ui.View):
+    """清除資料前的二次確認按鈕。"""
+
+    def __init__(self, target: str, author_id: int):
+        super().__init__(timeout=60)
+        self.target = target  # "members" / "items" / "all"
+        self.author_id = author_id
+        self.confirmed = False
+        self.message: discord.Message | None = None
+
+    @discord.ui.button(label="🗑️ 確定清除", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("只有發起清除的人可以確認喔。", ephemeral=True)
+            return
+
+        async with github_lock:
+            records, sha = await asyncio.to_thread(github_get_records)
+            if self.target == "members":
+                records["members"] = []
+                commit_msg = "清除所有隊員記錄"
+                reply = "🗑️ 已清除所有隊員記錄。"
+            elif self.target == "items":
+                records["items"] = []
+                commit_msg = "清除所有寶物記錄"
+                reply = "🗑️ 已清除所有寶物記錄。"
+            else:
+                records["members"] = []
+                records["items"] = []
+                commit_msg = "清除所有記錄（隊員＋寶物）"
+                reply = "🗑️ 已清除所有隊員與寶物記錄。"
+            await asyncio.to_thread(github_save_records, records, sha, commit_msg)
+
+        self.confirmed = True
+        await interaction.response.edit_message(content=reply, view=None)
+        self.stop()
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("只有發起清除的人可以取消喔。", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="已取消，資料沒有被清除。", view=None)
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message and not self.confirmed:
+            try:
+                await self.message.edit(content="⏰ 已逾時，未進行清除。", view=None)
+            except Exception:
+                pass
+
+
+@bot.command(name="clearmembers")
+async def clear_members(ctx):
+    """清除所有隊員記錄（需二次確認）。"""
+    view = ClearConfirmView("members", ctx.author.id)
+    sent = await ctx.send("⚠️ 確定要清除**所有隊員記錄**嗎？此動作無法復原。", view=view)
+    view.message = sent
+
+
+@bot.command(name="clearitems")
+async def clear_items(ctx):
+    """清除所有寶物記錄（需二次確認）。"""
+    view = ClearConfirmView("items", ctx.author.id)
+    sent = await ctx.send("⚠️ 確定要清除**所有寶物記錄**嗎？此動作無法復原。", view=view)
+    view.message = sent
+
+
+@bot.command(name="clearall")
+async def clear_all(ctx):
+    """清除所有隊員與寶物記錄（需二次確認）。"""
+    view = ClearConfirmView("all", ctx.author.id)
+    sent = await ctx.send("⚠️ 確定要清除**所有隊員與寶物記錄**嗎？此動作無法復原。", view=view)
+    view.message = sent
+
+
 @bot.event
 async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
