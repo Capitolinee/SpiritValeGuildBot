@@ -53,6 +53,7 @@ GEMINI_MODEL = "gemini-3.6-flash"
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # 需要在 Discord Developer Portal 開啟「Server Members Intent」，見部署說明
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # 同一時間只允許一個寫入動作，避免多筆訊息同時寫入 GitHub 造成 sha 衝突
@@ -185,15 +186,30 @@ def find_user_by_character_name(records: dict, name: str):
     return None, None
 
 
-def get_member_display(m: dict, guild: discord.Guild = None) -> str:
-    """列出隊員時的顯示文字：能對應到 Discord 帳號就顯示 Discord 顯示名稱，否則顯示原始角色名字。"""
+async def resolve_member_display(m: dict, guild: discord.Guild = None) -> str:
+    """
+    列出隊員時的顯示文字：能對應到 Discord 帳號就顯示 Discord 顯示名稱，否則顯示原始角色名字。
+    ID 一律是唯一、不會變動的識別碼；改暱稱不影響對應關係。
+    """
     uid = m.get("discord_user_id")
-    if uid:
-        member = guild.get_member(int(uid)) if guild else None
-        if member:
-            return member.display_name
+    if not uid:
+        return m.get("name", "未知")
+
+    if not guild:
+        return f"（使用者 {uid}）"
+
+    member = guild.get_member(int(uid))
+    if member:
+        return member.display_name
+
+    # 快取裡沒有，不代表這個人真的離開了，直接跟 Discord API 確認一次
+    try:
+        member = await guild.fetch_member(int(uid))
+        return member.display_name
+    except discord.NotFound:
         return f"（已離開的使用者 {uid}）"
-    return m.get("name", "未知")
+    except Exception:
+        return f"（使用者 {uid}）"
 
 
 def upsert_member(records: dict, name: str, author: str, timestamp: str):
@@ -266,10 +282,10 @@ async def raw_member_list(ctx):
         await ctx.send("目前還沒有任何隊員記錄。")
         return
 
-    lines = [
-        f"[{i}] {get_member_display(m, ctx.guild)}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
-        for i, m in enumerate(members)
-    ]
+    lines = []
+    for i, m in enumerate(members):
+        display = await resolve_member_display(m, ctx.guild)
+        lines.append(f"[{i}] {display}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）")
     text = "\n".join(lines)
     for i in range(0, len(text), 1800):
         await ctx.send(f"**📋 隊員記錄：**\n```{text[i:i+1800]}```")
@@ -410,9 +426,13 @@ async def list_members(ctx):
         await ctx.send("目前還沒有任何隊員記錄。")
         return
 
+    display_map = {}
+    for m in members:
+        display_map[id(m)] = await resolve_member_display(m, ctx.guild)
+
     lines = [
-        f"- {get_member_display(m, ctx.guild)}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
-        for m in sorted(members, key=lambda x: get_member_display(x, ctx.guild))
+        f"- {display_map[id(m)]}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
+        for m in sorted(members, key=lambda x: display_map[id(x)])
     ]
     text = "\n".join(lines)
 
