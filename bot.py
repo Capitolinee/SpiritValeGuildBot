@@ -109,7 +109,7 @@ def github_get_records():
 
     data.setdefault("members", [])
     data.setdefault("items", [])
-    data.setdefault("jobs", {})       # {"職業名稱": "圖片網址"}
+    data.setdefault("jobs", {})       # {"職業名稱": {"tier": int, "parent": str|None, "image": str}}
     data.setdefault("profiles", {})   # {"discord_user_id": {"name":..., "job":..., "recorded_at":...}}
     return data, sha
 
@@ -649,18 +649,72 @@ async def clear_all(ctx):
     view.message = sent
 
 
+def get_job_info(jobs: dict, name: str) -> dict:
+    """相容處理：舊版本可能把職業存成單純的圖片網址字串，這裡統一轉成 dict 格式。"""
+    info = jobs.get(name, {})
+    if isinstance(info, str):
+        return {"tier": 1, "parent": None, "image": info}
+    return info
+
+
+def get_tier1_jobs(jobs: dict) -> list:
+    return [n for n in jobs if get_job_info(jobs, n).get("tier", 1) == 1]
+
+
+def get_children_jobs(jobs: dict, parent_name: str) -> list:
+    return [n for n in jobs if get_job_info(jobs, n).get("parent") == parent_name]
+
+
 @bot.command(name="addjob")
-async def add_job(ctx, job_name: str, image_url: str = None):
-    """新增或更新一個職業設定，圖片網址可以先不填。用法：!addjob 戰士 [圖片網址]"""
+async def add_job(ctx, job_name: str, *, options: str = ""):
+    """
+    新增或更新職業，可設定轉職層級與上一轉職業。
+    用法範例：
+    !addjob 戰士 tier=1
+    !addjob 聖騎士 tier=2 parent=戰士
+    !addjob 聖騎士 tier=2 parent=戰士 image=https://.../paladin.png
+    （tier 預設為 1，image 可留空之後再補）
+    """
+    opts = {}
+    for token in options.split():
+        if "=" in token:
+            k, v = token.split("=", 1)
+            opts[k.strip().lower()] = v.strip()
+
+    try:
+        tier = int(opts.get("tier", 1))
+    except ValueError:
+        await ctx.send("⚠️ tier 必須是數字，例如 tier=1、tier=2。")
+        return
+
+    parent = opts.get("parent")
+    image_url = opts.get("image")
+
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        records.setdefault("jobs", {})[job_name] = image_url or ""
-        await asyncio.to_thread(github_save_records, records, sha, f"新增/更新職業設定：{job_name}")
+        jobs = records.setdefault("jobs", {})
 
-    if image_url:
-        await ctx.send(f"✅ 已設定職業「{job_name}」（含圖片）。")
-    else:
-        await ctx.send(f"✅ 已新增職業「{job_name}」（尚未設定圖片，之後可以用 `!addjob {job_name} 圖片網址` 補上）。")
+        if tier > 1 and not parent:
+            await ctx.send("⚠️ 第 2 轉以上的職業需要指定 `parent=上一轉職業`，例如：`!addjob 聖騎士 tier=2 parent=戰士`")
+            return
+
+        if parent and parent not in jobs:
+            await ctx.send(f"⚠️ 找不到上一轉職業「{parent}」，請先用 !jobs 確認名稱，或先建立那個職業。")
+            return
+
+        existing = get_job_info(jobs, job_name)
+        jobs[job_name] = {
+            "tier": tier,
+            "parent": parent,
+            "image": image_url if image_url is not None else existing.get("image", ""),
+        }
+        await asyncio.to_thread(
+            github_save_records, records, sha,
+            f"設定職業：{job_name}（第{tier}轉{f'，承接自 {parent}' if parent else ''}）"
+        )
+
+    detail = f"第 {tier} 轉" + (f"，承接自「{parent}」" if parent else "")
+    await ctx.send(f"✅ 已設定職業「{job_name}」（{detail}）。")
 
 
 @bot.command(name="deljob")
@@ -672,6 +726,15 @@ async def del_job(ctx, job_name: str):
         if job_name not in jobs:
             await ctx.send(f"⚠️ 找不到職業「{job_name}」，用 !jobs 確認目前有哪些職業。")
             return
+
+        children = get_children_jobs(jobs, job_name)
+        if children:
+            await ctx.send(
+                f"⚠️ 「{job_name}」還有下一轉職業（{', '.join(children)}）承接自它，"
+                f"請先處理那些職業（改設定或刪除）後再刪除「{job_name}」。"
+            )
+            return
+
         del jobs[job_name]
         await asyncio.to_thread(github_save_records, records, sha, f"刪除職業設定：{job_name}")
     await ctx.send(f"🗑️ 已刪除職業「{job_name}」。")
@@ -679,14 +742,26 @@ async def del_job(ctx, job_name: str):
 
 @bot.command(name="jobs")
 async def list_jobs(ctx):
-    """列出目前設定的所有職業。"""
+    """列出目前設定的職業樹（依轉職層級分組）。"""
     records, _ = await asyncio.to_thread(github_get_records)
     jobs = records.get("jobs", {})
     if not jobs:
-        await ctx.send("目前還沒有設定任何職業，用 `!addjob 職業名稱 圖片網址` 新增第一個職業。")
+        await ctx.send("目前還沒有設定任何職業，用 `!addjob 職業名稱 tier=1` 新增第一個職業。")
         return
-    lines = "\n".join(f"- {name}" for name in jobs)
-    await ctx.send(f"**⚔️ 目前設定的職業：**\n```{lines}```")
+
+    by_tier = {}
+    for name in jobs:
+        info = get_job_info(jobs, name)
+        by_tier.setdefault(info.get("tier", 1), []).append((name, info.get("parent")))
+
+    lines = []
+    for tier in sorted(by_tier):
+        lines.append(f"【第 {tier} 轉】")
+        for name, parent in sorted(by_tier[tier]):
+            suffix = f"（承接自 {parent}）" if parent else ""
+            lines.append(f"  - {name}{suffix}")
+    text = "\n".join(lines)
+    await ctx.send(f"**⚔️ 職業樹：**\n```{text}```")
 
 
 class NameModal(discord.ui.Modal):
@@ -709,7 +784,7 @@ class NameModal(discord.ui.Modal):
 
         if not jobs:
             await interaction.response.send_message(
-                "⚠️ 目前還沒有設定任何職業，請先請管理員用 `!addjob 職業名稱 圖片網址` 新增職業。",
+                "⚠️ 目前還沒有設定任何職業，請先請管理員用 `!addjob 職業名稱 tier=1` 新增職業。",
                 ephemeral=True,
             )
             return
@@ -720,45 +795,80 @@ class NameModal(discord.ui.Modal):
         )
 
 
+async def finalize_profile(interaction: discord.Interaction, name: str, job: str, jobs: dict):
+    """把最終選定的名字＋職業寫入 GitHub，並顯示確認卡片。"""
+    info = get_job_info(jobs, job)
+    image_url = info.get("image", "")
+    now = datetime.now(timezone.utc).isoformat()
+
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("profiles", {})[str(interaction.user.id)] = {
+            "name": name,
+            "job": job,
+            "recorded_at": now,
+        }
+        await asyncio.to_thread(
+            github_save_records, records, sha, f"設定角色資料：{name}（{job}）"
+        )
+
+    embed = discord.Embed(
+        title="✅ 已設定角色資料",
+        description=f"名字：**{name}**\n職業：**{job}**",
+        color=discord.Color.green(),
+    )
+    if image_url:
+        embed.set_thumbnail(url=image_url)
+
+    await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+
 class JobSelect(discord.ui.Select):
-    def __init__(self, name: str, jobs: dict):
-        # Discord 下拉選單最多 25 個選項
-        options = [discord.SelectOption(label=job) for job in list(jobs.keys())[:25]]
-        super().__init__(placeholder="選擇職業", options=options, min_values=1, max_values=1)
+    """
+    職業選單。current_job=None 時列出所有第一轉職業；
+    否則列出 current_job 的下一轉選項，並附上「維持目前職業」選項。
+    """
+
+    def __init__(self, name: str, jobs: dict, current_job: str = None):
         self.name = name
         self.jobs = jobs
+        self.current_job = current_job
+
+        if current_job is None:
+            candidates = get_tier1_jobs(jobs)
+            placeholder = "選擇你的職業（第一轉）"
+        else:
+            candidates = get_children_jobs(jobs, current_job)
+            placeholder = f"選擇「{current_job}」的下一轉（或維持不轉職）"
+
+        options = [discord.SelectOption(label=c) for c in candidates[:24]]
+        if current_job is not None:
+            options.append(discord.SelectOption(label=f"維持「{current_job}」，不再轉職", value="__STOP__"))
+
+        super().__init__(placeholder=placeholder, options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        job = self.values[0]
-        image_url = self.jobs.get(job)
-        now = datetime.now(timezone.utc).isoformat()
+        chosen = self.values[0]
 
-        async with github_lock:
-            records, sha = await asyncio.to_thread(github_get_records)
-            records.setdefault("profiles", {})[str(interaction.user.id)] = {
-                "name": self.name,
-                "job": job,
-                "recorded_at": now,
-            }
-            await asyncio.to_thread(
-                github_save_records, records, sha, f"設定角色資料：{self.name}（{job}）"
+        if chosen == "__STOP__":
+            await finalize_profile(interaction, self.name, self.current_job, self.jobs)
+            return
+
+        children = get_children_jobs(self.jobs, chosen)
+        if children:
+            view = JobSelectView(self.name, self.jobs, current_job=chosen)
+            await interaction.response.edit_message(
+                content=f"名字：**{self.name}**\n已選擇：**{chosen}**\n請選擇下一轉職業，或維持目前職業：",
+                view=view,
             )
-
-        embed = discord.Embed(
-            title="✅ 已設定角色資料",
-            description=f"名字：**{self.name}**\n職業：**{job}**",
-            color=discord.Color.green(),
-        )
-        if image_url:
-            embed.set_thumbnail(url=image_url)
-
-        await interaction.response.edit_message(content=None, embed=embed, view=None)
+        else:
+            await finalize_profile(interaction, self.name, chosen, self.jobs)
 
 
 class JobSelectView(discord.ui.View):
-    def __init__(self, name: str, jobs: dict):
+    def __init__(self, name: str, jobs: dict, current_job: str = None):
         super().__init__(timeout=120)
-        self.add_item(JobSelect(name, jobs))
+        self.add_item(JobSelect(name, jobs, current_job=current_job))
 
 
 class StartProfileView(discord.ui.View):
