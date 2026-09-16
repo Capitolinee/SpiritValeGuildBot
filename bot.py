@@ -143,6 +143,67 @@ def parse_gemini_json(raw_text: str) -> dict:
     return json.loads(cleaned)
 
 
+@bot.command(name="members")
+async def list_members(ctx):
+    """查詢目前記錄的隊員名單。"""
+    try:
+        records, _ = await asyncio.to_thread(github_get_records)
+    except requests.HTTPError as e:
+        await ctx.send(f"❌ 讀取記錄失敗：{e}")
+        return
+
+    members = records.get("members", [])
+    if not members:
+        await ctx.send("目前還沒有任何隊員記錄。")
+        return
+
+    # 統計每個名字被記錄的次數，並列出最近一次記錄時間
+    summary = {}
+    for m in members:
+        name = m.get("name", "未知")
+        summary.setdefault(name, {"count": 0, "last_seen": m.get("recorded_at", "")})
+        summary[name]["count"] += 1
+        if m.get("recorded_at", "") > summary[name]["last_seen"]:
+            summary[name]["last_seen"] = m.get("recorded_at", "")
+
+    lines = [
+        f"- {name}（出現 {info['count']} 次，最近：{info['last_seen'][:10]}）"
+        for name, info in sorted(summary.items())
+    ]
+    text = "\n".join(lines)
+
+    # Discord 單則訊息有長度限制，太長就分段送
+    for i in range(0, len(text), 1800):
+        await ctx.send(f"**👥 隊員名單（共 {len(summary)} 人）：**\n```{text[i:i+1800]}```")
+
+
+@bot.command(name="items")
+async def list_items(ctx):
+    """查詢目前記錄的寶物數量統計。"""
+    try:
+        records, _ = await asyncio.to_thread(github_get_records)
+    except requests.HTTPError as e:
+        await ctx.send(f"❌ 讀取記錄失敗：{e}")
+        return
+
+    items = records.get("items", [])
+    if not items:
+        await ctx.send("目前還沒有任何寶物記錄。")
+        return
+
+    totals = {}
+    for it in items:
+        name = it.get("item", "未知")
+        amount = it.get("amount", 1) or 1
+        totals[name] = totals.get(name, 0) + amount
+
+    lines = [f"- {name} x{amount}" for name, amount in sorted(totals.items(), key=lambda x: -x[1])]
+    text = "\n".join(lines)
+
+    for i in range(0, len(text), 1800):
+        await ctx.send(f"**💎 寶物總計（{len(totals)} 種）：**\n```{text[i:i+1800]}```")
+
+
 @bot.event
 async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
