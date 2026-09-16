@@ -143,6 +143,151 @@ def parse_gemini_json(raw_text: str) -> dict:
     return json.loads(cleaned)
 
 
+@bot.command(name="memberlist")
+async def raw_member_list(ctx):
+    """列出隊員的原始記錄（含編號，供修改／刪除使用）。"""
+    try:
+        records, _ = await asyncio.to_thread(github_get_records)
+    except requests.HTTPError as e:
+        await ctx.send(f"❌ 讀取記錄失敗：{e}")
+        return
+
+    members = records.get("members", [])
+    if not members:
+        await ctx.send("目前還沒有任何隊員記錄。")
+        return
+
+    lines = [
+        f"[{i}] {m.get('name', '未知')}（{m.get('recorded_at', '')[:10]}）"
+        for i, m in enumerate(members)
+    ]
+    text = "\n".join(lines)
+    for i in range(0, len(text), 1800):
+        await ctx.send(f"**📋 隊員原始記錄：**\n```{text[i:i+1800]}```")
+
+
+@bot.command(name="itemlist")
+async def raw_item_list(ctx):
+    """列出寶物的原始記錄（含編號，供修改／刪除使用）。"""
+    try:
+        records, _ = await asyncio.to_thread(github_get_records)
+    except requests.HTTPError as e:
+        await ctx.send(f"❌ 讀取記錄失敗：{e}")
+        return
+
+    items = records.get("items", [])
+    if not items:
+        await ctx.send("目前還沒有任何寶物記錄。")
+        return
+
+    lines = [
+        f"[{i}] {it.get('item', '未知')} x{it.get('amount', 1)}（{it.get('recorded_at', '')[:10]}）"
+        for i, it in enumerate(items)
+    ]
+    text = "\n".join(lines)
+    for i in range(0, len(text), 1800):
+        await ctx.send(f"**📋 寶物原始記錄：**\n```{text[i:i+1800]}```")
+
+
+@bot.command(name="editmember")
+async def edit_member(ctx, index: int, *, new_name: str):
+    """修改指定編號的隊員名字。用法：!editmember 3 正確的名字"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        members = records.get("members", [])
+        if index < 0 or index >= len(members):
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !memberlist 確認編號。")
+            return
+        old_name = members[index].get("name")
+        members[index]["name"] = new_name
+        await asyncio.to_thread(
+            github_save_records, records, sha, f"修正隊員 [{index}]：{old_name} → {new_name}"
+        )
+    await ctx.send(f"✅ 已將 [{index}] 的「{old_name}」改為「{new_name}」")
+
+
+@bot.command(name="delmember")
+async def delete_member(ctx, index: int):
+    """刪除指定編號的隊員記錄。用法：!delmember 3"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        members = records.get("members", [])
+        if index < 0 or index >= len(members):
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !memberlist 確認編號。")
+            return
+        removed = members.pop(index)
+        await asyncio.to_thread(
+            github_save_records, records, sha, f"刪除隊員 [{index}]：{removed.get('name')}"
+        )
+    await ctx.send(f"🗑️ 已刪除 [{index}]：{removed.get('name')}")
+
+
+@bot.command(name="addmember")
+async def add_member(ctx, *, name: str):
+    """手動新增一筆隊員記錄。用法：!addmember 隊員名字"""
+    now = datetime.now(timezone.utc).isoformat()
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("members", []).append({
+            "name": name,
+            "recorded_at": now,
+            "recorded_by": str(ctx.author),
+        })
+        await asyncio.to_thread(github_save_records, records, sha, f"手動新增隊員：{name}")
+    await ctx.send(f"✅ 已新增隊員：{name}")
+
+
+@bot.command(name="edititem")
+async def edit_item(ctx, index: int, new_amount: int, *, new_name: str):
+    """修改指定編號的寶物名稱與數量。用法：!edititem 2 5 正確的寶物名稱"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        items = records.get("items", [])
+        if index < 0 or index >= len(items):
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !itemlist 確認編號。")
+            return
+        old = f"{items[index].get('item')} x{items[index].get('amount')}"
+        items[index]["item"] = new_name
+        items[index]["amount"] = new_amount
+        await asyncio.to_thread(
+            github_save_records, records, sha, f"修正寶物 [{index}]：{old} → {new_name} x{new_amount}"
+        )
+    await ctx.send(f"✅ 已將 [{index}] 改為「{new_name} x{new_amount}」")
+
+
+@bot.command(name="delitem")
+async def delete_item(ctx, index: int):
+    """刪除指定編號的寶物記錄。用法：!delitem 2"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        items = records.get("items", [])
+        if index < 0 or index >= len(items):
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !itemlist 確認編號。")
+            return
+        removed = items.pop(index)
+        await asyncio.to_thread(
+            github_save_records, records, sha,
+            f"刪除寶物 [{index}]：{removed.get('item')} x{removed.get('amount')}"
+        )
+    await ctx.send(f"🗑️ 已刪除 [{index}]：{removed.get('item')} x{removed.get('amount')}")
+
+
+@bot.command(name="additem")
+async def add_item(ctx, amount: int, *, name: str):
+    """手動新增一筆寶物記錄。用法：!additem 3 寶物名稱"""
+    now = datetime.now(timezone.utc).isoformat()
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("items", []).append({
+            "item": name,
+            "amount": amount,
+            "recorded_at": now,
+            "recorded_by": str(ctx.author),
+        })
+        await asyncio.to_thread(github_save_records, records, sha, f"手動新增寶物：{name} x{amount}")
+    await ctx.send(f"✅ 已新增寶物：{name} x{amount}")
+
+
 @bot.command(name="members")
 async def list_members(ctx):
     """查詢目前記錄的隊員名單。"""
