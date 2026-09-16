@@ -975,6 +975,49 @@ async def show_pending(ctx):
     await ctx.send(f"**💰 待領取分潤，共 {total:.2f}：**\n```{text}```")
 
 
+@bot.command(name="unclaimed")
+async def show_unclaimed(ctx):
+    """查看目前頻道進行中場次裡，還有誰沒領錢。"""
+    records, _ = await asyncio.to_thread(github_get_records)
+    session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+    if not session_id:
+        await ctx.send("目前這個頻道沒有進行中的場次。")
+        return
+    session = get_session(records, session_id)
+    if not session:
+        await ctx.send("找不到場次資料。")
+        return
+
+    pending = {}
+    for it in session.get("items", []):
+        if not it.get("sold"):
+            continue
+        for key, claimed in it.get("claims", {}).items():
+            if not claimed:
+                pending[key] = pending.get(key, 0) + (it.get("per_person") or 0)
+
+    if not pending:
+        await ctx.send("✅ 這個場次目前沒有人有待領款項（可能都領完了，或還沒有寶物賣出）。")
+        return
+
+    lines = []
+    for key, amount in pending.items():
+        if key.startswith("raw:"):
+            display = f"{key[4:]}（未綁定 Discord 帳號，需人工處理）"
+        else:
+            member = ctx.guild.get_member(int(key)) if ctx.guild else None
+            if not member and ctx.guild:
+                try:
+                    member = await ctx.guild.fetch_member(int(key))
+                except Exception:
+                    member = None
+            display = member.display_name if member else f"（使用者 {key}）"
+        lines.append(f"- {display}：{amount:.2f}")
+
+    text = "\n".join(lines)
+    await ctx.send(f"**💸 尚未領款：**\n```{text}```")
+
+
 @bot.command(name="clearmembers")
 async def clear_members(ctx):
     """清除所有隊員記錄（需二次確認）。"""
