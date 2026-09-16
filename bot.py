@@ -42,6 +42,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}")
+    # 列出目前金鑰可用的模型（僅供除錯用）
+    for m in gemini_client.models.list():
+        print(m.name, getattr(m, "supported_actions", None))
 
 @bot.event
 async def on_message(message):
@@ -65,10 +68,15 @@ async def on_message(message):
                     如果圖片中沒有寶物資訊，請回傳空陣列 []。不要包含任何 Markdown 標記或額外說明。
                     """
 
-                    response = gemini_client.models.generate_content(
-                        model='gemini-2.5-flash',
-                        contents=[image, prompt]
+                    response = gemini_client.interactions.create(
+                        model="gemini-3.6-flash",
+                        input=[
+                            {"type": "text", "text": prompt},
+                            {"type": "image", "image": image},  # 視 SDK 版本，可能需要傳 bytes/base64
+                        ],
                     )
+                    
+                    result_text = response.output_text.strip()
                     
                     result_text = response.text.strip()
                     await message.channel.send(f"**辨識結果：**\n```{result_text}```")
