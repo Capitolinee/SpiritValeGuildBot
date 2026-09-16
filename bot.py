@@ -650,13 +650,17 @@ async def clear_all(ctx):
 
 
 @bot.command(name="addjob")
-async def add_job(ctx, job_name: str, image_url: str):
-    """新增或更新一個職業設定（含圖片）。用法：!addjob 戰士 https://.../warrior.png"""
+async def add_job(ctx, job_name: str, image_url: str = None):
+    """新增或更新一個職業設定，圖片網址可以先不填。用法：!addjob 戰士 [圖片網址]"""
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        records.setdefault("jobs", {})[job_name] = image_url
+        records.setdefault("jobs", {})[job_name] = image_url or ""
         await asyncio.to_thread(github_save_records, records, sha, f"新增/更新職業設定：{job_name}")
-    await ctx.send(f"✅ 已設定職業「{job_name}」，之後 !profile 的下拉選單就會出現這個選項。")
+
+    if image_url:
+        await ctx.send(f"✅ 已設定職業「{job_name}」（含圖片）。")
+    else:
+        await ctx.send(f"✅ 已新增職業「{job_name}」（尚未設定圖片，之後可以用 `!addjob {job_name} 圖片網址` 補上）。")
 
 
 @bot.command(name="deljob")
@@ -797,6 +801,24 @@ async def list_profiles(ctx):
     text = "\n".join(lines)
     for i in range(0, len(text), 1800):
         await ctx.send(f"**🧑‍🤝‍🧑 角色資料：**\n{text[i:i+1800]}")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    """全域指令錯誤處理：讓錯誤直接顯示在 Discord，而不是只默默記錄在 Render log。"""
+    if isinstance(error, commands.CommandNotFound):
+        return  # 忽略打錯的指令名稱
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"⚠️ 缺少必要參數：`{error.param.name}`，請確認指令用法。")
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(f"⚠️ 參數格式錯誤：{error}")
+        return
+
+    # 其他未預期的錯誤，把細節印到 Render log 方便除錯，同時回報到 Discord
+    original = getattr(error, "original", error)
+    print(f"⚠️ 指令錯誤（{ctx.command}）：{original!r}", flush=True)
+    await ctx.send(f"❌ 執行 `{ctx.command}` 時發生錯誤：{original}")
 
 
 @bot.event
