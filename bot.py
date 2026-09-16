@@ -1,12 +1,16 @@
 import os
-import io
+import json
 import base64
 import mimetypes
 import threading
+import asyncio
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
 import discord
 from discord.ext import commands
 from google import genai
+import requests
 
 # --- 1. 背景 HTTP 伺服器（讓 Render Web Service 保持健康連線） ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -23,44 +27,130 @@ def run_health_check_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# 啟動背景執行緒跑 HTTP Server
 threading.Thread(target=run_health_check_server, daemon=True).start()
 
 # --- 2. 讀取環境變數 ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")          # 格式："你的帳號/repo名稱"
+GITHUB_FILE_PATH = os.getenv("GITHUB_FILE_PATH", "data/records.json")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 
-if not GEMINI_API_KEY or not DISCORD_TOKEN:
-    raise ValueError("⚠️ 找不到 GEMINI_API_KEY 或 DISCORD_TOKEN，請檢查 Environment 變數設定！")
+required_env = {
+    "GEMINI_API_KEY": GEMINI_API_KEY,
+    "DISCORD_TOKEN": DISCORD_TOKEN,
+    "GITHUB_TOKEN": GITHUB_TOKEN,
+    "GITHUB_REPO": GITHUB_REPO,
+}
+missing = [k for k, v in required_env.items() if not v]
+if missing:
+    raise ValueError(f"⚠️ 缺少環境變數：{', '.join(missing)}，請檢查 Render 的 Environment 設定！")
 
 # --- 3. 初始化 Gemini Client & Discord Bot ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# 使用的模型名稱（Gemini 2.5 系列已對新用戶關閉，改用 3.6 Flash）
 GEMINI_MODEL = "gemini-3.6-flash"
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# 同一時間只允許一個寫入動作，避免多筆訊息同時寫入 GitHub 造成 sha 衝突
+github_lock = asyncio.Lock()
+
 PROMPT = """
-你是一個遊戲掉落紀錄助手。請讀取這張圖片中的文字（包含繁體中文與英文），
-只提取寶物名稱與數量。
-請直接回傳 JSON 格式，格式範例如下：
-[{"item": "寶物名稱", "amount": 1}]
-如果圖片中沒有寶物資訊，請回傳空陣列 []。不要包含任何 Markdown 標記或額外說明。
+你是一個遊戲紀錄助手。請判斷這張圖片的內容類型，並依照下列規則回傳「純 JSON」，
+不要包含任何 Markdown 標記（例如 ```json）或額外說明文字：
+
+1. 如果圖片是「隊員名單／成員列表」，回傳：
+{"type": "member", "data": ["隊員名字1", "隊員名字2"]}
+
+2. 如果圖片是「掉落寶物記錄」，回傳：
+{"type": "item", "data": [{"item": "寶物名稱", "amount": 1}]}
+
+3. 如果兩者都不是，或圖片內容無法辨識，回傳：
+{"type": "unknown", "data": []}
+
+請完整讀取圖片中的繁體中文與英文文字後再判斷與提取。
 """
+
+
+def _github_api_url() -> str:
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+
+
+def _github_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def github_get_records():
+    """從 GitHub 讀取現有的 JSON 記錄，回傳 (data_dict, sha)。檔案不存在時回傳空結構與 sha=None。"""
+    resp = requests.get(
+        _github_api_url(),
+        headers=_github_headers(),
+        params={"ref": GITHUB_BRANCH},
+        timeout=15,
+    )
+    if resp.status_code == 404:
+        return {"members": [], "items": []}, None
+
+    resp.raise_for_status()
+    payload = resp.json()
+    content = base64.b64decode(payload["content"]).decode("utf-8")
+    sha = payload["sha"]
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = {"members": [], "items": []}
+
+    data.setdefault("members", [])
+    data.setdefault("items", [])
+    return data, sha
+
+
+def github_save_records(data: dict, sha, commit_message: str):
+    """把更新後的 JSON 寫回 GitHub。"""
+    new_content = json.dumps(data, ensure_ascii=False, indent=2)
+    body = {
+        "message": commit_message,
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+
+    resp = requests.put(
+        _github_api_url(),
+        headers=_github_headers(),
+        json=body,
+        timeout=15,
+    )
+    resp.raise_for_status()
+
+
+def parse_gemini_json(raw_text: str) -> dict:
+    """清理並解析 Gemini 回傳的 JSON 字串。"""
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    return json.loads(cleaned)
 
 
 @bot.event
 async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
-    # 除錯用：列出目前金鑰可用的模型（正式穩定後可以刪掉這段）
     try:
         for m in gemini_client.models.list():
-            print(m.name, getattr(m, "supported_actions", None))
+            print(m.name, getattr(m, "supported_actions", None), flush=True)
     except Exception as e:
-        print(f"⚠️ 無法列出模型：{e}")
+        print(f"⚠️ 無法列出模型：{e}", flush=True)
 
 
 @bot.event
@@ -71,7 +161,7 @@ async def on_message(message):
     if message.attachments:
         for attachment in message.attachments:
             if any(attachment.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.webp']):
-                await message.channel.send("🔍 正在辨識圖片中的掉落寶物...")
+                await message.channel.send("🔍 正在辨識圖片中的內容...")
 
                 try:
                     image_bytes = await attachment.read()
@@ -86,9 +176,61 @@ async def on_message(message):
                         ],
                     )
 
-                    result_text = interaction.output_text.strip()
-                    await message.channel.send(f"**辨識結果：**\n```{result_text}```")
+                    parsed = parse_gemini_json(interaction.output_text)
+                    kind = parsed.get("type", "unknown")
+                    payload = parsed.get("data", [])
 
+                    if kind == "unknown" or not payload:
+                        await message.channel.send("⚠️ 無法判斷這張圖片是隊員名單還是寶物記錄，或內容為空。")
+                        continue
+
+                    now = datetime.now(timezone.utc).isoformat()
+
+                    async with github_lock:
+                        records, sha = await asyncio.to_thread(github_get_records)
+
+                        if kind == "member":
+                            new_names = [n for n in payload if isinstance(n, str)]
+                            for name in new_names:
+                                records["members"].append({
+                                    "name": name,
+                                    "recorded_at": now,
+                                    "recorded_by": str(message.author),
+                                })
+                            summary = "、".join(new_names) if new_names else "（無有效名字）"
+                            commit_msg = f"新增隊員：{summary}"
+                            reply = f"**✅ 已記錄隊員：**\n```{summary}```"
+
+                        elif kind == "item":
+                            valid_items = [
+                                it for it in payload
+                                if isinstance(it, dict) and "item" in it
+                            ]
+                            for it in valid_items:
+                                records["items"].append({
+                                    "item": it.get("item"),
+                                    "amount": it.get("amount", 1),
+                                    "recorded_at": now,
+                                    "recorded_by": str(message.author),
+                                })
+                            summary_lines = "\n".join(
+                                f"- {it.get('item')} x{it.get('amount', 1)}" for it in valid_items
+                            ) or "（無有效寶物資料）"
+                            commit_msg = f"新增寶物記錄：{len(valid_items)} 筆"
+                            reply = f"**✅ 已記錄寶物：**\n```{summary_lines}```"
+
+                        else:
+                            await message.channel.send("⚠️ 未知的辨識類型，未寫入記錄。")
+                            continue
+
+                        await asyncio.to_thread(github_save_records, records, sha, commit_msg)
+
+                    await message.channel.send(reply)
+
+                except json.JSONDecodeError:
+                    await message.channel.send("❌ Gemini 回傳的內容不是有效的 JSON，辨識失敗。")
+                except requests.HTTPError as e:
+                    await message.channel.send(f"❌ 寫入 GitHub 失敗：{e}")
                 except Exception as e:
                     await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
 
