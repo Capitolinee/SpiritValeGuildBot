@@ -143,9 +143,47 @@ def parse_gemini_json(raw_text: str) -> dict:
     return json.loads(cleaned)
 
 
+def upsert_member(records: dict, name: str, author: str, timestamp: str):
+    """新增或更新一位隊員（依名字去重）。同名已存在時只更新次數與最近時間。"""
+    for m in records.setdefault("members", []):
+        if m.get("name") == name:
+            m["count"] = m.get("count", 1) + 1
+            m["recorded_at"] = timestamp
+            m["recorded_by"] = author
+            return
+    records["members"].append({
+        "name": name,
+        "count": 1,
+        "recorded_at": timestamp,
+        "recorded_by": author,
+    })
+
+
+def rename_member(records: dict, index: int, new_name: str) -> str:
+    """
+    修改編號 index 的隊員名字。
+    如果新名字跟另一筆既有記錄重複，會自動合併（次數相加），並回傳 'merged'；
+    否則單純改名，回傳 'renamed'。
+    """
+    members = records.get("members", [])
+    target = members[index]
+
+    for i, m in enumerate(members):
+        if i != index and m.get("name") == new_name:
+            m["count"] = m.get("count", 1) + target.get("count", 1)
+            if target.get("recorded_at", "") > m.get("recorded_at", ""):
+                m["recorded_at"] = target["recorded_at"]
+                m["recorded_by"] = target.get("recorded_by")
+            del members[index]
+            return "merged"
+
+    target["name"] = new_name
+    return "renamed"
+
+
 @bot.command(name="memberlist")
 async def raw_member_list(ctx):
-    """列出隊員的原始記錄（含編號，供修改／刪除使用）。"""
+    """列出隊員記錄（每人只會有一筆，含編號，供修改／刪除使用）。"""
     try:
         records, _ = await asyncio.to_thread(github_get_records)
     except requests.HTTPError as e:
@@ -158,12 +196,12 @@ async def raw_member_list(ctx):
         return
 
     lines = [
-        f"[{i}] {m.get('name', '未知')}（{m.get('recorded_at', '')[:10]}）"
+        f"[{i}] {m.get('name', '未知')}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
         for i, m in enumerate(members)
     ]
     text = "\n".join(lines)
     for i in range(0, len(text), 1800):
-        await ctx.send(f"**📋 隊員原始記錄：**\n```{text[i:i+1800]}```")
+        await ctx.send(f"**📋 隊員記錄：**\n```{text[i:i+1800]}```")
 
 
 @bot.command(name="itemlist")
@@ -191,7 +229,7 @@ async def raw_item_list(ctx):
 
 @bot.command(name="editmember")
 async def edit_member(ctx, index: int, *, new_name: str):
-    """修改指定編號的隊員名字。用法：!editmember 3 正確的名字"""
+    """修改指定編號的隊員名字。若新名字與其他既有記錄重複，會自動合併次數。用法：!editmember 3 正確的名字"""
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
         members = records.get("members", [])
@@ -199,11 +237,14 @@ async def edit_member(ctx, index: int, *, new_name: str):
             await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !memberlist 確認編號。")
             return
         old_name = members[index].get("name")
-        members[index]["name"] = new_name
+        result = rename_member(records, index, new_name)
         await asyncio.to_thread(
             github_save_records, records, sha, f"修正隊員 [{index}]：{old_name} → {new_name}"
         )
-    await ctx.send(f"✅ 已將 [{index}] 的「{old_name}」改為「{new_name}」")
+    if result == "merged":
+        await ctx.send(f"✅ 已將「{old_name}」合併進既有的「{new_name}」，次數已加總。")
+    else:
+        await ctx.send(f"✅ 已將 [{index}] 的「{old_name}」改為「{new_name}」")
 
 
 @bot.command(name="delmember")
@@ -224,17 +265,13 @@ async def delete_member(ctx, index: int):
 
 @bot.command(name="addmember")
 async def add_member(ctx, *, name: str):
-    """手動新增一筆隊員記錄。用法：!addmember 隊員名字"""
+    """手動新增一筆隊員記錄（同名會自動疊加次數，不會重複建立）。用法：!addmember 隊員名字"""
     now = datetime.now(timezone.utc).isoformat()
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        records.setdefault("members", []).append({
-            "name": name,
-            "recorded_at": now,
-            "recorded_by": str(ctx.author),
-        })
+        upsert_member(records, name, str(ctx.author), now)
         await asyncio.to_thread(github_save_records, records, sha, f"手動新增隊員：{name}")
-    await ctx.send(f"✅ 已新增隊員：{name}")
+    await ctx.send(f"✅ 已記錄隊員：{name}")
 
 
 @bot.command(name="edititem")
@@ -302,24 +339,15 @@ async def list_members(ctx):
         await ctx.send("目前還沒有任何隊員記錄。")
         return
 
-    # 統計每個名字被記錄的次數，並列出最近一次記錄時間
-    summary = {}
-    for m in members:
-        name = m.get("name", "未知")
-        summary.setdefault(name, {"count": 0, "last_seen": m.get("recorded_at", "")})
-        summary[name]["count"] += 1
-        if m.get("recorded_at", "") > summary[name]["last_seen"]:
-            summary[name]["last_seen"] = m.get("recorded_at", "")
-
     lines = [
-        f"- {name}（出現 {info['count']} 次，最近：{info['last_seen'][:10]}）"
-        for name, info in sorted(summary.items())
+        f"- {m.get('name', '未知')}（出現 {m.get('count', 1)} 次，最近：{m.get('recorded_at', '')[:10]}）"
+        for m in sorted(members, key=lambda x: x.get("name", ""))
     ]
     text = "\n".join(lines)
 
     # Discord 單則訊息有長度限制，太長就分段送
     for i in range(0, len(text), 1800):
-        await ctx.send(f"**👥 隊員名單（共 {len(summary)} 人）：**\n```{text[i:i+1800]}```")
+        await ctx.send(f"**👥 隊員名單（共 {len(members)} 人）：**\n```{text[i:i+1800]}```")
 
 
 @bot.command(name="items")
@@ -398,11 +426,7 @@ async def on_message(message):
                         if kind == "member":
                             new_names = [n for n in payload if isinstance(n, str)]
                             for name in new_names:
-                                records["members"].append({
-                                    "name": name,
-                                    "recorded_at": now,
-                                    "recorded_by": str(message.author),
-                                })
+                                upsert_member(records, name, str(message.author), now)
                             summary = "、".join(new_names) if new_names else "（無有效名字）"
                             commit_msg = f"新增隊員：{summary}"
                             reply = f"**✅ 已記錄隊員：**\n```{summary}```"
