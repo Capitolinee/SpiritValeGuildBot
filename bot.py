@@ -623,6 +623,7 @@ class ConfirmView(discord.ui.View):
                         for it in self.payload:
                             session.setdefault("items", []).append({
                                 "name": it.get("item"),
+                                "recorded_at": now,
                                 "sold": False,
                                 "sale_amount": None,
                                 "per_person": None,
@@ -806,6 +807,7 @@ async def add_item_to_session(ctx, *, item_name: str):
             return
         session.setdefault("items", []).append({
             "name": item_name,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
             "sold": False,
             "sale_amount": None,
             "per_person": None,
@@ -853,6 +855,7 @@ async def sell_item(ctx, index: int, amount: int):
         target_item["sold"] = True
         target_item["sale_amount"] = amount
         target_item["per_person"] = per_person
+        target_item["sold_at"] = datetime.now(timezone.utc).isoformat()
         target_item["claims"] = {
             (m.get("discord_user_id") or f"raw:{m.get('name')}"): False
             for m in members
@@ -886,8 +889,10 @@ async def session_info(ctx):
         return
 
     member_names = "、".join(m.get("name", "未知") for m in session.get("members", []))
+    created_date = session.get("created_at", "")[:16].replace("T", " ")
     lines = [
         f"場次 ID：{session['id']}（{'已結束' if session.get('closed') else '進行中'}）",
+        f"開場時間：{created_date}",
         f"出席：{member_names}",
         "寶物：",
     ]
@@ -895,11 +900,13 @@ async def session_info(ctx):
     if not items:
         lines.append("  （尚未記錄任何寶物）")
     for i, it in enumerate(items):
+        recorded_date = it.get("recorded_at", "")[:16].replace("T", " ")
         if it.get("sold"):
-            status = f"已賣 {it['sale_amount']}（每人 {it['per_person']:.2f}）"
+            sold_date = it.get("sold_at", "")[:16].replace("T", " ")
+            status = f"已賣 {it['sale_amount']}（每人 {it['per_person']:.2f}，賣出時間：{sold_date}）"
         else:
             status = "未賣出"
-        lines.append(f"  [{i}] {it.get('name')}：{status}")
+        lines.append(f"  [{i}] {it.get('name')}（記錄時間：{recorded_date}）：{status}")
 
     await ctx.send("```" + "\n".join(lines) + "```")
 
