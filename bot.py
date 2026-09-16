@@ -54,7 +54,7 @@ PROMPT = """
 
 @bot.event
 async def on_ready():
-    print(f"🤖 機器人已順利上線：{bot.user.name}")
+    print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
     # 除錯用：列出目前金鑰可用的模型（正式穩定後可以刪掉這段）
     try:
         for m in gemini_client.models.list():
