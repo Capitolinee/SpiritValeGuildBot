@@ -377,6 +377,135 @@ async def list_items(ctx):
         await ctx.send(f"**💎 寶物總計（{len(totals)} 種）：**\n```{text[i:i+1800]}```")
 
 
+class EditModal(discord.ui.Modal):
+    """讓使用者在寫入 GitHub 前，手動修改辨識結果的彈出視窗。"""
+
+    def __init__(self, view: "ConfirmView"):
+        super().__init__(title="修改辨識結果")
+        self.view_ref = view
+
+        self.text_input = discord.ui.TextInput(
+            label=view.edit_label(),
+            style=discord.TextStyle.paragraph,
+            default=view.to_editable_text(),
+            required=True,
+            max_length=2000,
+        )
+        self.add_item(self.text_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_payload = self.view_ref.parse_edited_text(self.text_input.value)
+        except Exception:
+            await interaction.response.send_message(
+                "⚠️ 格式錯誤，請確認每行格式後再試一次（寶物記錄格式為：名稱,數量）。",
+                ephemeral=True,
+            )
+            return
+
+        if not new_payload:
+            await interaction.response.send_message("⚠️ 內容是空的，未進行任何記錄。", ephemeral=True)
+            return
+
+        self.view_ref.payload = new_payload
+        reply = await self.view_ref.save(str(interaction.user))
+        await interaction.response.edit_message(content=reply, view=None)
+        self.view_ref.stop()
+
+
+class ConfirmView(discord.ui.View):
+    """辨識完成後，讓使用者用按鈕確認正確或修改後再寫入 GitHub。"""
+
+    def __init__(self, kind: str, payload: list, author_id: int):
+        super().__init__(timeout=300)  # 5 分鐘沒操作就失效
+        self.kind = kind
+        self.payload = payload
+        self.author_id = author_id
+        self.message: discord.Message | None = None
+
+    def preview_text(self) -> str:
+        if self.kind == "member":
+            body = "、".join(self.payload) if self.payload else "（無）"
+            return f"**🔍 辨識為隊員名單：**\n```{body}```\n請確認是否正確？"
+        lines = "\n".join(f"- {it.get('item')} x{it.get('amount', 1)}" for it in self.payload)
+        return f"**🔍 辨識為寶物記錄：**\n```{lines or '（無）'}```\n請確認是否正確？"
+
+    def edit_label(self) -> str:
+        return "每行一個隊員名字" if self.kind == "member" else "格式：寶物名稱,數量（每行一筆）"
+
+    def to_editable_text(self) -> str:
+        if self.kind == "member":
+            return "\n".join(self.payload)
+        return "\n".join(f"{it.get('item')},{it.get('amount', 1)}" for it in self.payload)
+
+    def parse_edited_text(self, text: str):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if self.kind == "member":
+            return lines
+        result = []
+        for line in lines:
+            parts = line.split(",")
+            name = parts[0].strip()
+            amount = 1
+            if len(parts) > 1 and parts[1].strip().lstrip("-").isdigit():
+                amount = int(parts[1].strip())
+            result.append({"item": name, "amount": amount})
+        return result
+
+    async def save(self, author: str) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        async with github_lock:
+            records, sha = await asyncio.to_thread(github_get_records)
+
+            if self.kind == "member":
+                for name in self.payload:
+                    if name:
+                        upsert_member(records, name, author, now)
+                summary = "、".join(self.payload) if self.payload else "（無）"
+                commit_msg = f"新增隊員：{summary}"
+                reply = f"**✅ 已記錄隊員：**\n```{summary}```"
+            else:
+                for it in self.payload:
+                    records["items"].append({
+                        "item": it.get("item"),
+                        "amount": it.get("amount", 1),
+                        "recorded_at": now,
+                        "recorded_by": author,
+                    })
+                lines = "\n".join(f"- {it.get('item')} x{it.get('amount', 1)}" for it in self.payload) or "（無）"
+                commit_msg = f"新增寶物記錄：{len(self.payload)} 筆"
+                reply = f"**✅ 已記錄寶物：**\n```{lines}```"
+
+            await asyncio.to_thread(github_save_records, records, sha, commit_msg)
+        return reply
+
+    @discord.ui.button(label="✅ 確認正確", style=discord.ButtonStyle.success)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("只有上傳圖片的人可以確認喔。", ephemeral=True)
+            return
+        reply = await self.save(str(interaction.user))
+        await interaction.response.edit_message(content=reply, view=None)
+        self.stop()
+
+    @discord.ui.button(label="✏️ 修改後再存", style=discord.ButtonStyle.primary)
+    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("只有上傳圖片的人可以修改喔。", ephemeral=True)
+            return
+        await interaction.response.send_modal(EditModal(self))
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(
+                    content=self.message.content + "\n\n⏰ 已逾時未確認，這筆資料未寫入記錄。",
+                    view=None,
+                )
+            except Exception:
+                pass
+
+
 @bot.event
 async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
@@ -418,44 +547,23 @@ async def on_message(message):
                         await message.channel.send("⚠️ 無法判斷這張圖片是隊員名單還是寶物記錄，或內容為空。")
                         continue
 
-                    now = datetime.now(timezone.utc).isoformat()
+                    if kind == "member":
+                        clean_payload = [n for n in payload if isinstance(n, str) and n.strip()]
+                    elif kind == "item":
+                        clean_payload = [
+                            it for it in payload
+                            if isinstance(it, dict) and it.get("item")
+                        ]
+                    else:
+                        clean_payload = []
 
-                    async with github_lock:
-                        records, sha = await asyncio.to_thread(github_get_records)
+                    if not clean_payload:
+                        await message.channel.send("⚠️ 辨識結果內容無效，未寫入記錄。")
+                        continue
 
-                        if kind == "member":
-                            new_names = [n for n in payload if isinstance(n, str)]
-                            for name in new_names:
-                                upsert_member(records, name, str(message.author), now)
-                            summary = "、".join(new_names) if new_names else "（無有效名字）"
-                            commit_msg = f"新增隊員：{summary}"
-                            reply = f"**✅ 已記錄隊員：**\n```{summary}```"
-
-                        elif kind == "item":
-                            valid_items = [
-                                it for it in payload
-                                if isinstance(it, dict) and "item" in it
-                            ]
-                            for it in valid_items:
-                                records["items"].append({
-                                    "item": it.get("item"),
-                                    "amount": it.get("amount", 1),
-                                    "recorded_at": now,
-                                    "recorded_by": str(message.author),
-                                })
-                            summary_lines = "\n".join(
-                                f"- {it.get('item')} x{it.get('amount', 1)}" for it in valid_items
-                            ) or "（無有效寶物資料）"
-                            commit_msg = f"新增寶物記錄：{len(valid_items)} 筆"
-                            reply = f"**✅ 已記錄寶物：**\n```{summary_lines}```"
-
-                        else:
-                            await message.channel.send("⚠️ 未知的辨識類型，未寫入記錄。")
-                            continue
-
-                        await asyncio.to_thread(github_save_records, records, sha, commit_msg)
-
-                    await message.channel.send(reply)
+                    view = ConfirmView(kind, clean_payload, message.author.id)
+                    sent = await message.channel.send(view.preview_text(), view=view)
+                    view.message = sent
 
                 except json.JSONDecodeError:
                     await message.channel.send("❌ Gemini 回傳的內容不是有效的 JSON，辨識失敗。")
