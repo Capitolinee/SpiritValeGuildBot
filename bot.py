@@ -95,7 +95,7 @@ def github_get_records():
         timeout=15,
     )
     if resp.status_code == 404:
-        return {"members": [], "items": []}, None
+        return {"members": [], "items": [], "jobs": {}, "profiles": {}}, None
 
     resp.raise_for_status()
     payload = resp.json()
@@ -105,10 +105,12 @@ def github_get_records():
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        data = {"members": [], "items": []}
+        data = {"members": [], "items": [], "jobs": {}, "profiles": {}}
 
     data.setdefault("members", [])
     data.setdefault("items", [])
+    data.setdefault("jobs", {})       # {"職業名稱": "圖片網址"}
+    data.setdefault("profiles", {})   # {"discord_user_id": {"name":..., "job":..., "recorded_at":...}}
     return data, sha
 
 
@@ -143,10 +145,36 @@ def parse_gemini_json(raw_text: str) -> dict:
     return json.loads(cleaned)
 
 
+# 容易造成誤判的「形似字元」對照表：左邊會被視為跟右邊相同。
+# 之後如果又發現新的形似字元組合，直接在這裡加一行就好。
+CONFUSABLE_CHAR_MAP = {
+    "ㄚ": "丫",   # 注音符號 ㄚ vs 中文字 丫
+    "ㄧ": "一",   # 注音符號 ㄧ vs 中文字 一
+    "ㄩ": "凵",   # 注音符號 ㄩ vs 部首 凵
+    "O": "0",     # 英文字母 O vs 數字 0
+    "l": "1",     # 英文小寫 l vs 數字 1
+}
+
+
+def normalize_name(name: str) -> str:
+    """
+    把名字正規化成用來「比對是否為同一人」的統一格式：
+    - 轉小寫（英文大小寫視為相同）
+    - 套用形似字元對照表
+    - 去除頭尾空白
+    注意：這只用來比對，實際存檔還是保留使用者原本輸入的寫法。
+    """
+    normalized = name.strip().lower()
+    for confusable, canonical in CONFUSABLE_CHAR_MAP.items():
+        normalized = normalized.replace(confusable.lower(), canonical.lower())
+    return normalized
+
+
 def upsert_member(records: dict, name: str, author: str, timestamp: str):
-    """新增或更新一位隊員（依名字去重）。同名已存在時只更新次數與最近時間。"""
+    """新增或更新一位隊員（依正規化後的名字去重，能自動抓出形似字元造成的重複）。"""
+    target_key = normalize_name(name)
     for m in records.setdefault("members", []):
-        if m.get("name") == name:
+        if normalize_name(m.get("name", "")) == target_key:
             m["count"] = m.get("count", 1) + 1
             m["recorded_at"] = timestamp
             m["recorded_by"] = author
@@ -162,14 +190,15 @@ def upsert_member(records: dict, name: str, author: str, timestamp: str):
 def rename_member(records: dict, index: int, new_name: str) -> str:
     """
     修改編號 index 的隊員名字。
-    如果新名字跟另一筆既有記錄重複，會自動合併（次數相加），並回傳 'merged'；
+    如果新名字正規化後跟另一筆既有記錄相同，會自動合併（次數相加），並回傳 'merged'；
     否則單純改名，回傳 'renamed'。
     """
     members = records.get("members", [])
     target = members[index]
+    target_key = normalize_name(new_name)
 
     for i, m in enumerate(members):
-        if i != index and m.get("name") == new_name:
+        if i != index and normalize_name(m.get("name", "")) == target_key:
             m["count"] = m.get("count", 1) + target.get("count", 1)
             if target.get("recorded_at", "") > m.get("recorded_at", ""):
                 m["recorded_at"] = target["recorded_at"]
@@ -559,6 +588,43 @@ class ClearConfirmView(discord.ui.View):
                 pass
 
 
+@bot.command(name="dedupemembers")
+async def dedupe_members(ctx):
+    """掃描目前所有隊員記錄，把正規化後名字相同（例如形似字元造成的重複）的記錄自動合併。"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        members = records.get("members", [])
+
+        groups = {}
+        for m in members:
+            key = normalize_name(m.get("name", ""))
+            groups.setdefault(key, []).append(m)
+
+        new_members = []
+        merge_log = []
+        for group in groups.values():
+            if len(group) == 1:
+                new_members.append(group[0])
+                continue
+            # 合併：次數相加，名字採用最近一次記錄時的寫法
+            group_sorted = sorted(group, key=lambda x: x.get("recorded_at", ""))
+            base = dict(group_sorted[-1])
+            base["count"] = sum(g.get("count", 1) for g in group)
+            new_members.append(base)
+            names_involved = "、".join(sorted({g.get("name", "") for g in group}))
+            merge_log.append(f"{names_involved} → {base.get('name')}（共 {base['count']} 次）")
+
+        if not merge_log:
+            await ctx.send("沒有發現重複的隊員記錄，不需要合併。")
+            return
+
+        records["members"] = new_members
+        await asyncio.to_thread(github_save_records, records, sha, "自動合併重複隊員記錄（正規化去重）")
+
+    text = "\n".join(merge_log)
+    await ctx.send(f"✅ 已自動合併以下重複記錄：\n```{text}```")
+
+
 @bot.command(name="clearmembers")
 async def clear_members(ctx):
     """清除所有隊員記錄（需二次確認）。"""
@@ -581,6 +647,156 @@ async def clear_all(ctx):
     view = ClearConfirmView("all", ctx.author.id)
     sent = await ctx.send("⚠️ 確定要清除**所有隊員與寶物記錄**嗎？此動作無法復原。", view=view)
     view.message = sent
+
+
+@bot.command(name="addjob")
+async def add_job(ctx, job_name: str, image_url: str):
+    """新增或更新一個職業設定（含圖片）。用法：!addjob 戰士 https://.../warrior.png"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("jobs", {})[job_name] = image_url
+        await asyncio.to_thread(github_save_records, records, sha, f"新增/更新職業設定：{job_name}")
+    await ctx.send(f"✅ 已設定職業「{job_name}」，之後 !profile 的下拉選單就會出現這個選項。")
+
+
+@bot.command(name="deljob")
+async def del_job(ctx, job_name: str):
+    """刪除一個職業設定。用法：!deljob 戰士"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        jobs = records.get("jobs", {})
+        if job_name not in jobs:
+            await ctx.send(f"⚠️ 找不到職業「{job_name}」，用 !jobs 確認目前有哪些職業。")
+            return
+        del jobs[job_name]
+        await asyncio.to_thread(github_save_records, records, sha, f"刪除職業設定：{job_name}")
+    await ctx.send(f"🗑️ 已刪除職業「{job_name}」。")
+
+
+@bot.command(name="jobs")
+async def list_jobs(ctx):
+    """列出目前設定的所有職業。"""
+    records, _ = await asyncio.to_thread(github_get_records)
+    jobs = records.get("jobs", {})
+    if not jobs:
+        await ctx.send("目前還沒有設定任何職業，用 `!addjob 職業名稱 圖片網址` 新增第一個職業。")
+        return
+    lines = "\n".join(f"- {name}" for name in jobs)
+    await ctx.send(f"**⚔️ 目前設定的職業：**\n```{lines}```")
+
+
+class NameModal(discord.ui.Modal):
+    """輸入名字用的彈出視窗，送出後接著跳出職業選單。"""
+
+    def __init__(self):
+        super().__init__(title="設定你的角色資料")
+        self.name_input = discord.ui.TextInput(
+            label="你的名字",
+            placeholder="手動輸入你的角色名字",
+            required=True,
+            max_length=50,
+        )
+        self.add_item(self.name_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name_input.value.strip()
+        records, _ = await asyncio.to_thread(github_get_records)
+        jobs = records.get("jobs", {})
+
+        if not jobs:
+            await interaction.response.send_message(
+                "⚠️ 目前還沒有設定任何職業，請先請管理員用 `!addjob 職業名稱 圖片網址` 新增職業。",
+                ephemeral=True,
+            )
+            return
+
+        view = JobSelectView(name, jobs)
+        await interaction.response.send_message(
+            f"名字：**{name}**\n請選擇你的職業：", view=view, ephemeral=True
+        )
+
+
+class JobSelect(discord.ui.Select):
+    def __init__(self, name: str, jobs: dict):
+        # Discord 下拉選單最多 25 個選項
+        options = [discord.SelectOption(label=job) for job in list(jobs.keys())[:25]]
+        super().__init__(placeholder="選擇職業", options=options, min_values=1, max_values=1)
+        self.name = name
+        self.jobs = jobs
+
+    async def callback(self, interaction: discord.Interaction):
+        job = self.values[0]
+        image_url = self.jobs.get(job)
+        now = datetime.now(timezone.utc).isoformat()
+
+        async with github_lock:
+            records, sha = await asyncio.to_thread(github_get_records)
+            records.setdefault("profiles", {})[str(interaction.user.id)] = {
+                "name": self.name,
+                "job": job,
+                "recorded_at": now,
+            }
+            await asyncio.to_thread(
+                github_save_records, records, sha, f"設定角色資料：{self.name}（{job}）"
+            )
+
+        embed = discord.Embed(
+            title="✅ 已設定角色資料",
+            description=f"名字：**{self.name}**\n職業：**{job}**",
+            color=discord.Color.green(),
+        )
+        if image_url:
+            embed.set_thumbnail(url=image_url)
+
+        await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+
+class JobSelectView(discord.ui.View):
+    def __init__(self, name: str, jobs: dict):
+        super().__init__(timeout=120)
+        self.add_item(JobSelect(name, jobs))
+
+
+class StartProfileView(discord.ui.View):
+    """!profile 指令送出的起始按鈕，按下才會跳出輸入名字的視窗。"""
+
+    def __init__(self, author_id: int):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+
+    @discord.ui.button(label="📝 設定角色資料", style=discord.ButtonStyle.primary)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "這個按鈕是給發起的人用的，你可以自己打 `!profile` 喔。", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(NameModal())
+
+
+@bot.command(name="profile")
+async def set_profile(ctx):
+    """設定你自己的角色資料（名字＋職業）。"""
+    view = StartProfileView(ctx.author.id)
+    await ctx.send(f"{ctx.author.mention} 點下面的按鈕開始設定你的角色資料：", view=view)
+
+
+@bot.command(name="profiles")
+async def list_profiles(ctx):
+    """列出目前所有人設定的角色資料。"""
+    records, _ = await asyncio.to_thread(github_get_records)
+    profiles = records.get("profiles", {})
+    if not profiles:
+        await ctx.send("目前還沒有人設定角色資料，用 `!profile` 開始設定。")
+        return
+
+    lines = [
+        f"<@{user_id}>：{p.get('name')}（{p.get('job')}）"
+        for user_id, p in profiles.items()
+    ]
+    text = "\n".join(lines)
+    for i in range(0, len(text), 1800):
+        await ctx.send(f"**🧑‍🤝‍🧑 角色資料：**\n{text[i:i+1800]}")
 
 
 @bot.event
