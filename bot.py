@@ -59,6 +59,43 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # 同一時間只允許一個寫入動作，避免多筆訊息同時寫入 GitHub 造成 sha 衝突
 github_lock = asyncio.Lock()
 
+# 記錄每個頻道目前「進行中的場次」是哪一個（存在記憶體裡，機器人重啟會清空，
+# 但場次本身的資料都在 GitHub 上，不會遺失，只是重啟後需要用新的隊員圖片重開一個場次）
+ACTIVE_SESSIONS: dict = {}  # {channel_id(int): session_id(str)}
+
+
+def new_session_id() -> str:
+    return f"s{int(datetime.now(timezone.utc).timestamp())}"
+
+
+def get_session(records: dict, session_id: str):
+    for s in records.get("sessions", []):
+        if s.get("id") == session_id:
+            return s
+    return None
+
+
+def create_session(records: dict, channel_id: int, member_names: list) -> dict:
+    """依這次確認的出席名單建立一個新場次，並嘗試對應到 Discord 帳號。"""
+    now = datetime.now(timezone.utc).isoformat()
+    members = []
+    for raw_name in member_names:
+        uid, matched_name = find_user_by_character_name(records, raw_name)
+        members.append({
+            "discord_user_id": uid,
+            "name": matched_name or raw_name,
+        })
+    session = {
+        "id": new_session_id(),
+        "channel_id": str(channel_id),
+        "created_at": now,
+        "members": members,
+        "items": [],
+        "closed": False,
+    }
+    records.setdefault("sessions", []).append(session)
+    return session
+
 PROMPT = """
 你是一個遊戲紀錄助手。請判斷這張圖片的內容類型，並依照下列規則回傳「純 JSON」，
 不要包含任何 Markdown 標記（例如 ```json）或額外說明文字：
@@ -96,7 +133,7 @@ def github_get_records():
         timeout=15,
     )
     if resp.status_code == 404:
-        return {"members": [], "items": [], "jobs": {}, "profiles": {}}, None
+        return {"members": [], "items": [], "jobs": {}, "profiles": {}, "sessions": []}, None
 
     resp.raise_for_status()
     payload = resp.json()
@@ -106,12 +143,13 @@ def github_get_records():
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        data = {"members": [], "items": [], "jobs": {}, "profiles": {}}
+        data = {"members": [], "items": [], "jobs": {}, "profiles": {}, "sessions": []}
 
     data.setdefault("members", [])
     data.setdefault("items", [])
     data.setdefault("jobs", {})       # {"職業名稱": {"tier": int, "parent": str|None, "image": str}}
     data.setdefault("profiles", {})   # {"discord_user_id": {"name":..., "job":..., "recorded_at":...}}
+    data.setdefault("sessions", [])   # [{"id":..., "channel_id":..., "members":[...], "items":[...], "closed": bool}]
     return data, sha
 
 
@@ -507,11 +545,12 @@ class EditModal(discord.ui.Modal):
 class ConfirmView(discord.ui.View):
     """辨識完成後，讓使用者用按鈕確認正確或修改後再寫入 GitHub。"""
 
-    def __init__(self, kind: str, payload: list, author_id: int):
+    def __init__(self, kind: str, payload: list, author_id: int, channel_id: int):
         super().__init__(timeout=300)  # 5 分鐘沒操作就失效
         self.kind = kind
         self.payload = payload
         self.author_id = author_id
+        self.channel_id = channel_id
         self.message: discord.Message | None = None
 
     def preview_text(self) -> str:
@@ -555,6 +594,15 @@ class ConfirmView(discord.ui.View):
                 summary = "、".join(self.payload) if self.payload else "（無）"
                 commit_msg = f"新增隊員：{summary}"
                 reply = f"**✅ 已記錄隊員：**\n```{summary}```"
+
+                # 依這次確認的出席名單開一個新場次，之後的寶物可以掛在這場底下結算分潤
+                session = create_session(records, self.channel_id, self.payload)
+                ACTIVE_SESSIONS[self.channel_id] = session["id"]
+                commit_msg += f"，開啟場次 {session['id']}"
+                reply += (
+                    f"\n\n📌 已建立場次 `{session['id']}`，接下來可以用 `!item 寶物名稱` "
+                    f"或上傳寶物圖片記錄掉落，賣掉後用 `!sell 金額 寶物名稱` 結算分潤。"
+                )
             else:
                 for it in self.payload:
                     records["items"].append({
@@ -566,6 +614,22 @@ class ConfirmView(discord.ui.View):
                 lines = "\n".join(f"- {it.get('item')} x{it.get('amount', 1)}" for it in self.payload) or "（無）"
                 commit_msg = f"新增寶物記錄：{len(self.payload)} 筆"
                 reply = f"**✅ 已記錄寶物：**\n```{lines}```"
+
+                # 如果這個頻道有進行中的場次，同時把寶物掛進場次的清單裡
+                active_id = ACTIVE_SESSIONS.get(self.channel_id)
+                if active_id:
+                    session = get_session(records, active_id)
+                    if session and not session.get("closed"):
+                        for it in self.payload:
+                            session.setdefault("items", []).append({
+                                "name": it.get("item"),
+                                "sold": False,
+                                "sale_amount": None,
+                                "per_person": None,
+                                "claims": {},
+                            })
+                        commit_msg += f"，掛入場次 {active_id}"
+                        reply += f"\n\n📌 已加入場次 `{active_id}` 的寶物清單。"
 
             await asyncio.to_thread(github_save_records, records, sha, commit_msg)
         return reply
@@ -725,6 +789,183 @@ async def sync_members(ctx):
         await asyncio.to_thread(github_save_records, records, sha, "依角色資料重新同步隊員記錄")
 
     await ctx.send(f"✅ 已同步完成，目前共 {len(records['members'])} 筆隊員記錄。")
+
+
+@bot.command(name="item")
+async def add_item_to_session(ctx, *, item_name: str):
+    """把寶物手動加進目前頻道進行中的場次。用法：!item 寶物名稱"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+        if not session_id:
+            await ctx.send("⚠️ 目前這個頻道沒有進行中的場次，請先上傳隊員圖片並確認出席名單。")
+            return
+        session = get_session(records, session_id)
+        if not session or session.get("closed"):
+            await ctx.send("⚠️ 找不到進行中的場次，或場次已結束。")
+            return
+        session.setdefault("items", []).append({
+            "name": item_name,
+            "sold": False,
+            "sale_amount": None,
+            "per_person": None,
+            "claims": {},
+        })
+        await asyncio.to_thread(
+            github_save_records, records, sha, f"場次 {session_id} 新增寶物：{item_name}"
+        )
+    await ctx.send(f"✅ 已將「{item_name}」加入目前場次的寶物清單。")
+
+
+@bot.command(name="sell")
+async def sell_item(ctx, index: int, amount: int):
+    """
+    把目前場次裡指定編號的寶物標記為已賣出，並平均分配給場次內的出席隊員。
+    編號用 !sessioninfo 查。用法：!sell 編號 金額
+    """
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+        if not session_id:
+            await ctx.send("⚠️ 目前這個頻道沒有進行中的場次。")
+            return
+        session = get_session(records, session_id)
+        if not session:
+            await ctx.send("⚠️ 找不到進行中的場次。")
+            return
+
+        items = session.get("items", [])
+        if index < 0 or index >= len(items):
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !sessioninfo 確認編號。")
+            return
+
+        target_item = items[index]
+        if target_item.get("sold"):
+            await ctx.send(f"⚠️ 編號 {index}「{target_item.get('name')}」已經賣過了，不能重複結算。")
+            return
+
+        members = session.get("members", [])
+        if not members:
+            await ctx.send("⚠️ 這個場次沒有出席名單，無法分配。")
+            return
+
+        per_person = amount / len(members)
+        target_item["sold"] = True
+        target_item["sale_amount"] = amount
+        target_item["per_person"] = per_person
+        target_item["claims"] = {
+            (m.get("discord_user_id") or f"raw:{m.get('name')}"): False
+            for m in members
+        }
+        item_name = target_item.get("name")
+
+        await asyncio.to_thread(
+            github_save_records, records, sha,
+            f"場次 {session_id}：[{index}] {item_name} 賣出 {amount}，每人分 {per_person:.2f}"
+        )
+
+    member_list = "、".join(m.get("name") for m in members)
+    await ctx.send(
+        f"💰 [{index}]「{item_name}」已賣出 **{amount}**，共 {len(members)} 人平分，"
+        f"每人 **{per_person:.2f}**。\n出席名單：{member_list}\n"
+        f"隊員可以用 `!claim` 領取自己的份額。"
+    )
+
+
+@bot.command(name="sessioninfo")
+async def session_info(ctx):
+    """查看目前頻道進行中的場次資訊（出席名單、寶物清單、賣出狀態）。"""
+    records, _ = await asyncio.to_thread(github_get_records)
+    session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+    if not session_id:
+        await ctx.send("目前這個頻道沒有進行中的場次。")
+        return
+    session = get_session(records, session_id)
+    if not session:
+        await ctx.send("找不到場次資料，可能已被清除。")
+        return
+
+    member_names = "、".join(m.get("name", "未知") for m in session.get("members", []))
+    lines = [
+        f"場次 ID：{session['id']}（{'已結束' if session.get('closed') else '進行中'}）",
+        f"出席：{member_names}",
+        "寶物：",
+    ]
+    items = session.get("items", [])
+    if not items:
+        lines.append("  （尚未記錄任何寶物）")
+    for i, it in enumerate(items):
+        if it.get("sold"):
+            status = f"已賣 {it['sale_amount']}（每人 {it['per_person']:.2f}）"
+        else:
+            status = "未賣出"
+        lines.append(f"  [{i}] {it.get('name')}：{status}")
+
+    await ctx.send("```" + "\n".join(lines) + "```")
+
+
+@bot.command(name="closesession")
+async def close_session_cmd(ctx):
+    """結束目前頻道的進行中場次（資料不會刪除，只是不再接受新寶物）。"""
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        session_id = ACTIVE_SESSIONS.pop(ctx.channel.id, None)
+        if not session_id:
+            await ctx.send("目前這個頻道沒有進行中的場次。")
+            return
+        session = get_session(records, session_id)
+        if session:
+            session["closed"] = True
+            await asyncio.to_thread(github_save_records, records, sha, f"結束場次 {session_id}")
+    await ctx.send(f"✅ 已結束場次 `{session_id}`。")
+
+
+@bot.command(name="claim")
+async def claim_payout(ctx):
+    """領取自己在所有場次裡尚未領取的分潤。"""
+    uid = str(ctx.author.id)
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        total = 0.0
+        claimed_details = []
+        for session in records.get("sessions", []):
+            for it in session.get("items", []):
+                claims = it.get("claims", {})
+                if claims.get(uid) is False:
+                    claims[uid] = True
+                    total += it.get("per_person", 0) or 0
+                    claimed_details.append(f"{session['id']}：{it.get('name')} +{it.get('per_person', 0):.2f}")
+
+        if not claimed_details:
+            await ctx.send("目前沒有可領取的分潤。")
+            return
+
+        await asyncio.to_thread(github_save_records, records, sha, f"{ctx.author} 領取分潤")
+
+    detail_text = "\n".join(claimed_details)
+    await ctx.send(f"✅ 已領取，共 **{total:.2f}**：\n```{detail_text}```")
+
+
+@bot.command(name="pending")
+async def show_pending(ctx):
+    """查看自己目前尚未領取的分潤總額與明細。"""
+    uid = str(ctx.author.id)
+    records, _ = await asyncio.to_thread(github_get_records)
+    total = 0.0
+    details = []
+    for session in records.get("sessions", []):
+        for it in session.get("items", []):
+            claims = it.get("claims", {})
+            if claims.get(uid) is False:
+                total += it.get("per_person", 0) or 0
+                details.append(f"{session['id']}：{it.get('name')}（{it.get('per_person', 0):.2f}）")
+
+    if not details:
+        await ctx.send("目前沒有待領取的分潤。")
+        return
+
+    text = "\n".join(details)
+    await ctx.send(f"**💰 待領取分潤，共 {total:.2f}：**\n```{text}```")
 
 
 @bot.command(name="clearmembers")
@@ -1152,7 +1393,7 @@ async def on_message(message):
                         await message.channel.send("⚠️ 辨識結果內容無效，未寫入記錄。")
                         continue
 
-                    view = ConfirmView(kind, clean_payload, message.author.id)
+                    view = ConfirmView(kind, clean_payload, message.author.id, message.channel.id)
                     sent = await message.channel.send(view.preview_text(), view=view)
                     view.message = sent
 
