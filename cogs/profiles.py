@@ -31,23 +31,50 @@ class NameModal(discord.ui.Modal):
         await interaction.followup.send(f"名字：**{name}**\n請選擇你的職業：", view=view, ephemeral=True)
 
 
-async def finalize_profile(store, interaction: discord.Interaction, name: str, job: str, jobs: dict):
+async def finalize_profile(store, interaction: discord.Interaction, name: str, job: str, jobs: dict, position: str = ""):
     info = jobs.get(job, {})
     image_url = info.get("image", "")
     user_id = str(interaction.user.id)
     display_name = interaction.user.display_name
 
     async with store.lock:
-        result = await asyncio.to_thread(store.upsert_character, user_id, display_name, name, job, "")
+        result = await asyncio.to_thread(store.upsert_character, user_id, display_name, name, job, position)
 
+    desc = f"名字：**{name}**\n職業：**{job}**"
+    if position:
+        desc += f"\n位置：**{position}**"
     embed = discord.Embed(
         title="✅ 已更新角色資料" if result == "updated" else "✅ 已新增角色資料",
-        description=f"名字：**{name}**\n職業：**{job}**",
+        description=desc,
         color=discord.Color.green(),
     )
     if image_url:
         embed.set_thumbnail(url=image_url)
     await interaction.edit_original_response(content=None, embed=embed, view=None)
+
+
+class PositionSelect(discord.ui.Select):
+    """選職業之後接著選戰鬥位置，選完才真正寫入。"""
+
+    def __init__(self, store, name: str, job: str, jobs: dict):
+        self.store = store
+        self.name = name
+        self.job = job
+        self.jobs = jobs
+        options = [discord.SelectOption(label=p) for p in ["DPS", "坦克", "奶媽", "BUFF", "其他"]]
+        options.append(discord.SelectOption(label="不設定位置", value="__SKIP__"))
+        super().__init__(placeholder="選擇這隻角色的戰鬥位置", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        position = "" if self.values[0] == "__SKIP__" else self.values[0]
+        await interaction.response.defer()
+        await finalize_profile(self.store, interaction, self.name, self.job, self.jobs, position)
+
+
+class PositionSelectView(discord.ui.View):
+    def __init__(self, store, name: str, job: str, jobs: dict):
+        super().__init__(timeout=120)
+        self.add_item(PositionSelect(store, name, job, jobs))
 
 
 class JobSelect(discord.ui.Select):
@@ -73,8 +100,11 @@ class JobSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         chosen = self.values[0]
         if chosen == "__STOP__":
-            await interaction.response.defer()
-            await finalize_profile(self.store, interaction, self.name, self.current_job, self.jobs)
+            view = PositionSelectView(self.store, self.name, self.current_job, self.jobs)
+            await interaction.response.edit_message(
+                content=f"名字：**{self.name}**\n職業：**{self.current_job}**\n請選擇戰鬥位置：",
+                view=view,
+            )
             return
 
         children = get_children_jobs(self.jobs, chosen)
@@ -85,8 +115,11 @@ class JobSelect(discord.ui.Select):
                 view=view,
             )
         else:
-            await interaction.response.defer()
-            await finalize_profile(self.store, interaction, self.name, chosen, self.jobs)
+            view = PositionSelectView(self.store, self.name, chosen, self.jobs)
+            await interaction.response.edit_message(
+                content=f"名字：**{self.name}**\n職業：**{chosen}**\n請選擇戰鬥位置：",
+                view=view,
+            )
 
 
 class JobSelectView(discord.ui.View):
@@ -160,6 +193,52 @@ class Profiles(commands.Cog):
             await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !myprofiles 確認編號。")
             return
         await ctx.send(f"🗑️ 已刪除角色：{removed.get('角色名稱')}（{removed.get('職業')}）")
+
+    @commands.command(name="setavailability")
+    async def set_availability(self, ctx, *, options: str = ""):
+        """
+        設定你平常可出席的時段（平日/假日可以都設，也可以都不設，改用備註手動說明）。
+        用法：!setavailability weekday=yes weekend=no
+             !setavailability weekday=no weekend=no note=平日8:00~9:00
+        """
+        opts = {}
+        for token in options.split():
+            if "=" in token:
+                k, v = token.split("=", 1)
+                opts[k.strip().lower()] = v.strip()
+
+        def to_bool(s):
+            return s.lower() in ("yes", "true", "y", "1", "是")
+
+        weekday = to_bool(opts["weekday"]) if "weekday" in opts else None
+        weekend = to_bool(opts["weekend"]) if "weekend" in opts else None
+        note = opts.get("note")
+
+        if weekday is None and weekend is None and note is None:
+            await ctx.send("⚠️ 用法：`!setavailability weekday=yes weekend=no note=平日8:00~9:00`（三個參數都可省略，不填的欄位不會被改動）")
+            return
+
+        async with self.store.lock:
+            await asyncio.to_thread(
+                self.store.update_availability, str(ctx.author.id), ctx.author.display_name,
+                weekday, weekend, note,
+            )
+        await ctx.send("✅ 已更新你的可出席時間設定。")
+
+    @commands.hybrid_command(name="myavailability")
+    async def my_availability(self, ctx):
+        """查看自己目前的可出席時間設定。用 /myavailability 打的話只有你看得到。"""
+        stats = await asyncio.to_thread(self.store.get_account_stats, str(ctx.author.id))
+        if not stats:
+            await ctx.send("你還沒有任何角色資料，先用 `!profile` 設定一隻角色。", ephemeral=True)
+            return
+        weekday = "✅" if str(stats.get("平日可出席", "")).strip().upper() == "TRUE" else "❌"
+        weekend = "✅" if str(stats.get("假日可出席", "")).strip().upper() == "TRUE" else "❌"
+        note = stats.get("其他時間備註", "") or "（無）"
+        await ctx.send(
+            f"**🕒 你的可出席時間：**\n平日：{weekday}　假日：{weekend}\n其他時間備註：{note}",
+            ephemeral=True,
+        )
 
 
 async def setup(bot):
