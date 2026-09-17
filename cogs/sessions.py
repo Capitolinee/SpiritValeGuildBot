@@ -41,10 +41,11 @@ def new_session_id() -> str:
 
 
 async def build_session_members(store, guild, raw_names: list) -> list:
-    """把辨識到的名字，對應到 Discord 帳號 + 顯示名稱，組成場次的出席名單。"""
+    """把辨識到的名字，對應到 Discord 帳號 + 顯示名稱，組成場次的出席名單（一次查完所有名字，不逐個查表）。"""
+    lookup = await asyncio.to_thread(store.find_users_by_character_names, raw_names)
     members = []
     for raw_name in raw_names:
-        uid, matched_name = await asyncio.to_thread(store.find_user_by_character_name, raw_name)
+        uid, matched_name = lookup.get(raw_name, (None, None))
         char_name = matched_name or raw_name
         display = await resolve_display_name(uid, char_name, guild)
         members.append({"discord_id": uid, "name": char_name, "display_name": display})
