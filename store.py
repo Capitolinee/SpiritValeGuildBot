@@ -1,429 +1,450 @@
-import asyncio
+"""
+Google Sheets 儲存層。
+所有跟 gspread 的直接互動都集中在這裡，cogs 不直接碰 gspread。
+
+工作表結構（跟 xlsx 範本 v10 一致，欄位順序不能亂動，公式欄位機器人永遠不寫）：
+
+角色資料：   A DiscordID(隱藏) B顯示名稱 C角色名稱 D職業 E位置
+             F出席次數(公式) G分潤總額(公式) H色碼(公式)
+場次記錄：   A場次ID(隱藏) B日期時間 C塔團 D DiscordID(隱藏) E DC名稱 F掉落 G寶物編號(隱藏)
+             H類型 I來源/貢獻者 J售出金額 K均分$$ L已領 M領取時間 N同場首筆(公式) O色碼(公式)
+職業管理：   A職業名稱 B轉職層級 C承接自 D圖片網址
+帳號基本資料：A DiscordID(隱藏) B顯示名稱 C平日可出席 D假日可出席 E其他時間備註
+             F出席次數(公式) G分潤總額(公式) H已領總額(公式) I待領總額(公式)
+"""
+import os
 import base64
 import json
-import mimetypes
+import asyncio
 from datetime import datetime, timezone
 
-import discord
-from discord.ext import commands
+import gspread
+from google.oauth2.service_account import Credentials
 
-from helpers import resolve_display_name
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-PROMPT = """
-你是一個遊戲紀錄助手。請判斷這張圖片的內容類型，並依照下列規則回傳「純 JSON」，
-不要包含任何 Markdown 標記或額外說明文字：
+SHEET_CHARACTERS = "角色資料"
+SHEET_SESSIONS = "場次記錄"
+SHEET_JOBS = "職業管理"
+SHEET_ACCOUNTS = "帳號基本資料"
 
-1. 如果圖片是「隊員名單／成員列表」，回傳：
-{"type": "member", "data": ["隊員名字1", "隊員名字2"]}
+MAX_ROW = 500
 
-2. 如果圖片是「掉落寶物記錄」，回傳（只要名字，不用數量，同一樣寶物出現幾次就列幾次）：
-{"type": "item", "data": ["寶物名稱1", "寶物名稱2"]}
-
-3. 如果兩者都不是，或圖片內容無法辨識，回傳：
-{"type": "unknown", "data": []}
-
-請完整讀取圖片中的繁體中文與英文文字後再判斷與提取。
-"""
-
-
-def parse_gemini_json(raw_text: str) -> dict:
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-        cleaned = cleaned.strip()
-    return json.loads(cleaned)
+# 容易造成誤判的「形似字元」對照表：左邊會被視為跟右邊相同。
+CONFUSABLE_CHAR_MAP = {
+    "ㄚ": "丫", "ㄧ": "一", "ㄩ": "凵", "O": "0", "l": "1",
+}
 
 
-def new_session_id() -> str:
-    return f"s{int(datetime.now(timezone.utc).timestamp())}"
+def normalize_name(name: str) -> str:
+    normalized = (name or "").strip().lower()
+    for confusable, canonical in CONFUSABLE_CHAR_MAP.items():
+        normalized = normalized.replace(confusable.lower(), canonical.lower())
+    return normalized
 
 
-async def build_session_members(store, guild, raw_names: list) -> list:
-    """把辨識到的名字，對應到 Discord 帳號 + 顯示名稱，組成場次的出席名單（一次查完所有名字，不逐個查表）。"""
-    lookup = await asyncio.to_thread(store.find_users_by_character_names, raw_names)
-    members = []
-    for raw_name in raw_names:
-        uid, matched_name = lookup.get(raw_name, (None, None))
-        char_name = matched_name or raw_name
-        display = await resolve_display_name(uid, char_name, guild)
-        members.append({"discord_id": uid, "name": char_name, "display_name": display})
-    return members
+def _col_letter(n: int) -> str:
+    """1 -> A, 2 -> B ... 只用在 row=1 的情況，所以可以簡單用 rowcol_to_a1 再去掉最後的 '1'。"""
+    return gspread.utils.rowcol_to_a1(1, n)[:-1]
 
 
-async def record_items(bot, item_names: list, item_type: str = "分潤", contributor: str = None,
-                        force_no_session: bool = False):
-    """
-    把一批寶物名稱記錄進去。
-    分潤類型需要目前有進行中的場次（bot.active_session）；公會/自用可以有場次也可以沒有（捐獻）。
-    回傳 (成功訊息, 是否有錯誤)。
-    """
-    store = bot.store
-    session = None if force_no_session else bot.active_session
-    session_id = session["id"] if session else None
-    members = session["members"] if (session and item_type == "分潤") else []
+class SheetsStore:
+    """所有 Google Sheets 讀寫都透過這個類別，方法都是同步的（gspread 本身是同步函式庫），
+    cogs 呼叫時要自己包 asyncio.to_thread。"""
 
-    if item_type == "分潤" and not session:
-        return None, "⚠️ 目前沒有進行中的場次，請先上傳隊員圖片，或改用 `!donate` 記錄捐獻的寶物。"
+    def __init__(self):
+        b64 = os.environ["GOOGLE_SERVICE_ACCOUNT_B64"]
+        creds_dict = json.loads(base64.b64decode(b64))
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        self.client = gspread.authorize(creds)
+        self.sheet_id = os.environ["GOOGLE_SHEET_ID"]
+        self.lock = asyncio.Lock()
+        self._spreadsheet = None
 
-    now = datetime.now(timezone.utc).isoformat()
-    recorded = []
-    async with store.lock:
-        for name in item_names:
-            if item_type == "分潤":
-                idx = session["next_item_index"]
-                session["next_item_index"] += 1
-            else:
-                idx = None
-            await asyncio.to_thread(
-                store.append_item_rows, session_id, now, members, name, idx, item_type, contributor
-            )
-            recorded.append(name)
+    def _ss(self):
+        if self._spreadsheet is None:
+            self._spreadsheet = self.client.open_by_key(self.sheet_id)
+        return self._spreadsheet
 
-    summary = "、".join(recorded)
-    where = f"場次 `{session_id}`" if session_id else "捐獻清單"
-    return f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```", None
+    def ws(self, sheet_name: str):
+        return self._ss().worksheet(sheet_name)
 
+    # ---------- 通用 row 操作 ----------
 
-class EditModal(discord.ui.Modal):
-    """辨識結果修改視窗：每行一個名字。"""
-
-    def __init__(self, view: "ConfirmView"):
-        super().__init__(title="修改辨識結果")
-        self.view_ref = view
-        label = "每行一個隊員名字" if view.kind == "member" else "每行一個寶物名稱"
-        self.text_input = discord.ui.TextInput(
-            label=label, style=discord.TextStyle.paragraph,
-            default="\n".join(view.payload), required=True, max_length=2000,
-        )
-        self.add_item(self.text_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        names = [line.strip() for line in self.text_input.value.splitlines() if line.strip()]
-        if not names:
-            await interaction.response.send_message("⚠️ 內容是空的，未進行任何記錄。", ephemeral=True)
-            return
-        self.view_ref.payload = names
-        await interaction.response.defer()
-        reply = await self.view_ref.save(interaction)
-        await interaction.edit_original_response(content=reply, view=None)
-        self.view_ref.stop()
-
-
-class ConfirmView(discord.ui.View):
-    def __init__(self, bot, kind: str, payload: list, author_id: int, guild):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.kind = kind
-        self.payload = payload
-        self.author_id = author_id
-        self.guild = guild
-        self.message: discord.Message | None = None
-
-    def preview_text(self) -> str:
-        body = "、".join(self.payload) if self.payload else "（無）"
-        label = "隊員名單" if self.kind == "member" else "寶物記錄"
-        return f"**🔍 辨識為{label}：**\n```{body}```\n請確認是否正確？"
-
-    async def save(self, interaction: discord.Interaction) -> str:
-        store = self.bot.store
-        if self.kind == "member":
-            members = await build_session_members(store, self.guild, self.payload)
-            self.bot.active_session = {
-                "id": new_session_id(), "members": members, "next_item_index": 0,
-            }
-            names = "、".join(m["display_name"] for m in members)
-            return (
-                f"**✅ 已建立場次 `{self.bot.active_session['id']}`，出席：**\n```{names}```\n"
-                f"接下來可以用 `!item 寶物名稱` 或上傳寶物圖片記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤。"
-            )
-        else:
-            reply, err = await record_items(self.bot, self.payload, item_type="分潤")
-            return err or reply
-
-    @discord.ui.button(label="✅ 確認正確", style=discord.ButtonStyle.success)
-    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("只有上傳圖片的人可以確認喔。", ephemeral=True)
-            return
-        await interaction.response.defer()
-        reply = await self.save(interaction)
-        await interaction.edit_original_response(content=reply, view=None)
-        self.stop()
-
-    @discord.ui.button(label="✏️ 修改後再存", style=discord.ButtonStyle.primary)
-    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("只有上傳圖片的人可以修改喔。", ephemeral=True)
-            return
-        await interaction.response.send_modal(EditModal(self))
-
-    async def on_timeout(self):
-        if self.message:
-            try:
-                await self.message.edit(content=self.message.content + "\n\n⏰ 已逾時未確認，未寫入記錄。", view=None)
-            except Exception:
-                pass
-
-
-class ClaimSelect(discord.ui.Select):
-    def __init__(self, store, author_id: int, pending_sessions: list):
-        options = [
-            discord.SelectOption(label=f"{sid}（待領 {amt:.2f}）", value=sid)
-            for sid, amt in pending_sessions[:24]
-        ]
-        options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
-        super().__init__(placeholder="選擇要領取哪一場", options=options, min_values=1, max_values=1)
-        self.store = store
-        self.author_id = author_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("這是別人發起的領取，你可以自己打 `!claim` 喔。", ephemeral=True)
-            return
-        chosen = self.values[0]
-        uid = str(interaction.user.id)
-        session_id = None if chosen == "__ALL__" else chosen
-
-        await interaction.response.defer()
-        async with self.store.lock:
-            result = await asyncio.to_thread(self.store.claim_for_user, uid, session_id)
-
-        if not result["details"]:
-            await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
-            return
-        detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
-        await interaction.edit_original_response(
-            content=f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", view=None
-        )
-
-
-class ClaimSelectView(discord.ui.View):
-    def __init__(self, store, author_id: int, pending_sessions: list):
-        super().__init__(timeout=120)
-        self.add_item(ClaimSelect(store, author_id, pending_sessions))
-
-
-class Sessions(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.store = bot.store
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot:
-            return
-        if not message.attachments:
-            return
-
-        for attachment in message.attachments:
-            if not any(attachment.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+    def get_rows(self, sheet_name: str) -> list:
+        """回傳這張表所有非空白列，每筆是 dict（含 _row 實際列號），跳過完全空白的列。"""
+        values = self.ws(sheet_name).get_all_values()
+        if not values:
+            return []
+        headers = values[0]
+        rows = []
+        for i, row in enumerate(values[1:], start=2):
+            if not any(cell.strip() for cell in row):
                 continue
+            d = {headers[j]: (row[j] if j < len(row) else "") for j in range(len(headers))}
+            d["_row"] = i
+            rows.append(d)
+        return rows
 
-            await message.channel.send("🔍 正在辨識圖片中的內容...")
+    def find_first_empty_row(self, sheet_name: str, key_col_index: int = 1, max_row: int = MAX_ROW) -> int:
+        """找到第一個「這個欄位是空的」列號，用來決定新資料要寫在哪一列。"""
+        col_values = self.ws(sheet_name).col_values(key_col_index)
+        for r in range(2, max_row + 1):
+            if r > len(col_values) or not col_values[r - 1].strip():
+                return r
+        return max_row + 1
+
+    def write_row(self, sheet_name: str, row_number: int, values: list, start_col: int = 1):
+        """把 values 依序寫進指定列，從 start_col 開始（1-indexed）。"""
+        start = f"{_col_letter(start_col)}{row_number}"
+        end = f"{_col_letter(start_col + len(values) - 1)}{row_number}"
+        self.ws(sheet_name).update(f"{start}:{end}", [values])
+
+    def append_rows_batch(self, sheet_name: str, values_list: list, start_col: int = 1, key_col_index: int = 1):
+        """
+        一次性把多列資料寫入（從第一個空白列開始，連續往下填），用「一次」API 呼叫寫完，
+        比一列一列呼叫 write_row 快很多。values_list 裡每一列的長度要一致。
+        """
+        if not values_list:
+            return
+        start_row = self.find_first_empty_row(sheet_name, key_col_index=key_col_index)
+        end_row = start_row + len(values_list) - 1
+        start_letter = _col_letter(start_col)
+        end_letter = _col_letter(start_col + len(values_list[0]) - 1)
+        self.ws(sheet_name).update(f"{start_letter}{start_row}:{end_letter}{end_row}", values_list)
+
+    def batch_update_cells(self, sheet_name: str, updates: list):
+        """
+        一次性更新多個（可能不連續的）位置。updates 是 [(row, start_col, values), ...]，
+        用 gspread 的 batch_update 一次送出，避免每一列各打一次 API。
+        """
+        if not updates:
+            return
+        data = []
+        for row, start_col, values in updates:
+            start_letter = _col_letter(start_col)
+            end_letter = _col_letter(start_col + len(values) - 1)
+            data.append({"range": f"{start_letter}{row}:{end_letter}{row}", "values": [values]})
+        self.ws(sheet_name).batch_update(data)
+
+    def update_cell(self, sheet_name: str, row: int, col: int, value):
+        self.ws(sheet_name).update_cell(row, col, value)
+
+    def delete_row(self, sheet_name: str, row_number: int):
+        self.ws(sheet_name).delete_rows(row_number)
+
+    @staticmethod
+    def _first_empty_row_from(rows: list, max_row: int = MAX_ROW) -> int:
+        """
+        從已經讀到的 rows（get_rows 的結果，每筆帶 _row）直接算出第一個空白列，
+        不用再另外打一次 API 去問。仍然會正確找回被刪除留下的空缺列。
+        """
+        occupied = {r["_row"] for r in rows}
+        for r in range(2, max_row + 1):
+            if r not in occupied:
+                return r
+        return max_row + 1
+
+    # ---------- 職業 ----------
+
+    def get_jobs(self) -> dict:
+        jobs = {}
+        for r in self.get_rows(SHEET_JOBS):
+            name = r.get("職業名稱", "").strip()
+            if not name:
+                continue
             try:
-                image_bytes = await attachment.read()
-                mime_type = mimetypes.guess_type(attachment.filename)[0] or "image/png"
-                image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+                tier = int(r.get("轉職層級") or 1)
+            except ValueError:
+                tier = 1
+            parent = r.get("承接自", "").strip() or None
+            image = r.get("圖片網址", "").strip()
+            jobs[name] = {"tier": tier, "parent": parent, "image": image}
+        return jobs
 
-                result = self.bot.gemini.interactions.create(
-                    model=self.bot.gemini_model,
-                    input=[
-                        {"type": "text", "text": PROMPT},
-                        {"type": "image", "data": image_b64, "mime_type": mime_type},
-                    ],
-                )
-                parsed = parse_gemini_json(result.output_text)
-                kind = parsed.get("type", "unknown")
-                payload = [n for n in parsed.get("data", []) if isinstance(n, str) and n.strip()]
-
-                if kind == "unknown" or not payload:
-                    await message.channel.send("⚠️ 無法判斷這張圖片是隊員名單還是寶物記錄，或內容為空。")
-                    continue
-
-                view = ConfirmView(self.bot, kind, payload, message.author.id, message.guild)
-                sent = await message.channel.send(view.preview_text(), view=view)
-                view.message = sent
-
-            except json.JSONDecodeError:
-                await message.channel.send("❌ Gemini 回傳的內容不是有效的 JSON，辨識失敗。")
-            except Exception as e:
-                await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
-
-    @commands.command(name="item")
-    async def add_item(self, ctx, *, text: str):
-        """
-        記錄寶物掉落，預設是「分潤」類型（需要有進行中的場次）。
-        用法：!item 寶物名稱
-             !item 寶物名稱 公會    → 明確指定類型（分潤/公會/自用）
-        """
-        parts = text.rsplit(maxsplit=1)
-        item_type = "分潤"
-        item_name = text
-        if len(parts) == 2 and parts[1] in ("分潤", "公會", "自用"):
-            item_name, item_type = parts
-
-        reply, err = await record_items(self.bot, [item_name], item_type=item_type)
-        await ctx.send(err or reply)
-
-    @commands.command(name="donate")
-    async def donate_item(self, ctx, item_name: str, *, contributor: str = None):
-        """
-        記錄捐獻的寶物（不屬於任何場次，不能分潤，只能是公會或自用）。
-        用法：!donate 屠龍刀 牡羊
-        """
-        reply, err = await record_items(
-            self.bot, [item_name], item_type="公會", contributor=contributor, force_no_session=True
-        )
-        await ctx.send(err or reply)
-
-    @commands.command(name="sell")
-    async def sell_item(self, ctx, *args):
-        """
-        把場次裡指定編號的寶物標記為已賣出。
-        用法：!sell 編號 金額            → 對目前進行中的場次
-             !sell 場次ID 編號 金額     → 對指定場次（捐獻物件沒有場次ID，用 0 或省略）
-        """
-        if len(args) == 2:
-            if not self.bot.active_session:
-                await ctx.send("⚠️ 目前沒有進行中的場次，請用 `!sell 場次ID 編號 金額`。")
-                return
-            session_id = self.bot.active_session["id"]
-            index_raw, amount_raw = args
-        elif len(args) == 3:
-            session_id, index_raw, amount_raw = args
-        else:
-            await ctx.send("⚠️ 用法：`!sell 編號 金額` 或 `!sell 場次ID 編號 金額`")
-            return
-
-        try:
-            index = int(index_raw)
-            amount = int(amount_raw)
-        except ValueError:
-            await ctx.send("⚠️ 編號跟金額都必須是數字。")
-            return
-
-        async with self.store.lock:
-            result = await asyncio.to_thread(self.store.sell_item, session_id, index, amount)
-
-        if not result["ok"]:
-            if result["reason"] == "not_found":
-                await ctx.send(f"⚠️ 找不到編號 {index}，請確認場次ID跟編號是否正確。")
-            else:
-                await ctx.send(f"⚠️ 編號 {index} 已經賣過了，不能重複結算。")
-            return
-
-        await ctx.send(
-            f"💰 「{result['item_name']}」已賣出 **{amount}**"
-            + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.2f}**。隊員可以用 `!claim` 領取。"
-               if result["item_type"] == "分潤" else "，已計入公會基金。")
-        )
-
-    @commands.command(name="sessioninfo")
-    async def session_info(self, ctx):
-        """查看目前進行中場次的出席名單與寶物狀態。"""
-        session = self.bot.active_session
-        if not session:
-            await ctx.send("目前沒有進行中的場次。")
-            return
-        rows = await asyncio.to_thread(self.store.get_session_rows, session["id"])
-
-        by_index = {}
+    def upsert_job(self, name: str, tier: int, parent: str, image: str) -> str:
+        rows = self.get_rows(SHEET_JOBS)
         for r in rows:
-            idx = r.get("寶物編號", "")
-            by_index.setdefault(idx, []).append(r)
+            if r.get("職業名稱", "").strip() == name:
+                final_image = image if image is not None else r.get("圖片網址", "")
+                self.write_row(SHEET_JOBS, r["_row"], [name, tier, parent or "", final_image])
+                return "updated"
+        row_num = self._first_empty_row_from(rows)
+        self.write_row(SHEET_JOBS, row_num, [name, tier, parent or "", image or ""])
+        return "created"
 
-        names = "、".join(m["display_name"] for m in session["members"])
-        lines = [f"場次 ID：{session['id']}", f"出席：{names}", "寶物："]
-        if not by_index:
-            lines.append("  （尚未記錄任何寶物）")
-        for idx, group in by_index.items():
-            first = group[0]
-            if first.get("售出金額", "").strip():
-                status = f"已賣 {first['售出金額']}"
-                if first.get("均分$$", "").strip():
-                    status += f"（每人 {first['均分$$']}）"
-            else:
-                status = "未賣出"
-            lines.append(f"  [{idx}] {first.get('掉落')}（{first.get('類型')}）：{status}")
+    def delete_job(self, name: str):
+        rows = self.get_rows(SHEET_JOBS)
+        for r in rows:
+            if r.get("職業名稱", "").strip() == name:
+                self.delete_row(SHEET_JOBS, r["_row"])
+                return True
+        return False
 
-        await ctx.send("```" + "\n".join(lines) + "```")
+    # ---------- 角色資料 / 帳號基本資料 ----------
 
-    @commands.command(name="unclaimed")
-    async def show_unclaimed(self, ctx, session_id: str = None):
-        """查看場次裡還有誰沒領錢。不填場次ID時查目前進行中的場次。"""
-        if not session_id:
-            if not self.bot.active_session:
-                await ctx.send("目前沒有進行中的場次，請指定場次ID：`!unclaimed 場次ID`。")
-                return
-            session_id = self.bot.active_session["id"]
+    def get_characters(self) -> list:
+        return self.get_rows(SHEET_CHARACTERS)
 
-        pending = await asyncio.to_thread(self.store.unclaimed_for_session, session_id)
-        if not pending:
-            await ctx.send("✅ 這個場次目前沒有人有待領款項。")
-            return
+    def get_user_characters(self, discord_id: str) -> list:
+        return [r for r in self.get_characters() if r.get("Discord ID", "").strip() == str(discord_id)]
 
-        lines = []
-        for key, amount in pending.items():
-            if key.startswith("raw:"):
-                display = f"{key[4:]}（未綁定 Discord 帳號，需人工處理）"
-            else:
-                display = await resolve_display_name(key, key, ctx.guild)
-            lines.append(f"- {display}：{amount:.2f}")
-        await ctx.send("**💸 尚未領款：**\n```" + "\n".join(lines) + "```")
+    def find_user_by_character_name(self, name: str):
+        """依角色名字（正規化後）反查 Discord ID。回傳 (discord_id, 原始角色名字) 或 (None, None)。"""
+        key = normalize_name(name)
+        for r in self.get_characters():
+            if normalize_name(r.get("角色名稱", "")) == key:
+                return r.get("Discord ID", "").strip() or None, r.get("角色名稱", "")
+        return None, None
 
-    @commands.hybrid_command(name="claim")
-    async def claim(self, ctx, session_id: str = None):
+    def find_users_by_character_names(self, names: list) -> dict:
         """
-        領取自己尚未領取的分潤。用 /claim 打的話只有你看得到。
-        用法：!claim            → 只有一場待領時直接領取；多場時跳選單
-             !claim 場次ID     → 直接領取指定場次
+        一次性查詢多個角色名字各自對應到的 Discord ID，只讀一次「角色資料」表，
+        避免像 find_user_by_character_name 那樣每個名字各自讀一次整張表。
+        回傳 {原始名字: (discord_id, 登記時的角色名字)}。
         """
-        uid = str(ctx.author.id)
+        characters = self.get_characters()
+        result = {}
+        for name in names:
+            key = normalize_name(name)
+            match = (None, None)
+            for r in characters:
+                if normalize_name(r.get("角色名稱", "")) == key:
+                    match = (r.get("Discord ID", "").strip() or None, r.get("角色名稱", ""))
+                    break
+            result[name] = match
+        return result
 
-        if session_id:
-            async with self.store.lock:
-                result = await asyncio.to_thread(self.store.claim_for_user, uid, session_id)
-            if not result["details"]:
-                await ctx.send(f"場次 `{session_id}` 沒有可領取的分潤。", ephemeral=True)
+    def upsert_character(self, discord_id: str, display_name: str, char_name: str, job: str, position: str = "") -> str:
+        """新增或更新一隻角色。同名角色（正規化後）視為同一隻，更新職業/位置；否則新增一列。"""
+        key = normalize_name(char_name)
+        rows = self.get_characters()
+        for r in rows:
+            if r.get("Discord ID", "").strip() == str(discord_id) and normalize_name(r.get("角色名稱", "")) == key:
+                self.write_row(SHEET_CHARACTERS, r["_row"],
+                                [str(discord_id), display_name, char_name, job, position])
+                self.ensure_account_row(discord_id, display_name)
+                return "updated"
+        row_num = self._first_empty_row_from(rows)
+        self.write_row(SHEET_CHARACTERS, row_num, [str(discord_id), display_name, char_name, job, position])
+        self.ensure_account_row(discord_id, display_name)
+        return "created"
+
+    def delete_character(self, discord_id: str, index: int):
+        """index 是這個帳號角色清單裡的第幾個（0-based，跟 !myprofiles 顯示的編號一致）。"""
+        chars = self.get_user_characters(discord_id)
+        if index < 0 or index >= len(chars):
+            return None
+        target = chars[index]
+        self.delete_row(SHEET_CHARACTERS, target["_row"])
+        return target
+
+    def ensure_account_row(self, discord_id: str, display_name: str):
+        """確保帳號基本資料表裡有這個 Discord ID 的列，沒有就新增一列（可出席時間留空）。"""
+        rows = self.get_rows(SHEET_ACCOUNTS)
+        for r in rows:
+            if r.get("Discord ID", "").strip() == str(discord_id):
                 return
-            detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
-            await ctx.send(f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", ephemeral=True)
-            return
+        row_num = self._first_empty_row_from(rows)
+        self.write_row(SHEET_ACCOUNTS, row_num, [str(discord_id), display_name, "", "", ""])
 
-        pending_sessions = await asyncio.to_thread(self.store.pending_sessions_for_user, uid)
-        if not pending_sessions:
-            await ctx.send("目前沒有可領取的分潤。", ephemeral=True)
-            return
+    def get_account_stats(self, discord_id: str) -> dict:
+        for r in self.get_rows(SHEET_ACCOUNTS):
+            if r.get("Discord ID", "").strip() == str(discord_id):
+                return r
+        return {}
 
-        if len(pending_sessions) == 1:
-            async with self.store.lock:
-                result = await asyncio.to_thread(self.store.claim_for_user, uid, pending_sessions[0][0])
-            detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
-            await ctx.send(f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", ephemeral=True)
-            return
+    def update_availability(self, discord_id: str, display_name: str,
+                             weekday: bool = None, weekend: bool = None, note: str = None):
+        """更新平日/假日可出席、其他時間備註。傳 None 代表這個欄位保持原值不變。"""
+        self.ensure_account_row(discord_id, display_name)
+        for r in self.get_rows(SHEET_ACCOUNTS):
+            if r.get("Discord ID", "").strip() == str(discord_id):
+                cur_weekday = str(r.get("平日可出席", "")).strip().upper() == "TRUE"
+                cur_weekend = str(r.get("假日可出席", "")).strip().upper() == "TRUE"
+                cur_note = r.get("其他時間備註", "")
+                new_weekday = cur_weekday if weekday is None else weekday
+                new_weekend = cur_weekend if weekend is None else weekend
+                new_note = cur_note if note is None else note
+                self.write_row(SHEET_ACCOUNTS, r["_row"], [new_weekday, new_weekend, new_note], start_col=3)
+                return
 
-        lines = "\n".join(f"- {sid}：待領 {amt:.2f}" for sid, amt in pending_sessions)
-        view = ClaimSelectView(self.store, ctx.author.id, pending_sessions)
-        await ctx.send(f"你有多場待領分潤，請選擇要領取哪一場：\n```{lines}```", view=view, ephemeral=True)
+    # ---------- 場次記錄 ----------
 
-    @commands.hybrid_command(name="pending")
-    async def pending(self, ctx):
-        """查看自己目前尚未領取的分潤總額與明細。用 /pending 打的話只有你看得到。"""
-        result = await asyncio.to_thread(self.store.pending_for_user, str(ctx.author.id))
-        if not result["details"]:
-            await ctx.send("目前沒有待領取的分潤。", ephemeral=True)
-            return
-        text = "\n".join(f"{sid}：{name}（{amt:.2f}）" for sid, name, amt in result["details"])
-        await ctx.send(f"**💰 待領取分潤，共 {result['total']:.2f}：**\n```{text}```", ephemeral=True)
+    def get_session_rows(self, session_id: str) -> list:
+        return [r for r in self.get_rows(SHEET_SESSIONS) if r.get("場次ID", "").strip() == session_id]
 
-    @commands.command(name="guildfund")
-    async def guild_fund(self, ctx):
-        """查看公會基金總額。"""
-        total = await asyncio.to_thread(self.store.guild_fund_total)
-        await ctx.send(f"🏦 公會基金總額：**{total:.2f}**")
+    def next_item_index(self, session_id: str) -> int:
+        indices = [
+            int(r["寶物編號"]) for r in self.get_session_rows(session_id)
+            if r.get("寶物編號", "").strip().isdigit()
+        ]
+        return (max(indices) + 1) if indices else 0
 
+    def append_item_rows(self, session_id, when_iso, members, item_name, item_index, item_type, contributor):
+        """
+        members: list of {"discord_id": str|None, "name": str} — 分潤類型才需要多列。
+        分潤：每個 member 各一列；公會/自用：只需要一列（塔團/DiscordID 留空）。
+        這裡會把這次要新增的所有列一次性打包成一個 API 呼叫寫入，不會一列一列分開打。
+        """
+        rows_data = []
+        if item_type == "分潤":
+            for m in members:
+                rows_data.append([
+                    session_id or "", when_iso, m.get("name", ""), m.get("discord_id") or "",
+                    m.get("display_name", m.get("name", "")), item_name, item_index,
+                    item_type, contributor or "", "", "", "", "",
+                ])
+        else:
+            rows_data.append([
+                session_id or "", when_iso, "", "", "",
+                item_name, item_index if item_index is not None else "",
+                item_type, contributor or "", "", "", "", "",
+            ])
+        self.append_rows_batch(SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2)
 
-async def setup(bot):
-    await bot.add_cog(Sessions(bot))
+    def sell_item(self, session_id: str, item_index: int, amount: int) -> dict:
+        """把指定場次+編號的寶物填上售出金額，分潤類型會平分給每一列。回傳結果摘要。"""
+        target_rows = [
+            r for r in self.get_session_rows(session_id)
+            if r.get("寶物編號", "").strip() == str(item_index)
+        ]
+        if not target_rows:
+            return {"ok": False, "reason": "not_found"}
+        if any(r.get("售出金額", "").strip() for r in target_rows):
+            return {"ok": False, "reason": "already_sold"}
+
+        item_type = target_rows[0].get("類型", "")
+        item_name = target_rows[0].get("掉落", "")
+
+        if item_type == "分潤":
+            per_person = amount / len(target_rows)
+            updates = [(r["_row"], 10, [amount, round(per_person, 2), False, ""]) for r in target_rows]
+        else:
+            per_person = amount
+            updates = [(r["_row"], 10, [amount, "", "", ""]) for r in target_rows]
+
+        self.batch_update_cells(SHEET_SESSIONS, updates)
+
+        return {
+            "ok": True, "item_name": item_name, "item_type": item_type,
+            "amount": amount, "per_person": per_person, "n_rows": len(target_rows),
+        }
+
+    def claim_for_user(self, discord_id: str, session_id: str = None) -> dict:
+        """把這個使用者所有（或指定場次）尚未領取的分潤列標記已領。回傳明細。"""
+        now = datetime.now(timezone.utc).isoformat()
+        total = 0.0
+        details = []
+        updates = []
+        for r in self.get_rows(SHEET_SESSIONS):
+            if r.get("類型") != "分潤":
+                continue
+            if r.get("Discord ID", "").strip() != str(discord_id):
+                continue
+            if session_id and r.get("場次ID", "").strip() != session_id:
+                continue
+            already = str(r.get("已領", "")).strip().upper() == "TRUE"
+            sale = r.get("售出金額", "").strip()
+            per_person = r.get("均分$$", "").strip()
+            if already or not sale or not per_person:
+                continue
+            updates.append((r["_row"], 12, [True, now]))
+            amt = float(per_person)
+            total += amt
+            details.append((r.get("場次ID", ""), r.get("掉落", ""), amt))
+
+        if updates:
+            self.batch_update_cells(SHEET_SESSIONS, updates)
+        return {"total": total, "details": details}
+
+    def pending_for_user(self, discord_id: str) -> dict:
+        total = 0.0
+        details = []
+        for r in self.get_rows(SHEET_SESSIONS):
+            if r.get("類型") != "分潤":
+                continue
+            if r.get("Discord ID", "").strip() != str(discord_id):
+                continue
+            already = str(r.get("已領", "")).strip().upper() == "TRUE"
+            sale = r.get("售出金額", "").strip()
+            per_person = r.get("均分$$", "").strip()
+            if already or not sale or not per_person:
+                continue
+            amt = float(per_person)
+            total += amt
+            details.append((r.get("場次ID", ""), r.get("掉落", ""), amt))
+        return {"total": total, "details": details}
+
+    def pending_sessions_for_user(self, discord_id: str) -> list:
+        """回傳這個人有待領分潤的場次清單 [(session_id, amount), ...]。"""
+        by_session = {}
+        for session_id, item_name, amt in self.pending_for_user(discord_id)["details"]:
+            by_session[session_id] = by_session.get(session_id, 0) + amt
+        return list(by_session.items())
+
+    def unclaimed_for_session(self, session_id: str) -> dict:
+        """回傳這個場次裡，誰還沒領錢 {key: amount}，key 是 discord_id 或 "raw:名字"。"""
+        pending = {}
+        for r in self.get_session_rows(session_id):
+            if r.get("類型") != "分潤":
+                continue
+            sale = r.get("售出金額", "").strip()
+            if not sale:
+                continue
+            already = str(r.get("已領", "")).strip().upper() == "TRUE"
+            if already:
+                continue
+            key = r.get("Discord ID", "").strip() or f"raw:{r.get('塔團', '')}"
+            per_person = float(r.get("均分$$", "0") or 0)
+            pending[key] = pending.get(key, 0) + per_person
+        return pending
+
+    def guild_fund_total(self) -> float:
+        total = 0.0
+        for r in self.get_rows(SHEET_SESSIONS):
+            if r.get("類型") == "公會" and r.get("售出金額", "").strip():
+                total += float(r["售出金額"])
+        return total
+
+    # ---------- 頻道/論壇指令規則（另外存一個獨立分頁不划算，先放在職業管理表旁邊的做法不理想，
+    # 改成存在一個叫「系統設定」的分頁；如果沒有這個分頁，第一次使用時自動建立） ----------
+
+    def _rules_sheet(self):
+        try:
+            return self.ws("系統設定")
+        except gspread.WorksheetNotFound:
+            ss = self._ss()
+            ws = ss.add_worksheet(title="系統設定", rows=200, cols=2)
+            ws.update("A1:B1", [["頻道/討論串ID", "允許指令(逗號分隔)"]])
+            return ws
+
+    def get_all_channel_rules(self) -> dict:
+        ws = self._rules_sheet()
+        values = ws.get_all_values()
+        rules = {}
+        for row in values[1:]:
+            if len(row) >= 2 and row[0].strip():
+                rules[row[0].strip()] = [c.strip() for c in row[1].split(",") if c.strip()]
+        return rules
+
+    def set_channel_rules(self, key: str, allowed: list):
+        ws = self._rules_sheet()
+        values = ws.get_all_values()
+        for i, row in enumerate(values[1:], start=2):
+            if row and row[0].strip() == key:
+                ws.update(f"A{i}:B{i}", [[key, ",".join(allowed)]])
+                return
+        row_num = len(values) + 1
+        ws.update(f"A{row_num}:B{row_num}", [[key, ",".join(allowed)]])
+
+    def clear_channel_rules(self, key: str):
+        ws = self._rules_sheet()
+        values = ws.get_all_values()
+        for i, row in enumerate(values[1:], start=2):
+            if row and row[0].strip() == key:
+                ws.delete_rows(i)
+                return
