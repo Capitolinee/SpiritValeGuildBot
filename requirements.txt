@@ -1,5 +1,0 @@
-discord.py
-google-genai
-requests
-gspread
-google-auth
