@@ -199,6 +199,21 @@ class SheetsStore:
                 return r
         return {}
 
+    def update_availability(self, discord_id: str, display_name: str,
+                             weekday: bool = None, weekend: bool = None, note: str = None):
+        """更新平日/假日可出席、其他時間備註。傳 None 代表這個欄位保持原值不變。"""
+        self.ensure_account_row(discord_id, display_name)
+        for r in self.get_rows(SHEET_ACCOUNTS):
+            if r.get("Discord ID", "").strip() == str(discord_id):
+                cur_weekday = str(r.get("平日可出席", "")).strip().upper() == "TRUE"
+                cur_weekend = str(r.get("假日可出席", "")).strip().upper() == "TRUE"
+                cur_note = r.get("其他時間備註", "")
+                new_weekday = cur_weekday if weekday is None else weekday
+                new_weekend = cur_weekend if weekend is None else weekend
+                new_note = cur_note if note is None else note
+                self.write_row(SHEET_ACCOUNTS, r["_row"], [new_weekday, new_weekend, new_note], start_col=3)
+                return
+
     # ---------- 場次記錄 ----------
 
     def get_session_rows(self, session_id: str) -> list:
