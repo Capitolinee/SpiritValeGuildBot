@@ -1002,30 +1002,125 @@ async def close_session_cmd(ctx, session_id: str = None):
     await ctx.send(f"✅ 已結束場次 `{session_id}`。")
 
 
-@bot.command(name="claim")
-async def claim_payout(ctx):
-    """領取自己在所有場次裡尚未領取的分潤。"""
-    uid = str(ctx.author.id)
+class ClaimSelect(discord.ui.Select):
+    def __init__(self, author_id: int, pending_sessions: list):
+        options = [
+            discord.SelectOption(label=f"{sid}（待領 {amt:.2f}）", value=sid)
+            for sid, amt in pending_sessions[:24]
+        ]
+        options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
+        super().__init__(placeholder="選擇要領取哪一場", options=options, min_values=1, max_values=1)
+        self.author_id = author_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("這是別人發起的領取，你可以自己打 `!claim` 喔。", ephemeral=True)
+            return
+
+        chosen = self.values[0]
+        uid = str(interaction.user.id)
+
+        async with github_lock:
+            records, sha = await asyncio.to_thread(github_get_records)
+            sessions_to_check = (
+                records.get("sessions", []) if chosen == "__ALL__" else [get_session(records, chosen)]
+            )
+
+            total = 0.0
+            details = []
+            for session in sessions_to_check:
+                if not session:
+                    continue
+                for it in session.get("items", []):
+                    claims = it.get("claims", {})
+                    if claims.get(uid) is False:
+                        claims[uid] = True
+                        total += it.get("per_person", 0) or 0
+                        details.append(f"{session['id']}：{it.get('name')} +{it.get('per_person', 0):.2f}")
+
+            if not details:
+                await interaction.response.edit_message(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
+                return
+
+            await asyncio.to_thread(github_save_records, records, sha, f"{interaction.user} 領取分潤")
+
+        detail_text = "\n".join(details)
+        await interaction.response.edit_message(
+            content=f"✅ 已領取，共 **{total:.2f}**：\n```{detail_text}```", view=None
+        )
+
+
+class ClaimSelectView(discord.ui.View):
+    def __init__(self, author_id: int, pending_sessions: list):
+        super().__init__(timeout=120)
+        self.add_item(ClaimSelect(author_id, pending_sessions))
+
+
+async def _do_claim_session(ctx, uid: str, session_id: str):
+    """實際執行對單一場次的領取動作。"""
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        total = 0.0
-        claimed_details = []
-        for session in records.get("sessions", []):
-            for it in session.get("items", []):
-                claims = it.get("claims", {})
-                if claims.get(uid) is False:
-                    claims[uid] = True
-                    total += it.get("per_person", 0) or 0
-                    claimed_details.append(f"{session['id']}：{it.get('name')} +{it.get('per_person', 0):.2f}")
+        session = get_session(records, session_id)
+        if not session:
+            await ctx.send(f"⚠️ 找不到場次 `{session_id}`。")
+            return
 
-        if not claimed_details:
-            await ctx.send("目前沒有可領取的分潤。")
+        total = 0.0
+        details = []
+        for it in session.get("items", []):
+            claims = it.get("claims", {})
+            if claims.get(uid) is False:
+                claims[uid] = True
+                total += it.get("per_person", 0) or 0
+                details.append(f"{session['id']}：{it.get('name')} +{it.get('per_person', 0):.2f}")
+
+        if not details:
+            await ctx.send(f"場次 `{session_id}` 沒有可領取的分潤。")
             return
 
         await asyncio.to_thread(github_save_records, records, sha, f"{ctx.author} 領取分潤")
 
-    detail_text = "\n".join(claimed_details)
+    detail_text = "\n".join(details)
     await ctx.send(f"✅ 已領取，共 **{total:.2f}**：\n```{detail_text}```")
+
+
+@bot.command(name="claim")
+async def claim_payout(ctx, session_id: str = None):
+    """
+    領取自己尚未領取的分潤。
+    用法：
+      !claim            → 只有一場待領時直接領取；有多場待領時跳出選單讓你挑
+      !claim 場次ID     → 直接領取指定場次（場次ID用 !sessions 查）
+    """
+    uid = str(ctx.author.id)
+
+    if session_id:
+        await _do_claim_session(ctx, uid, session_id)
+        return
+
+    records, _ = await asyncio.to_thread(github_get_records)
+    pending_sessions = []
+    for session in records.get("sessions", []):
+        amt = 0.0
+        has_pending = False
+        for it in session.get("items", []):
+            if it.get("claims", {}).get(uid) is False:
+                has_pending = True
+                amt += it.get("per_person", 0) or 0
+        if has_pending:
+            pending_sessions.append((session["id"], amt))
+
+    if not pending_sessions:
+        await ctx.send("目前沒有可領取的分潤。")
+        return
+
+    if len(pending_sessions) == 1:
+        await _do_claim_session(ctx, uid, pending_sessions[0][0])
+        return
+
+    lines = "\n".join(f"- {sid}：待領 {amt:.2f}" for sid, amt in pending_sessions)
+    view = ClaimSelectView(ctx.author.id, pending_sessions)
+    await ctx.send(f"你有多場待領分潤，請選擇要領取哪一場：\n```{lines}```", view=view)
 
 
 @bot.command(name="pending")
