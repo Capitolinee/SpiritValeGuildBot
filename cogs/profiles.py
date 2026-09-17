@@ -19,15 +19,16 @@ class NameModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         name = self.name_input.value.strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
         jobs = await asyncio.to_thread(self.store.get_jobs)
         if not jobs:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ 目前還沒有設定任何職業，請先請管理員用 `!addjob 職業名稱 tier=1` 新增職業。",
                 ephemeral=True,
             )
             return
         view = JobSelectView(self.store, name, jobs)
-        await interaction.response.send_message(f"名字：**{name}**\n請選擇你的職業：", view=view, ephemeral=True)
+        await interaction.followup.send(f"名字：**{name}**\n請選擇你的職業：", view=view, ephemeral=True)
 
 
 async def finalize_profile(store, interaction: discord.Interaction, name: str, job: str, jobs: dict):
@@ -46,7 +47,7 @@ async def finalize_profile(store, interaction: discord.Interaction, name: str, j
     )
     if image_url:
         embed.set_thumbnail(url=image_url)
-    await interaction.response.edit_message(content=None, embed=embed, view=None)
+    await interaction.edit_original_response(content=None, embed=embed, view=None)
 
 
 class JobSelect(discord.ui.Select):
@@ -72,6 +73,7 @@ class JobSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         chosen = self.values[0]
         if chosen == "__STOP__":
+            await interaction.response.defer()
             await finalize_profile(self.store, interaction, self.name, self.current_job, self.jobs)
             return
 
@@ -83,6 +85,7 @@ class JobSelect(discord.ui.Select):
                 view=view,
             )
         else:
+            await interaction.response.defer()
             await finalize_profile(self.store, interaction, self.name, chosen, self.jobs)
 
 
