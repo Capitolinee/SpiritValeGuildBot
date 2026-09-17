@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 import gspread
 from google.oauth2.service_account import Credentials
 
+from helpers import now_str
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -31,7 +33,13 @@ SHEET_SESSIONS = "場次記錄"
 SHEET_JOBS = "職業管理"
 SHEET_ACCOUNTS = "帳號基本資料"
 
-MAX_ROW = 500
+# 表格裡實際手動拖曳/貼上公式到第幾列，機器人只能安全寫到這裡（超過這個範圍，
+# 那一列會沒有公式、算不出數字）。之後表格端拖更長，記得同步把這個環境變數改大，
+# 不然機器人自己還是會覺得「到 1000 列就滿了」，明明表格早就拖更長了。
+MAX_ROW = int(os.environ.get("FORMULA_FILL_LIMIT", "1000"))
+
+# 剩餘列數低於這個門檻時，寫入資料的回覆會附上警告，提醒你該去表格端把公式拖長了
+WARNING_THRESHOLD = 50
 
 # 容易造成誤判的「形似字元」對照表：左邊會被視為跟右邊相同。
 CONFUSABLE_CHAR_MAP = {
@@ -135,6 +143,34 @@ class SheetsStore:
 
     def delete_row(self, sheet_name: str, row_number: int):
         self.ws(sheet_name).delete_rows(row_number)
+
+    def get_sheet_usage(self, sheet_name: str) -> dict:
+        """
+        查這張表目前用到第幾列、離「公式拖曳範圍上限」(MAX_ROW) 還剩多少列。
+        用最後一個非空白列的實際列號來判斷，不是用資料筆數（避免中間有刪除留下的空缺誤判）。
+        """
+        rows = self.get_rows(sheet_name)
+        used_row = max((r["_row"] for r in rows), default=1)
+        return {
+            "sheet": sheet_name,
+            "used_row": used_row,
+            "limit": MAX_ROW,
+            "remaining": MAX_ROW - used_row,
+        }
+
+    def get_all_usage(self) -> list:
+        return [self.get_sheet_usage(name) for name in (SHEET_CHARACTERS, SHEET_SESSIONS, SHEET_ACCOUNTS)]
+
+    def capacity_warning_for(self, sheet_name: str) -> str:
+        """如果指定的表快接近公式拖曳範圍上限，回傳一句警告文字；還夠用就回傳 None。"""
+        usage = self.get_sheet_usage(sheet_name)
+        if usage["remaining"] <= WARNING_THRESHOLD:
+            return (
+                f"⚠️ 「{sheet_name}」目前用到第 {usage['used_row']} 列，"
+                f"公式只拖曳到第 {usage['limit']} 列，只剩 {usage['remaining']} 列可用！"
+                f"請去 Google Sheets 把公式往下拖曳延伸（範例操作問我），不然快沒地方寫了。"
+            )
+        return None
 
     @staticmethod
     def _first_empty_row_from(rows: list, max_row: int = MAX_ROW) -> int:
@@ -284,6 +320,19 @@ class SheetsStore:
         ]
         return (max(indices) + 1) if indices else 0
 
+    def record_attendance(self, session_id: str, when_iso: str, members: list):
+        """
+        單純記錄出席，不綁定任何寶物。確認隊員名單的當下就寫入這筆，
+        這樣就算這一場全程沒有掉寶，出席次數也還是會被正確算到。
+        """
+        rows_data = []
+        for m in members:
+            rows_data.append([
+                session_id, when_iso, m.get("name", ""), m.get("discord_id") or "",
+                m.get("display_name", m.get("name", "")), "", "", "出席", "", "", "", "", "",
+            ])
+        self.append_rows_batch(SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2)
+
     def append_item_rows(self, session_id, when_iso, members, item_name, item_index, item_type, contributor):
         """
         members: list of {"discord_id": str|None, "name": str} — 分潤類型才需要多列。
@@ -336,7 +385,7 @@ class SheetsStore:
 
     def claim_for_user(self, discord_id: str, session_id: str = None) -> dict:
         """把這個使用者所有（或指定場次）尚未領取的分潤列標記已領。回傳明細。"""
-        now = datetime.now(timezone.utc).isoformat()
+        now = now_str()
         total = 0.0
         details = []
         updates = []

@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler

@@ -1,5 +1,12 @@
 """跟 Discord API 互動的顯示用輔助函式（不是純資料儲存，所以獨立於 store.py）。"""
+from datetime import datetime, timezone
+
 import discord
+
+
+def now_str() -> str:
+    """統一的時間格式：yyyy/mm/dd HH:MM:SS（UTC）。所有跟時間有關的紀錄都用這個，不要直接用 isoformat()。"""
+    return datetime.now(timezone.utc).strftime("%Y/%m/%d %H:%M:%S")
 
 
 async def resolve_display_name(discord_id: str, fallback_name: str, guild: discord.Guild = None) -> str:
