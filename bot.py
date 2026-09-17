@@ -63,6 +63,36 @@ github_lock = asyncio.Lock()
 # 但場次本身的資料都在 GitHub 上，不會遺失，只是重啟後需要用新的隊員圖片重開一個場次）
 ACTIVE_SESSIONS: dict = {}  # {channel_id(int): session_id(str)}
 
+# 每個論壇/討論串的指令限制快取（開機時從 GitHub 載入，設定時同步更新，避免每次下指令都要讀一次 GitHub）
+FORUM_RULES: dict = {}  # {"channel_or_forum_id(str)": ["允許的指令名稱", ...]}
+
+# 這些是「管理規則本身」的指令，不管論壇/討論串設了什麼限制，永遠都能用，避免自己把自己鎖住
+RULE_MANAGEMENT_COMMANDS = {
+    "setthreadrules", "clearthreadrules", "threadrules",
+    "setforumrules", "clearforumrules", "forumrules",
+}
+
+
+def resolve_allowed_commands(ctx):
+    """
+    決定目前這則訊息允許用哪些指令：
+    1. 先看「這個討論串自己」有沒有專屬規則（最優先）
+    2. 沒有的話，看它的上層論壇（或所屬頻道）有沒有規則
+    3. 都沒有就代表不受限制，回傳 None
+    """
+    channel = ctx.channel
+    thread_key = str(channel.id)
+    if thread_key in FORUM_RULES:
+        return FORUM_RULES[thread_key]
+
+    parent = getattr(channel, "parent", None)
+    if parent is not None:
+        parent_key = str(parent.id)
+        if parent_key in FORUM_RULES:
+            return FORUM_RULES[parent_key]
+
+    return None
+
 
 def new_session_id() -> str:
     return f"s{int(datetime.now(timezone.utc).timestamp())}"
@@ -133,7 +163,7 @@ def github_get_records():
         timeout=15,
     )
     if resp.status_code == 404:
-        return {"members": [], "items": [], "jobs": {}, "profiles": {}, "sessions": []}, None
+        return {"members": [], "items": [], "jobs": {}, "profiles": {}, "sessions": [], "channel_rules": {}}, None
 
     resp.raise_for_status()
     payload = resp.json()
@@ -143,13 +173,14 @@ def github_get_records():
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        data = {"members": [], "items": [], "jobs": {}, "profiles": {}, "sessions": []}
+        data = {"members": [], "items": [], "jobs": {}, "profiles": {}, "sessions": [], "channel_rules": {}}
 
     data.setdefault("members", [])
     data.setdefault("items", [])
     data.setdefault("jobs", {})       # {"職業名稱": {"tier": int, "parent": str|None, "image": str}}
     data.setdefault("profiles", {})   # {"discord_user_id": {"name":..., "job":..., "recorded_at":...}}
     data.setdefault("sessions", [])   # [{"id":..., "channel_id":..., "members":[...], "items":[...], "closed": bool}]
+    data.setdefault("channel_rules", {})  # {"channel_or_forum_id": ["允許的指令名稱", ...]}
     return data, sha
 
 
@@ -304,6 +335,128 @@ def rename_member(records: dict, index: int, new_name: str) -> str:
 
     target["name"] = new_name
     return "renamed"
+
+
+@bot.check
+async def restrict_by_forum(ctx):
+    """全域檢查：討論串／論壇有設定指令白名單的話，只允許清單內的指令執行。"""
+    if ctx.command is None:
+        return True
+    if ctx.command.name in RULE_MANAGEMENT_COMMANDS:
+        return True  # 管理規則本身的指令永遠放行，避免自己把自己鎖住
+
+    allowed = resolve_allowed_commands(ctx)
+    if allowed and ctx.command.name not in allowed:
+        raise commands.CheckFailure(f"這裡只開放這些指令：{', '.join(allowed)}")
+    return True
+
+
+@bot.command(name="setthreadrules")
+async def set_thread_rules(ctx, *, commands_csv: str):
+    """
+    限制「這個討論串／頻道自己」只能使用列出的指令（優先於論壇的預設規則）。
+    用法：!setthreadrules myprofiles,profile
+    """
+    key = str(ctx.channel.id)
+    allowed = [c.strip().lstrip("!") for c in commands_csv.split(",") if c.strip()]
+    if not allowed:
+        await ctx.send("⚠️ 至少要指定一個指令名稱。")
+        return
+
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("channel_rules", {})[key] = allowed
+        await asyncio.to_thread(
+            github_save_records, records, sha, f"設定討論串規則：{key} → {allowed}"
+        )
+    FORUM_RULES[key] = allowed
+    await ctx.send(f"✅ 已限制這個討論串只能使用：{', '.join(allowed)}")
+
+
+@bot.command(name="clearthreadrules")
+async def clear_thread_rules(ctx):
+    """解除「這個討論串／頻道自己」的指令限制（如果上層論壇有預設規則，會改用論壇的規則）。"""
+    key = str(ctx.channel.id)
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("channel_rules", {}).pop(key, None)
+        await asyncio.to_thread(github_save_records, records, sha, f"清除討論串規則：{key}")
+    FORUM_RULES.pop(key, None)
+    await ctx.send("✅ 已解除這個討論串的專屬限制。")
+
+
+@bot.command(name="threadrules")
+async def show_thread_rules(ctx):
+    """查看目前這個討論串／頻道實際套用的指令規則（含繼承自論壇的規則）。"""
+    channel = ctx.channel
+    thread_key = str(channel.id)
+    own_rule = FORUM_RULES.get(thread_key)
+    if own_rule:
+        await ctx.send(f"這個討論串有專屬限制，只能使用：{', '.join(own_rule)}")
+        return
+
+    parent = getattr(channel, "parent", None)
+    if parent is not None:
+        parent_rule = FORUM_RULES.get(str(parent.id))
+        if parent_rule:
+            await ctx.send(f"這裡沒有專屬限制，但套用了上層論壇的規則，只能使用：{', '.join(parent_rule)}")
+            return
+
+    await ctx.send("這裡目前沒有任何指令限制，可以使用所有指令。")
+
+
+@bot.command(name="setforumrules")
+async def set_forum_rules(ctx, *, commands_csv: str):
+    """
+    限制「整個論壇」的預設指令（底下沒有專屬設定的討論串都會套用這組規則）。
+    用法：!setforumrules item,sell,sessioninfo,unclaimed
+    """
+    channel = ctx.channel
+    parent = getattr(channel, "parent", None)
+    key = str(parent.id) if parent is not None else str(channel.id)
+
+    allowed = [c.strip().lstrip("!") for c in commands_csv.split(",") if c.strip()]
+    if not allowed:
+        await ctx.send("⚠️ 至少要指定一個指令名稱。")
+        return
+
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("channel_rules", {})[key] = allowed
+        await asyncio.to_thread(
+            github_save_records, records, sha, f"設定論壇預設規則：{key} → {allowed}"
+        )
+    FORUM_RULES[key] = allowed
+    await ctx.send(f"✅ 已設定這個論壇的預設規則：{', '.join(allowed)}（沒有專屬設定的討論串都會套用這組）")
+
+
+@bot.command(name="clearforumrules")
+async def clear_forum_rules(ctx):
+    """解除「整個論壇」的預設指令限制。"""
+    channel = ctx.channel
+    parent = getattr(channel, "parent", None)
+    key = str(parent.id) if parent is not None else str(channel.id)
+
+    async with github_lock:
+        records, sha = await asyncio.to_thread(github_get_records)
+        records.setdefault("channel_rules", {}).pop(key, None)
+        await asyncio.to_thread(github_save_records, records, sha, f"清除論壇預設規則：{key}")
+    FORUM_RULES.pop(key, None)
+    await ctx.send("✅ 已解除這個論壇的預設限制。")
+
+
+@bot.command(name="forumrules")
+async def show_forum_rules(ctx):
+    """查看目前論壇的預設指令規則。"""
+    channel = ctx.channel
+    parent = getattr(channel, "parent", None)
+    key = str(parent.id) if parent is not None else str(channel.id)
+
+    allowed = FORUM_RULES.get(key)
+    if not allowed:
+        await ctx.send("這個論壇目前沒有預設規則。")
+        return
+    await ctx.send(f"這個論壇的預設規則：{', '.join(allowed)}")
 
 
 @bot.command(name="memberlist")
@@ -601,7 +754,7 @@ class ConfirmView(discord.ui.View):
                 commit_msg += f"，開啟場次 {session['id']}"
                 reply += (
                     f"\n\n📌 已建立場次 `{session['id']}`，接下來可以用 `!item 寶物名稱` "
-                    f"或上傳寶物圖片記錄掉落，賣掉後用 `!sell 金額 寶物名稱` 結算分潤。"
+                    f"或上傳寶物圖片記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤。"
                 )
             else:
                 for it in self.payload:
@@ -1546,6 +1699,9 @@ async def on_command_error(ctx, error):
     """全域指令錯誤處理：讓錯誤直接顯示在 Discord，而不是只默默記錄在 Render log。"""
     if isinstance(error, commands.CommandNotFound):
         return  # 忽略打錯的指令名稱
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send(f"⚠️ {error}")
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"⚠️ 缺少必要參數：`{error.param.name}`，請確認指令用法。")
         return
@@ -1562,6 +1718,12 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
+    try:
+        records, _ = await asyncio.to_thread(github_get_records)
+        FORUM_RULES.update(records.get("channel_rules", {}))
+        print(f"✅ 已載入 {len(FORUM_RULES)} 個頻道/討論串的指令規則", flush=True)
+    except Exception as e:
+        print(f"⚠️ 載入頻道規則失敗：{e}", flush=True)
     try:
         for m in gemini_client.models.list():
             print(m.name, getattr(m, "supported_actions", None), flush=True)
