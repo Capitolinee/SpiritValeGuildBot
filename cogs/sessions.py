@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 
-from helpers import resolve_display_name
+from helpers import resolve_display_name, now_str
+from store import SHEET_SESSIONS
 
 PROMPT = """
 你是一個遊戲紀錄助手。請判斷這張圖片的內容類型，並依照下列規則回傳「純 JSON」，
@@ -67,7 +68,7 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
     if item_type == "分潤" and not session:
         return None, "⚠️ 目前沒有進行中的場次，請先上傳隊員圖片，或改用 `!donate` 記錄捐獻的寶物。"
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_str()
     recorded = []
     async with store.lock:
         for name in item_names:
@@ -83,7 +84,11 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
 
     summary = "、".join(recorded)
     where = f"場次 `{session_id}`" if session_id else "捐獻清單"
-    return f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```", None
+    reply = f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```"
+    warning = await asyncio.to_thread(store.capacity_warning_for, SHEET_SESSIONS)
+    if warning:
+        reply += f"\n\n{warning}"
+    return reply, None
 
 
 class EditModal(discord.ui.Modal):
@@ -120,6 +125,39 @@ class ConfirmView(discord.ui.View):
         self.author_id = author_id
         self.guild = guild
         self.message: discord.Message | None = None
+
+        if kind == "member":
+            no_loot_button = discord.ui.Button(
+                label="📋 這場沒有掉落寶物", style=discord.ButtonStyle.secondary
+            )
+            no_loot_button.callback = self.no_loot_callback
+            self.add_item(no_loot_button)
+
+    async def no_loot_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("只有上傳圖片的人可以操作喔。", ephemeral=True)
+            return
+        await interaction.response.defer()
+
+        store = self.bot.store
+        members = await build_session_members(store, self.guild, self.payload)
+        session_id = new_session_id()
+        now = now_str()
+        self.bot.active_session = {"id": session_id, "members": members, "next_item_index": 0}
+
+        async with store.lock:
+            await asyncio.to_thread(store.record_attendance, session_id, now, members)
+
+        names = "、".join(m["display_name"] for m in members)
+        content = (
+            f"**✅ 已建立場次 `{session_id}`，出席：**\n```{names}```\n"
+            f"（已標記這場沒有掉落寶物，出席已直接記錄。）"
+        )
+        warning = await asyncio.to_thread(store.capacity_warning_for, SHEET_SESSIONS)
+        if warning:
+            content += f"\n\n{warning}"
+        await interaction.edit_original_response(content=content, view=None)
+        self.stop()
 
     def preview_text(self) -> str:
         body = "、".join(self.payload) if self.payload else "（無）"
@@ -250,6 +288,26 @@ class Sessions(commands.Cog):
                 await message.channel.send("❌ Gemini 回傳的內容不是有效的 JSON，辨識失敗。")
             except Exception as e:
                 await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
+
+    @commands.command(name="noloot")
+    async def no_loot(self, ctx):
+        """
+        如果目前進行中的場次確定沒有掉落寶物，用這個指令補記錄出席
+        （適合用在已經用一般流程確認過名單、事後才確定沒有掉寶的情況；
+        如果一開始就知道沒有掉寶，直接按隊員確認畫面上的「📋 這場沒有掉落寶物」按鈕更快）。
+        """
+        session = self.bot.active_session
+        if not session:
+            await ctx.send("目前沒有進行中的場次。")
+            return
+        now = now_str()
+        async with self.store.lock:
+            await asyncio.to_thread(self.store.record_attendance, session["id"], now, session["members"])
+        reply = f"✅ 已補記錄場次 `{session['id']}` 的出席（沒有掉落寶物）。"
+        warning = await asyncio.to_thread(self.store.capacity_warning_for, SHEET_SESSIONS)
+        if warning:
+            reply += f"\n\n{warning}"
+        await ctx.send(reply)
 
     @commands.command(name="item")
     async def add_item(self, ctx, *, text: str):

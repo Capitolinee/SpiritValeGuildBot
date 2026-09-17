@@ -120,5 +120,16 @@ class AccessControl(commands.Cog):
         await ctx.send(f"這個論壇的預設規則：{', '.join(allowed)}")
 
 
+    @commands.command(name="sheetstatus")
+    async def sheet_status(self, ctx):
+        """查看目前各分頁用了幾列、離公式拖曳範圍上限還剩多少。"""
+        usage = await asyncio.to_thread(self.store.get_all_usage)
+        lines = [
+            f"- {u['sheet']}：用到第 {u['used_row']} 列 / 上限 {u['limit']} 列（剩 {u['remaining']} 列）"
+            for u in usage
+        ]
+        await ctx.send("**📊 表格容量狀況：**\n```" + "\n".join(lines) + "```")
+
+
 async def setup(bot):
     await bot.add_cog(AccessControl(bot))
