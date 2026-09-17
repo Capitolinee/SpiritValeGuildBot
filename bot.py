@@ -793,18 +793,34 @@ async def sync_members(ctx):
 
 
 @bot.command(name="item")
-async def add_item_to_session(ctx, *, item_name: str):
-    """把寶物手動加進目前頻道進行中的場次。用法：!item 寶物名稱"""
+async def add_item_to_session(ctx, *, text: str):
+    """
+    把寶物手動加進場次。
+    用法：
+      !item 寶物名稱            → 加進目前頻道「預設場次」
+      !item 場次ID 寶物名稱     → 加進指定場次（場次ID用 !sessions 查）
+    """
+    parts = text.split(maxsplit=1)
+    session_id = None
+    item_name = text
+
+    if len(parts) == 2 and parts[0].startswith("s") and parts[0][1:].isdigit():
+        session_id, item_name = parts
+
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+
         if not session_id:
-            await ctx.send("⚠️ 目前這個頻道沒有進行中的場次，請先上傳隊員圖片並確認出席名單。")
-            return
+            session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+            if not session_id:
+                await ctx.send("⚠️ 目前這個頻道沒有預設場次，請先上傳隊員圖片，或用 `!item 場次ID 寶物名稱` 指定場次。")
+                return
+
         session = get_session(records, session_id)
         if not session or session.get("closed"):
-            await ctx.send("⚠️ 找不到進行中的場次，或場次已結束。")
+            await ctx.send(f"⚠️ 找不到場次 `{session_id}`，或該場次已結束。")
             return
+
         session.setdefault("items", []).append({
             "name": item_name,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -816,29 +832,49 @@ async def add_item_to_session(ctx, *, item_name: str):
         await asyncio.to_thread(
             github_save_records, records, sha, f"場次 {session_id} 新增寶物：{item_name}"
         )
-    await ctx.send(f"✅ 已將「{item_name}」加入目前場次的寶物清單。")
+    await ctx.send(f"✅ 已將「{item_name}」加入場次 `{session_id}` 的寶物清單。")
 
 
 @bot.command(name="sell")
-async def sell_item(ctx, index: int, amount: int):
+async def sell_item(ctx, *args):
     """
-    把目前場次裡指定編號的寶物標記為已賣出，並平均分配給場次內的出席隊員。
-    編號用 !sessioninfo 查。用法：!sell 編號 金額
+    把場次裡指定編號的寶物標記為已賣出，並平均分配給該場次的出席隊員。
+    用法：
+      !sell 編號 金額            → 對目前頻道「預設場次」結算
+      !sell 場次ID 編號 金額     → 對指定場次結算（場次ID用 !sessions 查）
     """
+    if len(args) == 2:
+        session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+        index_raw, amount_raw = args
+        if not session_id:
+            await ctx.send(
+                "⚠️ 目前這個頻道沒有預設場次，請改用 `!sell 場次ID 編號 金額`"
+                "（場次ID用 `!sessions` 查）。"
+            )
+            return
+    elif len(args) == 3:
+        session_id, index_raw, amount_raw = args
+    else:
+        await ctx.send("⚠️ 用法：`!sell 編號 金額` 或 `!sell 場次ID 編號 金額`")
+        return
+
+    try:
+        index = int(index_raw)
+        amount = int(amount_raw)
+    except ValueError:
+        await ctx.send("⚠️ 編號跟金額都必須是數字，確認一下順序有沒有打反。")
+        return
+
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
-        if not session_id:
-            await ctx.send("⚠️ 目前這個頻道沒有進行中的場次。")
-            return
         session = get_session(records, session_id)
         if not session:
-            await ctx.send("⚠️ 找不到進行中的場次。")
+            await ctx.send(f"⚠️ 找不到場次 `{session_id}`，用 `!sessions` 確認場次ID。")
             return
 
         items = session.get("items", [])
         if index < 0 or index >= len(items):
-            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !sessioninfo 確認編號。")
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 `!sessioninfo {session_id}` 確認編號。")
             return
 
         target_item = items[index]
@@ -869,23 +905,54 @@ async def sell_item(ctx, index: int, amount: int):
 
     member_list = "、".join(m.get("name") for m in members)
     await ctx.send(
-        f"💰 [{index}]「{item_name}」已賣出 **{amount}**，共 {len(members)} 人平分，"
+        f"💰 場次 `{session_id}` [{index}]「{item_name}」已賣出 **{amount}**，共 {len(members)} 人平分，"
         f"每人 **{per_person:.2f}**。\n出席名單：{member_list}\n"
         f"隊員可以用 `!claim` 領取自己的份額。"
     )
 
 
-@bot.command(name="sessioninfo")
-async def session_info(ctx):
-    """查看目前頻道進行中的場次資訊（出席名單、寶物清單、賣出狀態）。"""
+@bot.command(name="sessions")
+async def list_sessions(ctx):
+    """列出這個頻道所有場次（含已結束的），方便找出還沒賣完寶物的舊場次。"""
     records, _ = await asyncio.to_thread(github_get_records)
-    session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
-    if not session_id:
-        await ctx.send("目前這個頻道沒有進行中的場次。")
+    channel_sessions = [
+        s for s in records.get("sessions", [])
+        if s.get("channel_id") == str(ctx.channel.id)
+    ]
+    if not channel_sessions:
+        await ctx.send("這個頻道還沒有任何場次記錄。")
         return
+
+    active_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+    lines = []
+    for s in sorted(channel_sessions, key=lambda x: x.get("created_at", "")):
+        items = s.get("items", [])
+        unsold = sum(1 for it in items if not it.get("sold"))
+        created_date = s.get("created_at", "")[:16].replace("T", " ")
+        if s["id"] == active_id:
+            tag = "🟢 目前預設場次"
+        elif s.get("closed"):
+            tag = "🔴 已結束"
+        else:
+            tag = "⚪ 未結束（非預設，需指定場次ID操作）"
+        lines.append(f"{s['id']}｜{created_date}｜{tag}｜未賣出寶物：{unsold} 筆")
+
+    text = "\n".join(lines)
+    await ctx.send(f"**📅 場次列表：**\n```{text}```\n對舊場次操作時，記得在指令加上場次ID，例如 `!sell {channel_sessions[0]['id']} 0 3000`。")
+
+
+@bot.command(name="sessioninfo")
+async def session_info(ctx, session_id: str = None):
+    """查看場次資訊（出席名單、寶物清單、賣出狀態）。不填場次ID時查目前預設場次。"""
+    records, _ = await asyncio.to_thread(github_get_records)
+    if not session_id:
+        session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+        if not session_id:
+            await ctx.send("目前這個頻道沒有預設場次，用 `!sessions` 查看有哪些場次，或指定場次ID：`!sessioninfo 場次ID`。")
+            return
     session = get_session(records, session_id)
     if not session:
-        await ctx.send("找不到場次資料，可能已被清除。")
+        await ctx.send(f"找不到場次 `{session_id}`，用 `!sessions` 確認場次ID。")
         return
 
     member_names = "、".join(m.get("name", "未知") for m in session.get("members", []))
@@ -912,18 +979,26 @@ async def session_info(ctx):
 
 
 @bot.command(name="closesession")
-async def close_session_cmd(ctx):
-    """結束目前頻道的進行中場次（資料不會刪除，只是不再接受新寶物）。"""
+async def close_session_cmd(ctx, session_id: str = None):
+    """結束一個場次（資料不會刪除，只是不再接受新寶物）。不填場次ID時結束目前預設場次。"""
     async with github_lock:
         records, sha = await asyncio.to_thread(github_get_records)
-        session_id = ACTIVE_SESSIONS.pop(ctx.channel.id, None)
+
         if not session_id:
-            await ctx.send("目前這個頻道沒有進行中的場次。")
-            return
+            session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+            if not session_id:
+                await ctx.send("目前這個頻道沒有預設場次，用 `!sessions` 查看場次ID，或指定 `!closesession 場次ID`。")
+                return
+
         session = get_session(records, session_id)
-        if session:
-            session["closed"] = True
-            await asyncio.to_thread(github_save_records, records, sha, f"結束場次 {session_id}")
+        if not session:
+            await ctx.send(f"⚠️ 找不到場次 `{session_id}`。")
+            return
+
+        session["closed"] = True
+        if ACTIVE_SESSIONS.get(ctx.channel.id) == session_id:
+            ACTIVE_SESSIONS.pop(ctx.channel.id, None)
+        await asyncio.to_thread(github_save_records, records, sha, f"結束場次 {session_id}")
     await ctx.send(f"✅ 已結束場次 `{session_id}`。")
 
 
@@ -976,16 +1051,17 @@ async def show_pending(ctx):
 
 
 @bot.command(name="unclaimed")
-async def show_unclaimed(ctx):
-    """查看目前頻道進行中場次裡，還有誰沒領錢。"""
+async def show_unclaimed(ctx, session_id: str = None):
+    """查看場次裡還有誰沒領錢。不填場次ID時查目前預設場次。"""
     records, _ = await asyncio.to_thread(github_get_records)
-    session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
     if not session_id:
-        await ctx.send("目前這個頻道沒有進行中的場次。")
-        return
+        session_id = ACTIVE_SESSIONS.get(ctx.channel.id)
+        if not session_id:
+            await ctx.send("目前這個頻道沒有預設場次，用 `!sessions` 查看場次ID，或指定 `!unclaimed 場次ID`。")
+            return
     session = get_session(records, session_id)
     if not session:
-        await ctx.send("找不到場次資料。")
+        await ctx.send(f"找不到場次 `{session_id}`。")
         return
 
     pending = {}
