@@ -104,8 +104,9 @@ class EditModal(discord.ui.Modal):
             await interaction.response.send_message("⚠️ 內容是空的，未進行任何記錄。", ephemeral=True)
             return
         self.view_ref.payload = names
+        await interaction.response.defer()
         reply = await self.view_ref.save(interaction)
-        await interaction.response.edit_message(content=reply, view=None)
+        await interaction.edit_original_response(content=reply, view=None)
         self.view_ref.stop()
 
 
@@ -145,8 +146,9 @@ class ConfirmView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("只有上傳圖片的人可以確認喔。", ephemeral=True)
             return
+        await interaction.response.defer()
         reply = await self.save(interaction)
-        await interaction.response.edit_message(content=reply, view=None)
+        await interaction.edit_original_response(content=reply, view=None)
         self.stop()
 
     @discord.ui.button(label="✏️ 修改後再存", style=discord.ButtonStyle.primary)
@@ -183,14 +185,15 @@ class ClaimSelect(discord.ui.Select):
         uid = str(interaction.user.id)
         session_id = None if chosen == "__ALL__" else chosen
 
+        await interaction.response.defer()
         async with self.store.lock:
             result = await asyncio.to_thread(self.store.claim_for_user, uid, session_id)
 
         if not result["details"]:
-            await interaction.response.edit_message(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
+            await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
             return
         detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", view=None
         )
 
