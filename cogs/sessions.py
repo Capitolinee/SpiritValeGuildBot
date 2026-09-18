@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import re
 from datetime import datetime, timezone
 
 import discord
@@ -284,7 +285,20 @@ class Sessions(commands.Cog):
             except json.JSONDecodeError:
                 await message.channel.send("❌ Gemini 回傳的內容不是有效的 JSON，辨識失敗。")
             except Exception as e:
-                await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
+                error_text = str(e)
+                if "429" in error_text or "quota" in error_text.lower() or "RESOURCE_EXHAUSTED" in error_text:
+                    match = re.search(r"retry in ([\d.]+)s", error_text)
+                    if match:
+                        seconds = int(float(match.group(1))) + 1
+                        await message.channel.send(
+                            f"⏳ 圖片辨識額度暫時用完了，請大約 **{seconds} 秒**後再重新上傳一次圖片。"
+                        )
+                    else:
+                        await message.channel.send(
+                            "⏳ 圖片辨識額度暫時用完了（免費額度是每分鐘限制次數），請稍等約 1 分鐘後再重新上傳一次圖片。"
+                        )
+                else:
+                    await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
 
     @commands.command(name="noloot")
     async def no_loot(self, ctx):
