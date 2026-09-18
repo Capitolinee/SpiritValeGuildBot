@@ -61,6 +61,7 @@ EXTENSIONS = [
     "cogs.profiles",
     "cogs.sessions",
     "cogs.access_control",
+    "cogs.help",
 ]
 
 
@@ -85,6 +86,32 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
+
+    # 設定機器人在成員清單上顯示的狀態（就是「正在玩 ⋯⋯」那一行）
+    # 想換樣式的話改 ACTIVITY_TYPE / ACTIVITY_TEXT 這兩個環境變數就好，不用改程式碼：
+    #   playing   → 正在玩 ⋯⋯
+    #   watching  → 正在觀看 ⋯⋯
+    #   listening → 正在聽 ⋯⋯
+    #   competing → 正在參加 ⋯⋯
+    activity_type = os.getenv("ACTIVITY_TYPE", "playing").lower()
+    activity_text = os.getenv("ACTIVITY_TEXT", "!loot 管理公會分潤")
+    activity_map = {
+        "playing": discord.ActivityType.playing,
+        "watching": discord.ActivityType.watching,
+        "listening": discord.ActivityType.listening,
+        "competing": discord.ActivityType.competing,
+    }
+    try:
+        await bot.change_presence(
+            activity=discord.Activity(
+                type=activity_map.get(activity_type, discord.ActivityType.playing),
+                name=activity_text,
+            )
+        )
+        print(f"✅ 已設定狀態顯示：{activity_type} {activity_text}", flush=True)
+    except Exception as e:
+        print(f"⚠️ 設定狀態顯示失敗：{e}", flush=True)
+
     try:
         synced = await bot.tree.sync()
         print(
