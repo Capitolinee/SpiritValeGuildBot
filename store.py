@@ -52,7 +52,8 @@ def _col_letter(n: int) -> str:
 
 
 def _char_attendance_formula(row: int) -> str:
-    return (f"=SUMIFS('{SHEET_SESSIONS}'!$N:$N,'{SHEET_SESSIONS}'!$D:$D,A{row},"
+    # 用 Q 欄（角色層級的同場首筆），每隻角色各自累積出席次數
+    return (f"=SUMIFS('{SHEET_SESSIONS}'!$Q:$Q,'{SHEET_SESSIONS}'!$D:$D,A{row},"
             f"'{SHEET_SESSIONS}'!$C:$C,C{row})")
 
 
@@ -79,8 +80,19 @@ def _account_pending_formula(row: int) -> str:
 
 
 def _session_first_occurrence_formula(row: int) -> str:
-    """這欄用成長式範圍（$A$2:A{row}），本來就隨列數自動擴大，不需要整欄參照。"""
+    """
+    帳號層級的「同場首筆」：同一場次＋同一個 Discord 帳號只算一次，
+    給「帳號基本資料」的出席次數用（一個人一場只算出席一次，不管帶幾隻角色）。
+    """
     return f'=IF($D{row}="","",IF(COUNTIFS($A$2:A{row},A{row},$D$2:D{row},D{row})=1,1,0))'
+
+
+def _session_first_occurrence_by_char_formula(row: int) -> str:
+    """
+    角色層級的「同場首筆」：同一場次＋同一個角色名字只算一次，
+    給「角色資料」的出席次數用（每隻角色各自累積自己的出席次數）。
+    """
+    return f'=IF($C{row}="","",IF(COUNTIFS($A$2:A{row},A{row},$C$2:C{row},C{row})=1,1,0))'
 
 
 class SheetsStore:
@@ -452,6 +464,7 @@ class SheetsStore:
             extra_formulas=[
                 (14, _session_first_occurrence_formula),
                 (16, lambda r: operator),
+                (17, _session_first_occurrence_by_char_formula),
             ],
         )
 
@@ -482,6 +495,7 @@ class SheetsStore:
             extra_formulas=[
                 (14, _session_first_occurrence_formula),
                 (16, lambda r: operator),
+                (17, _session_first_occurrence_by_char_formula),
             ],
         )
 
