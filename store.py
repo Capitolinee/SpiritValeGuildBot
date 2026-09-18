@@ -303,6 +303,39 @@ class SheetsStore:
                 return r.get("Discord ID", "").strip() or None, r.get("角色名稱", "")
         return None, None
 
+    def backfill_discord_ids(self) -> list:
+        """
+        掃描「場次記錄」裡 Discord ID 是空白、但塔團有名字的列，重新比對現在登記的
+        角色資料，找得到就補上 Discord ID（適合在有人「事後才補登 !profile」時使用）。
+        回傳補上的清單 [(row_number, discord_id, 角色名稱), ...]，方便呼叫端接著去補
+        DC名稱（那個需要問 Discord API，不在這個純資料層處理）。
+        """
+        characters = self.get_characters()
+
+        def find_uid(name: str):
+            key = normalize_name(name)
+            for r in characters:
+                if normalize_name(r.get("角色名稱", "")) == key:
+                    return r.get("Discord ID", "").strip() or None
+            return None
+
+        updates = []
+        backfilled = []
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
+            if r.get("Discord ID", "").strip():
+                continue  # 已經有了，不用補
+            char_name = r.get("塔團", "").strip()
+            if not char_name:
+                continue  # 公會/自用/捐獻列本來就沒有塔團，不用補
+            uid = find_uid(char_name)
+            if uid:
+                updates.append((r["_row"], 4, [uid]))
+                backfilled.append((r["_row"], uid, char_name))
+
+        if updates:
+            self.batch_update_cells(SHEET_SESSIONS, updates)
+        return backfilled
+
     def find_users_by_character_names(self, names: list) -> dict:
         """
         一次性查詢多個角色名字各自對應到的 Discord ID，只讀一次「角色資料」表，
