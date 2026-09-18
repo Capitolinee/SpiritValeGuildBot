@@ -499,11 +499,16 @@ class SheetsStore:
             ],
         )
 
-    def sell_item(self, session_id: str, item_index: int, amount: int) -> dict:
-        """把指定場次+編號的寶物填上售出金額，分潤類型會平分給每一列。回傳結果摘要。"""
+    def sell_item(self, session_id: str, item_index: int, amount: int, item_name: str = None) -> dict:
+        """
+        把指定場次+編號的寶物填上售出金額，分潤類型會平分給每一列。回傳結果摘要。
+        item_name：捐獻的寶物場次ID跟編號都是空白，光靠編號會比對到同一批所有捐獻，
+        所以選單那條路會額外傳名稱來精確定位。
+        """
         target_rows = [
             r for r in self.get_session_rows(session_id)
             if r.get("寶物編號", "").strip() == str(item_index)
+            and (item_name is None or r.get("掉落", "").strip() == item_name)
         ]
         if not target_rows:
             return {"ok": False, "reason": "not_found"}
@@ -525,6 +530,73 @@ class SheetsStore:
         return {
             "ok": True, "item_name": item_name, "item_type": item_type,
             "amount": amount, "per_person": per_person, "n_rows": len(target_rows),
+        }
+
+    def list_unsold_items(self, session_id: str = None) -> list:
+        """
+        列出還沒結算（售出金額空白）的寶物，給 !sell 的選單用。
+        不指定 session_id 就列出所有場次的，包含捐獻（場次ID 空白）的寶物。
+        回傳 [{"session_id","item_index","name","when","item_type","n_rows"}, ...]，
+        照日期時間新到舊排序。
+        """
+        rows = self.get_rows(SHEET_SESSIONS, key_col_index=2)
+        if session_id:
+            rows = [r for r in rows if r.get("場次ID", "").strip() == session_id]
+
+        groups = {}
+        for r in rows:
+            if r.get("類型") == "出席":
+                continue  # 純出席列沒有寶物
+            if not r.get("掉落", "").strip():
+                continue
+            if r.get("售出金額", "").strip():
+                continue  # 已經結算過了
+            key = (r.get("場次ID", "").strip(), r.get("寶物編號", "").strip(), r.get("掉落", "").strip())
+            if key not in groups:
+                groups[key] = {
+                    "session_id": key[0],
+                    "item_index": key[1],
+                    "name": key[2],
+                    "when": r.get("日期時間", ""),
+                    "item_type": r.get("類型", ""),
+                    "n_rows": 0,
+                }
+            groups[key]["n_rows"] += 1
+
+        return sorted(groups.values(), key=lambda x: x["when"], reverse=True)
+
+    def give_item_to_member(self, session_id: str, item_index: int, receiver: str,
+                             item_name: str = None) -> dict:
+        """
+        把原本要分潤的寶物改成免費給某個成員（類型改「自用」、金額 0）。
+        只保留一列記錄誰拿走了，其他分潤列會被清空，避免每個人都掛著一筆 0 元待領。
+        """
+        target_rows = [
+            r for r in self.get_session_rows(session_id)
+            if r.get("寶物編號", "").strip() == str(item_index)
+            and (item_name is None or r.get("掉落", "").strip() == item_name)
+        ]
+        if not target_rows:
+            return {"ok": False, "reason": "not_found"}
+        if any(r.get("售出金額", "").strip() for r in target_rows):
+            return {"ok": False, "reason": "already_sold"}
+
+        item_name = target_rows[0].get("掉落", "")
+        keep = target_rows[0]
+
+        # 保留的那一列：類型改自用、金額 0、來源欄記下是給誰，塔團/DiscordID/DC名稱清空
+        # （因為「自用」在設計上是不分人的單列記錄）
+        self.write_row(SHEET_SESSIONS, keep["_row"], ["", "", ""], start_col=3)
+        self.write_row(SHEET_SESSIONS, keep["_row"], ["自用", f"免費給 {receiver}"], start_col=8)
+        self.write_row(SHEET_SESSIONS, keep["_row"], [0, "", "", ""], start_col=10)
+
+        # 其他多餘的分潤列整列清掉（從後面往前刪，避免刪除後列號位移）
+        for r in sorted(target_rows[1:], key=lambda x: x["_row"], reverse=True):
+            self.delete_row(SHEET_SESSIONS, r["_row"])
+
+        return {
+            "ok": True, "item_name": item_name, "receiver": receiver,
+            "removed_rows": len(target_rows) - 1,
         }
 
     def claim_for_user(self, discord_id: str, session_id: str = None) -> dict:
