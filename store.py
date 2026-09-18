@@ -566,11 +566,18 @@ class SheetsStore:
         return sorted(groups.values(), key=lambda x: x["when"], reverse=True)
 
     def give_item_to_member(self, session_id: str, item_index: int, receiver: str,
-                             item_name: str = None) -> dict:
+                             item_name: str = None, receiver_display: str = None) -> dict:
         """
         把原本要分潤的寶物改成免費給某個成員（類型改「自用」、金額 0）。
-        只保留一列記錄誰拿走了，其他分潤列會被清空，避免每個人都掛著一筆 0 元待領。
+        receiver 必須是「角色資料」裡登記過的角色名稱，比對不到會擋下來並回傳
+        reason="unknown_receiver"，讓呼叫端提示重打。
+        保留的那一列會把塔團/DiscordID/DC名稱填成收下的人，其他分潤列刪掉，
+        避免每個人都掛著一筆 0 元待領。
         """
+        uid, matched_name = self.find_user_by_character_name(receiver)
+        if not matched_name:
+            return {"ok": False, "reason": "unknown_receiver", "receiver": receiver}
+
         target_rows = [
             r for r in self.get_session_rows(session_id)
             if r.get("寶物編號", "").strip() == str(item_index)
@@ -583,20 +590,22 @@ class SheetsStore:
 
         item_name = target_rows[0].get("掉落", "")
         keep = target_rows[0]
+        display = receiver_display or matched_name
 
-        # 保留的那一列：類型改自用、金額 0、來源欄記下是給誰，塔團/DiscordID/DC名稱清空
-        # （因為「自用」在設計上是不分人的單列記錄）
-        self.write_row(SHEET_SESSIONS, keep["_row"], ["", "", ""], start_col=3)
-        self.write_row(SHEET_SESSIONS, keep["_row"], ["自用", f"免費給 {receiver}"], start_col=8)
+        # C=塔團 D=DiscordID E=DC名稱 → 填成收下的人
+        self.write_row(SHEET_SESSIONS, keep["_row"], [matched_name, uid or "", display], start_col=3)
+        # H=類型 I=來源/貢獻者
+        self.write_row(SHEET_SESSIONS, keep["_row"], ["自用", f"免費給 {matched_name}"], start_col=8)
+        # J=售出金額 K=均分$$ L=已領 M=領取時間
         self.write_row(SHEET_SESSIONS, keep["_row"], [0, "", "", ""], start_col=10)
 
-        # 其他多餘的分潤列整列清掉（從後面往前刪，避免刪除後列號位移）
+        # 其他多餘的分潤列整列刪掉（從後面往前刪，避免刪除後列號位移）
         for r in sorted(target_rows[1:], key=lambda x: x["_row"], reverse=True):
             self.delete_row(SHEET_SESSIONS, r["_row"])
 
         return {
-            "ok": True, "item_name": item_name, "receiver": receiver,
-            "removed_rows": len(target_rows) - 1,
+            "ok": True, "item_name": item_name, "receiver": matched_name,
+            "discord_id": uid, "removed_rows": len(target_rows) - 1,
         }
 
     def claim_for_user(self, discord_id: str, session_id: str = None) -> dict:
