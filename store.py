@@ -154,7 +154,7 @@ class SheetsStore:
         self._ensure_row_capacity(sheet_name, row_number)
         start = f"{_col_letter(start_col)}{row_number}"
         end = f"{_col_letter(start_col + len(values) - 1)}{row_number}"
-        self.ws(sheet_name).update(f"{start}:{end}", [values])
+        self.ws(sheet_name).update(f"{start}:{end}", [values], value_input_option="USER_ENTERED")
 
     def append_rows_batch(self, sheet_name: str, values_list: list, start_col: int = 1, key_col_index: int = 1,
                            extra_formulas: list = None):
@@ -170,7 +170,7 @@ class SheetsStore:
         self._ensure_row_capacity(sheet_name, end_row)
         start_letter = _col_letter(start_col)
         end_letter = _col_letter(start_col + len(values_list[0]) - 1)
-        self.ws(sheet_name).update(f"{start_letter}{start_row}:{end_letter}{end_row}", values_list)
+        self.ws(sheet_name).update(f"{start_letter}{start_row}:{end_letter}{end_row}", values_list, value_input_option="USER_ENTERED")
 
         if extra_formulas:
             updates = []
@@ -194,12 +194,13 @@ class SheetsStore:
             start_letter = _col_letter(start_col)
             end_letter = _col_letter(start_col + len(values) - 1)
             data.append({"range": f"{start_letter}{row}:{end_letter}{row}", "values": [values]})
-        self.ws(sheet_name).batch_update(data)
+        self.ws(sheet_name).batch_update(data, value_input_option="USER_ENTERED")
 
 
 
     def update_cell(self, sheet_name: str, row: int, col: int, value):
-        self.ws(sheet_name).update_cell(row, col, value)
+        letter = _col_letter(col)
+        self.ws(sheet_name).update(f"{letter}{row}", [[value]], value_input_option="USER_ENTERED")
 
     def delete_row(self, sheet_name: str, row_number: int):
         self.ws(sheet_name).delete_rows(row_number)
@@ -272,9 +273,9 @@ class SheetsStore:
         col_values = self.ws(SHEET_JOBS).col_values(self.POSITION_COL)
         for i in range(2, len(col_values) + 1):
             if not col_values[i - 1].strip():
-                self.ws(SHEET_JOBS).update_cell(i, self.POSITION_COL, name)
+                self.update_cell(SHEET_JOBS, i, self.POSITION_COL, name)
                 return "added"
-        self.ws(SHEET_JOBS).update_cell(len(col_values) + 1, self.POSITION_COL, name)
+        self.update_cell(SHEET_JOBS, len(col_values) + 1, self.POSITION_COL, name)
         return "added"
 
     def delete_position(self, name: str) -> bool:
@@ -282,7 +283,7 @@ class SheetsStore:
         col_values = self.ws(SHEET_JOBS).col_values(self.POSITION_COL)
         for i, v in enumerate(col_values[1:], start=2):
             if v.strip() == name:
-                self.ws(SHEET_JOBS).update_cell(i, self.POSITION_COL, "")
+                self.update_cell(SHEET_JOBS, i, self.POSITION_COL, "")
                 return True
         return False
 
@@ -564,7 +565,7 @@ class SheetsStore:
         except gspread.WorksheetNotFound:
             ss = self._ss()
             ws = ss.add_worksheet(title="系統設定", rows=200, cols=2)
-            ws.update("A1:B1", [["頻道/討論串ID", "允許指令(逗號分隔)"]])
+            ws.update("A1:B1", [["頻道/討論串ID", "允許指令(逗號分隔)"]], value_input_option="USER_ENTERED")
             return ws
 
     def get_all_channel_rules(self) -> dict:
@@ -581,10 +582,10 @@ class SheetsStore:
         values = ws.get_all_values()
         for i, row in enumerate(values[1:], start=2):
             if row and row[0].strip() == key:
-                ws.update(f"A{i}:B{i}", [[key, ",".join(allowed)]])
+                ws.update(f"A{i}:B{i}", [[key, ",".join(allowed)]], value_input_option="USER_ENTERED")
                 return
         row_num = len(values) + 1
-        ws.update(f"A{row_num}:B{row_num}", [[key, ",".join(allowed)]])
+        ws.update(f"A{row_num}:B{row_num}", [[key, ",".join(allowed)]], value_input_option="USER_ENTERED")
 
     def clear_channel_rules(self, key: str):
         ws = self._rules_sheet()
