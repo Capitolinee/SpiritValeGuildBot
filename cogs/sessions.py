@@ -213,6 +213,163 @@ class ConfirmView(discord.ui.View):
                 pass
 
 
+class SellAmountModal(discord.ui.Modal):
+    """選好寶物後，跳出視窗輸入金額。"""
+
+    def __init__(self, store, item: dict):
+        super().__init__(title="輸入售出金額")
+        self.store = store
+        self.item = item
+        self.amount_input = discord.ui.TextInput(
+            label=f"「{item['name'][:30]}」賣多少錢？",
+            placeholder="只填數字，例如 3000",
+            required=True,
+            max_length=12,
+        )
+        self.add_item(self.amount_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.amount_input.value.strip().replace(",", "")
+        try:
+            amount = int(raw)
+        except ValueError:
+            await interaction.response.send_message("⚠️ 金額必須是數字，請重新打一次 `!sell`。", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        async with self.store.lock:
+            result = await asyncio.to_thread(
+                self.store.sell_item, self.item["session_id"], self.item["item_index"], amount,
+                self.item["name"],
+            )
+
+        if not result["ok"]:
+            msg = ("⚠️ 找不到這樣寶物，可能已經被別人處理掉了。"
+                   if result["reason"] == "not_found" else "⚠️ 這樣寶物已經結算過了。")
+            await interaction.edit_original_response(content=msg, view=None)
+            return
+
+        text = f"💰 「{result['item_name']}」已賣出 **{amount}**"
+        if result["item_type"] == "分潤":
+            text += (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.2f}**。"
+                     f"隊員可以用 `!claim` 領取。")
+        else:
+            text += "，已計入公會基金。"
+        await interaction.edit_original_response(content=text, view=None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"⚠️ 結算時發生錯誤：{error!r}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 結算時發生錯誤：{error}", ephemeral=True)
+        except Exception:
+            pass
+
+
+class SellSelect(discord.ui.Select):
+    def __init__(self, store, author_id: int, items: list):
+        self.store = store
+        self.author_id = author_id
+        self.items = {}
+        options = []
+        for i, it in enumerate(items[:25]):
+            key = str(i)
+            self.items[key] = it
+            when = it["when"][:16] if it["when"] else "（無日期）"
+            label = f"{when}　{it['name']}"
+            desc = f"類型：{it['item_type']}"
+            if it["item_type"] == "分潤":
+                desc += f"　{it['n_rows']} 人平分"
+            options.append(discord.SelectOption(label=label[:100], value=key, description=desc[:100]))
+        super().__init__(placeholder="選擇要結算的寶物", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("這是別人發起的結算，你可以自己打 `!sell` 喔。", ephemeral=True)
+            return
+        item = self.items[self.values[0]]
+        await interaction.response.send_modal(SellAmountModal(self.store, item))
+
+
+class SellSelectView(discord.ui.View):
+    def __init__(self, store, author_id: int, items: list):
+        super().__init__(timeout=180)
+        self.add_item(SellSelect(store, author_id, items))
+
+
+class GiveToReceiverModal(discord.ui.Modal):
+    """選好寶物後，跳出視窗輸入是免費給誰。"""
+
+    def __init__(self, store, item: dict):
+        super().__init__(title="免費給誰？")
+        self.store = store
+        self.item = item
+        self.receiver_input = discord.ui.TextInput(
+            label=f"「{item['name'][:30]}」給誰？",
+            placeholder="輸入成員名字，例如 熊爺",
+            required=True,
+            max_length=50,
+        )
+        self.add_item(self.receiver_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        receiver = self.receiver_input.value.strip()
+        await interaction.response.defer()
+        async with self.store.lock:
+            result = await asyncio.to_thread(
+                self.store.give_item_to_member, self.item["session_id"], self.item["item_index"],
+                receiver, self.item["name"],
+            )
+
+        if not result["ok"]:
+            msg = ("⚠️ 找不到這樣寶物，可能已經被別人處理掉了。"
+                   if result["reason"] == "not_found" else "⚠️ 這樣寶物已經結算過了。")
+            await interaction.edit_original_response(content=msg, view=None)
+            return
+
+        await interaction.edit_original_response(
+            content=f"🎁 「{result['item_name']}」已改成免費給 **{result['receiver']}**（類型：自用，不分潤）。",
+            view=None,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"⚠️ 免費給人時發生錯誤：{error!r}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 執行時發生錯誤：{error}", ephemeral=True)
+        except Exception:
+            pass
+
+
+class GiveToSelect(discord.ui.Select):
+    def __init__(self, store, author_id: int, items: list):
+        self.store = store
+        self.author_id = author_id
+        self.items = {}
+        options = []
+        for i, it in enumerate(items[:25]):
+            key = str(i)
+            self.items[key] = it
+            when = it["when"][:16] if it["when"] else "（無日期）"
+            label = f"{when}　{it['name']}"
+            desc = f"類型：{it['item_type']}"
+            if it["item_type"] == "分潤":
+                desc += f"　原本 {it['n_rows']} 人平分"
+            options.append(discord.SelectOption(label=label[:100], value=key, description=desc[:100]))
+        super().__init__(placeholder="選擇要免費給人的寶物", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("這是別人發起的操作，你可以自己打 `!giveto` 喔。", ephemeral=True)
+            return
+        item = self.items[self.values[0]]
+        await interaction.response.send_modal(GiveToReceiverModal(self.store, item))
+
+
+class GiveToSelectView(discord.ui.View):
+    def __init__(self, store, author_id: int, items: list):
+        super().__init__(timeout=180)
+        self.add_item(GiveToSelect(store, author_id, items))
+
+
 class ClaimSelect(discord.ui.Select):
     def __init__(self, store, author_id: int, pending_sessions: list):
         options = [
@@ -427,20 +584,31 @@ class Sessions(commands.Cog):
     @commands.command(name="sell")
     async def sell_item(self, ctx, *args):
         """
-        把場次裡指定編號的寶物標記為已賣出。
-        用法：!sell 編號 金額            → 對目前進行中的場次
-             !sell 場次ID 編號 金額     → 對指定場次（捐獻物件沒有場次ID，用 0 或省略）
+        結算寶物售出金額。
+        用法：!sell                        → 跳出選單（日期＋寶物名稱），選完再輸入金額
+             !sell 編號 金額            → 直接對目前進行中的場次結算
+             !sell 場次ID 編號 金額     → 直接對指定場次結算
         """
+        if not args:
+            items = await asyncio.to_thread(self.store.list_unsold_items)
+            if not items:
+                await ctx.send("目前沒有任何還沒結算的寶物。")
+                return
+            view = SellSelectView(self.store, ctx.author.id, items)
+            more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
+            await ctx.send(f"請選擇要結算的寶物：{more}", view=view)
+            return
+
         if len(args) == 2:
             if not self.bot.active_session:
-                await ctx.send("⚠️ 目前沒有進行中的場次，請用 `!sell 場次ID 編號 金額`。")
+                await ctx.send("⚠️ 目前沒有進行中的場次，請直接打 `!sell` 用選單，或用 `!sell 場次ID 編號 金額`。")
                 return
             session_id = self.bot.active_session["id"]
             index_raw, amount_raw = args
         elif len(args) == 3:
             session_id, index_raw, amount_raw = args
         else:
-            await ctx.send("⚠️ 用法：`!sell 編號 金額` 或 `!sell 場次ID 編號 金額`")
+            await ctx.send("⚠️ 用法：`!sell`（選單）、`!sell 編號 金額` 或 `!sell 場次ID 編號 金額`")
             return
 
         try:
@@ -464,6 +632,58 @@ class Sessions(commands.Cog):
             f"💰 「{result['item_name']}」已賣出 **{amount}**"
             + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.2f}**。隊員可以用 `!claim` 領取。"
                if result["item_type"] == "分潤" else "，已計入公會基金。")
+        )
+
+    @commands.command(name="giveto")
+    async def give_to(self, ctx, *args):
+        """
+        原本要分潤的寶物，改成免費給某個成員（類型改「自用」、金額 0，不用分錢）。
+        用法：!giveto                           → 跳出選單（日期＋寶物名稱），選完再輸入給誰
+             !giveto 編號 成員名稱             → 直接對目前進行中的場次
+             !giveto 場次ID 編號 成員名稱     → 直接對指定場次
+        """
+        if not args:
+            items = await asyncio.to_thread(self.store.list_unsold_items)
+            if not items:
+                await ctx.send("目前沒有任何還沒結算的寶物。")
+                return
+            view = GiveToSelectView(self.store, ctx.author.id, items)
+            more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
+            await ctx.send(f"請選擇要免費給人的寶物：{more}", view=view)
+            return
+
+        if len(args) == 2:
+            if not self.bot.active_session:
+                await ctx.send("⚠️ 目前沒有進行中的場次，請直接打 `!giveto` 用選單，或用 `!giveto 場次ID 編號 成員名稱`。")
+                return
+            session_id = self.bot.active_session["id"]
+            index_raw, receiver = args
+        elif len(args) == 3:
+            session_id, index_raw, receiver = args
+        else:
+            await ctx.send("⚠️ 用法：`!giveto`（選單）、`!giveto 編號 成員名稱` 或 `!giveto 場次ID 編號 成員名稱`")
+            return
+
+        try:
+            index = int(index_raw)
+        except ValueError:
+            await ctx.send("⚠️ 編號必須是數字。")
+            return
+
+        async with self.store.lock:
+            result = await asyncio.to_thread(
+                self.store.give_item_to_member, session_id, index, receiver
+            )
+
+        if not result["ok"]:
+            if result["reason"] == "not_found":
+                await ctx.send(f"⚠️ 找不到編號 {index}，請用 `!sessioninfo` 確認編號。")
+            else:
+                await ctx.send(f"⚠️ 編號 {index} 已經結算過了，不能再改成免費給人。")
+            return
+
+        await ctx.send(
+            f"🎁 「{result['item_name']}」已改成免費給 **{result['receiver']}**（類型：自用，不分潤）。"
         )
 
     @commands.command(name="sessioninfo")
