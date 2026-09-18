@@ -464,6 +464,38 @@ class Sessions(commands.Cog):
         text = "\n".join(f"{sid}：{name}（{amt:.2f}）" for sid, name, amt in result["details"])
         await ctx.send(f"**💰 待領取分潤，共 {result['total']:.2f}：**\n```{text}```", ephemeral=True)
 
+    @commands.command(name="forceclaim")
+    @commands.has_permissions(manage_guild=True)
+    async def force_claim(self, ctx, member: discord.Member, session_id: str = None):
+        """
+        管理員專用：把某人尚未領取的分潤標記為已領（用在對方已經私下領過錢，
+        但沒有自己打 !claim 的情況，避免系統一直停在「未領」）。
+        用法：!forceclaim @某人            → 標記他所有場次的待領
+             !forceclaim @某人 場次ID     → 只標記指定場次
+        需要「管理伺服器」權限才能使用。
+        """
+        uid = str(member.id)
+        async with self.store.lock:
+            result = await asyncio.to_thread(self.store.claim_for_user, uid, session_id)
+
+        if not result["details"]:
+            scope = f"場次 `{session_id}` " if session_id else ""
+            await ctx.send(f"{member.display_name} 目前 {scope}沒有待領取的分潤。")
+            return
+
+        detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+        await ctx.send(
+            f"✅ 已由 {ctx.author.display_name} 代為標記 {member.display_name} 的分潤為已領，"
+            f"共 **{result['total']:.2f}**：\n```{detail_text}```"
+        )
+
+    @force_claim.error
+    async def force_claim_error(self, ctx, error):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("⚠️ 這個指令需要「管理伺服器」權限才能使用。")
+        elif isinstance(error, commands.MemberNotFound):
+            await ctx.send("⚠️ 找不到這個成員，請用 @提及 的方式指定對象。")
+
     @commands.command(name="guildfund")
     async def guild_fund(self, ctx):
         """查看公會基金總額。"""
