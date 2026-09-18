@@ -233,6 +233,37 @@ class SheetsStore:
                 return True
         return False
 
+    # ---------- 戰鬥位置清單（存在「職業管理」表的 F 欄，跟職業本身的 A-D 欄各自獨立） ----------
+    # 用 F 欄存放，不能直接刪整列（會誤刪同一列的職業資料），刪除時只清空儲存格內容，
+    # 中間留空缺沒關係，get_positions 只回傳非空白的值。
+
+    POSITION_COL = 5  # E 欄
+
+    def get_positions(self) -> list:
+        col_values = self.ws(SHEET_JOBS).col_values(self.POSITION_COL)
+        return [v.strip() for v in col_values[1:] if v.strip()]
+
+    def add_position(self, name: str) -> str:
+        """新增一個位置名稱。回傳 'added' 或 'exists'（已存在就不重複加）。"""
+        if name in self.get_positions():
+            return "exists"
+        col_values = self.ws(SHEET_JOBS).col_values(self.POSITION_COL)
+        for i in range(2, len(col_values) + 1):
+            if not col_values[i - 1].strip():
+                self.ws(SHEET_JOBS).update_cell(i, self.POSITION_COL, name)
+                return "added"
+        self.ws(SHEET_JOBS).update_cell(len(col_values) + 1, self.POSITION_COL, name)
+        return "added"
+
+    def delete_position(self, name: str) -> bool:
+        """刪除一個位置名稱（只清空那一格，不刪整列，避免動到同一列的職業資料）。"""
+        col_values = self.ws(SHEET_JOBS).col_values(self.POSITION_COL)
+        for i, v in enumerate(col_values[1:], start=2):
+            if v.strip() == name:
+                self.ws(SHEET_JOBS).update_cell(i, self.POSITION_COL, "")
+                return True
+        return False
+
     # ---------- 角色資料 / 帳號基本資料 ----------
 
     def get_characters(self) -> list:
