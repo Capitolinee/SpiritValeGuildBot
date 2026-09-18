@@ -16,7 +16,11 @@ class AccessControl(commands.Cog):
     async def cog_load(self):
         try:
             self.rules_cache = await asyncio.to_thread(self.store.get_all_channel_rules)
-            print(f"✅ 已載入 {len(self.rules_cache)} 個頻道/討論串的指令規則", flush=True)
+            print(
+                f"✅ 已載入 {len(self.rules_cache)} 個頻道/討論串的「指令限制規則」"
+                f"（用 !setthreadrules、!setforumrules 設定過的規則，0 個代表目前沒有設定過任何限制，一切正常）",
+                flush=True,
+            )
         except Exception as e:
             print(f"⚠️ 載入頻道規則失敗：{e}", flush=True)
 
