@@ -86,6 +86,35 @@ class Jobs(commands.Cog):
                 lines.append(f"  - {name}{suffix}")
         await ctx.send("**⚔️ 職業樹：**\n```" + "\n".join(lines) + "```")
 
+    @commands.command(name="addposition")
+    async def add_position(self, ctx, *, name: str):
+        """新增一個戰鬥位置選項（!profile 選位置時會出現）。用法：!addposition 輔助"""
+        async with self.store.lock:
+            result = await asyncio.to_thread(self.store.add_position, name)
+        if result == "exists":
+            await ctx.send(f"⚠️ 「{name}」已經存在，不用重複新增。")
+            return
+        await ctx.send(f"✅ 已新增位置「{name}」。")
+
+    @commands.command(name="delposition")
+    async def del_position(self, ctx, *, name: str):
+        """刪除一個戰鬥位置選項。用法：!delposition 輔助"""
+        async with self.store.lock:
+            removed = await asyncio.to_thread(self.store.delete_position, name)
+        if not removed:
+            await ctx.send(f"⚠️ 找不到位置「{name}」，用 !positions 確認目前有哪些。")
+            return
+        await ctx.send(f"🗑️ 已刪除位置「{name}」。")
+
+    @commands.command(name="positions")
+    async def list_positions(self, ctx):
+        """列出目前設定的所有戰鬥位置選項。"""
+        positions = await asyncio.to_thread(self.store.get_positions)
+        if not positions:
+            await ctx.send("目前還沒有設定任何位置，用 `!addposition 位置名稱` 新增。")
+            return
+        await ctx.send("**🎯 目前的位置選項：**\n```" + "、".join(positions) + "```")
+
 
 async def setup(bot):
     await bot.add_cog(Jobs(bot))
