@@ -4,7 +4,6 @@ from discord.ext import commands
 
 from cogs.jobs import get_tier1_jobs, get_children_jobs
 from helpers import resolve_display_name
-from store import SHEET_CHARACTERS
 
 
 class NameModal(discord.ui.Modal):
@@ -52,11 +51,6 @@ async def finalize_profile(store, interaction: discord.Interaction, name: str, j
     if image_url:
         embed.set_thumbnail(url=image_url)
     await interaction.edit_original_response(content=None, embed=embed, view=None)
-
-    if result == "created":
-        warning = await asyncio.to_thread(store.capacity_warning_for, SHEET_CHARACTERS)
-        if warning:
-            await interaction.followup.send(warning, ephemeral=True)
 
 
 class PositionSelect(discord.ui.Select):
