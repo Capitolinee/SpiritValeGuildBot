@@ -348,10 +348,11 @@ class SheetsStore:
         ]
         return (max(indices) + 1) if indices else 0
 
-    def record_attendance(self, session_id: str, when_iso: str, members: list):
+    def record_attendance(self, session_id: str, when_iso: str, members: list, operator: str = ""):
         """
         單純記錄出席，不綁定任何寶物。確認隊員名單的當下就寫入這筆，
         這樣就算這一場全程沒有掉寶，出席次數也還是會被正確算到。
+        operator：誰觸發了這次記錄（寫進 P 欄「操作者」，方便事後追查是誰記錄的）。
         """
         rows_data = []
         for m in members:
@@ -361,14 +362,19 @@ class SheetsStore:
             ])
         self.append_rows_batch(
             SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2,
-            extra_formulas=[(14, _session_first_occurrence_formula)],
+            extra_formulas=[
+                (14, _session_first_occurrence_formula),
+                (16, lambda r: operator),
+            ],
         )
 
-    def append_item_rows(self, session_id, when_iso, members, item_name, item_index, item_type, contributor):
+    def append_item_rows(self, session_id, when_iso, members, item_name, item_index, item_type, contributor,
+                          operator: str = ""):
         """
         members: list of {"discord_id": str|None, "name": str} — 分潤類型才需要多列。
         分潤：每個 member 各一列；公會/自用：只需要一列（塔團/DiscordID 留空）。
         這裡會把這次要新增的所有列一次性打包成一個 API 呼叫寫入，不會一列一列分開打。
+        operator：誰觸發了這次記錄（寫進 P 欄「操作者」，方便事後追查是誰記錄的）。
         """
         rows_data = []
         if item_type == "分潤":
@@ -386,7 +392,10 @@ class SheetsStore:
             ])
         self.append_rows_batch(
             SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2,
-            extra_formulas=[(14, _session_first_occurrence_formula)],
+            extra_formulas=[
+                (14, _session_first_occurrence_formula),
+                (16, lambda r: operator),
+            ],
         )
 
     def sell_item(self, session_id: str, item_index: int, amount: int) -> dict:
