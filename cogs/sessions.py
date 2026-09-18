@@ -383,6 +383,107 @@ class GiveToSelectView(discord.ui.View):
         self.add_item(GiveToSelect(store, author_id, items))
 
 
+class LootActionView(discord.ui.View):
+    """
+    選好一樣寶物之後，決定要對它做什麼：賣出分潤／免費給成員／改成公會收藏。
+    重複用既有的 SellAmountModal、GiveToReceiverModal，行為跟 !sell、!giveto 完全一致。
+    """
+
+    def __init__(self, store, author_id: int, item: dict):
+        super().__init__(timeout=180)
+        self.store = store
+        self.author_id = author_id
+        self.item = item
+
+    async def _check_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "這是別人發起的操作，你可以自己打 `!loot` 喔。", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="💰 賣出分潤", style=discord.ButtonStyle.success)
+    async def sell(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
+            return
+        await interaction.response.send_modal(SellAmountModal(self.store, self.item))
+        self.stop()
+
+    @discord.ui.button(label="🎁 免費給成員", style=discord.ButtonStyle.primary)
+    async def give(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
+            return
+        await interaction.response.send_modal(GiveToReceiverModal(self.store, self.item))
+        self.stop()
+
+    @discord.ui.button(label="🏦 歸公會（留著之後處理）", style=discord.ButtonStyle.secondary)
+    async def to_guild(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
+            return
+        await interaction.response.defer()
+        async with self.store.lock:
+            result = await asyncio.to_thread(
+                self.store.change_item_type, self.item["session_id"], self.item["item_index"],
+                "公會", self.item["name"],
+            )
+        if not result["ok"]:
+            msg = ("⚠️ 找不到這樣寶物，可能已經被別人處理掉了。"
+                   if result["reason"] == "not_found" else "⚠️ 這樣寶物已經結算過了。")
+            await interaction.edit_original_response(content=msg, view=None)
+            return
+        await interaction.edit_original_response(
+            content=(f"🏦 「{result['item_name']}」已改成公會收藏（類型：公會）。"
+                     f"之後要賣掉換錢進基金，再用 `!loot` 選它結算就好。"),
+            view=None,
+        )
+        self.stop()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        print(f"⚠️ 寶物操作時發生錯誤：{error!r}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 執行時發生錯誤：{error}", ephemeral=True)
+        except Exception:
+            pass
+
+
+class LootSelect(discord.ui.Select):
+    def __init__(self, store, author_id: int, items: list):
+        self.store = store
+        self.author_id = author_id
+        self.items = {}
+        options = []
+        for i, it in enumerate(items[:25]):
+            key = str(i)
+            self.items[key] = it
+            when = it["when"][:16] if it["when"] else "（無日期）"
+            label = f"{when}　{it['name']}"
+            desc = f"類型：{it['item_type']}"
+            if it["item_type"] == "分潤":
+                desc += f"　{it['n_rows']} 人平分"
+            options.append(discord.SelectOption(label=label[:100], value=key, description=desc[:100]))
+        super().__init__(placeholder="選擇一樣寶物", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("這是別人發起的操作，你可以自己打 `!loot` 喔。", ephemeral=True)
+            return
+        item = self.items[self.values[0]]
+        when = item["when"][:16] if item["when"] else "（無日期）"
+        view = LootActionView(self.store, self.author_id, item)
+        await interaction.response.edit_message(
+            content=(f"**{item['name']}**（{when}　類型：{item['item_type']}）\n"
+                     f"要對這樣寶物做什麼？"),
+            view=view,
+        )
+
+
+class LootSelectView(discord.ui.View):
+    def __init__(self, store, author_id: int, items: list):
+        super().__init__(timeout=180)
+        self.add_item(LootSelect(store, author_id, items))
+
+
 class ClaimSelect(discord.ui.Select):
     def __init__(self, store, author_id: int, pending_sessions: list):
         options = [
@@ -593,6 +694,21 @@ class Sessions(commands.Cog):
             operator=ctx.author.display_name,
         )
         await ctx.send(err or reply)
+
+    @commands.command(name="loot")
+    async def loot(self, ctx):
+        """
+        以寶物為出發點的整合指令：先選一樣還沒結算的寶物，再決定要對它做什麼
+        （賣出分潤／免費給成員／歸公會）。等同於 !sell、!giveto 的合併版本。
+        用法：!loot
+        """
+        items = await asyncio.to_thread(self.store.list_unsold_items)
+        if not items:
+            await ctx.send("目前沒有任何還沒結算的寶物。")
+            return
+        view = LootSelectView(self.store, ctx.author.id, items)
+        more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
+        await ctx.send(f"請選擇要處理的寶物：{more}", view=view)
 
     @commands.command(name="sell")
     async def sell_item(self, ctx, *args):
