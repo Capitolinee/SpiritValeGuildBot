@@ -132,8 +132,18 @@ class SheetsStore:
                 return r
         return len(col_values) + 1
 
+    def _ensure_row_capacity(self, sheet_name: str, needed_row: int):
+        """
+        確保這張表的實際格線列數夠寫到 needed_row，不夠就自動用 API 幫它加列
+        （多留 100 列緩衝，避免之後每加一筆資料就要呼叫一次擴充列數的 API）。
+        """
+        ws = self.ws(sheet_name)
+        if needed_row > ws.row_count:
+            ws.add_rows(needed_row - ws.row_count + 100)
+
     def write_row(self, sheet_name: str, row_number: int, values: list, start_col: int = 1):
         """把 values 依序寫進指定列，從 start_col 開始（1-indexed）。"""
+        self._ensure_row_capacity(sheet_name, row_number)
         start = f"{_col_letter(start_col)}{row_number}"
         end = f"{_col_letter(start_col + len(values) - 1)}{row_number}"
         self.ws(sheet_name).update(f"{start}:{end}", [values])
@@ -149,6 +159,7 @@ class SheetsStore:
             return None
         start_row = self.find_first_empty_row(sheet_name, key_col_index=key_col_index)
         end_row = start_row + len(values_list) - 1
+        self._ensure_row_capacity(sheet_name, end_row)
         start_letter = _col_letter(start_col)
         end_letter = _col_letter(start_col + len(values_list[0]) - 1)
         self.ws(sheet_name).update(f"{start_letter}{start_row}:{end_letter}{end_row}", values_list)
@@ -169,12 +180,15 @@ class SheetsStore:
         """
         if not updates:
             return
+        self._ensure_row_capacity(sheet_name, max(row for row, _, _ in updates))
         data = []
         for row, start_col, values in updates:
             start_letter = _col_letter(start_col)
             end_letter = _col_letter(start_col + len(values) - 1)
             data.append({"range": f"{start_letter}{row}:{end_letter}{row}", "values": [values]})
         self.ws(sheet_name).batch_update(data)
+
+
 
     def update_cell(self, sheet_name: str, row: int, col: int, value):
         self.ws(sheet_name).update_cell(row, col, value)
