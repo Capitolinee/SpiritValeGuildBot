@@ -43,12 +43,22 @@ def new_session_id() -> str:
 
 
 async def build_session_members(store, guild, raw_names: list) -> list:
-    """把辨識到的名字，對應到 Discord 帳號 + 顯示名稱，組成場次的出席名單（一次查完所有名字，不逐個查表）。"""
+    """
+    把辨識到的名字，對應到 Discord 帳號 + 顯示名稱，組成場次的出席名單（一次查完所有名字，不逐個查表）。
+    如果同一個 Discord 帳號底下有多隻角色，剛好都被列進同一份名單裡（例如隊員名單重複列到，
+    或這個人真的帶兩隻角色但只能算一份），這裡會自動去重複，同一個帳號一場只會算一次，
+    避免分潤被多算一份、也避免出席次數統計被互相蓋掉。
+    """
     lookup = await asyncio.to_thread(store.find_users_by_character_names, raw_names)
     members = []
+    seen_uids = set()
     for raw_name in raw_names:
         uid, matched_name = lookup.get(raw_name, (None, None))
         char_name = matched_name or raw_name
+        if uid and uid in seen_uids:
+            continue  # 同一個 Discord 帳號已經算過一次了，不重複計入
+        if uid:
+            seen_uids.add(uid)
         display = await resolve_display_name(uid, char_name, guild)
         members.append({"discord_id": uid, "name": char_name, "display_name": display})
     return members
@@ -301,6 +311,43 @@ class Sessions(commands.Cog):
                 else:
                     await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
 
+    @commands.command(name="startsession")
+    async def start_session(self, ctx, *, names_text: str):
+        """
+        手動輸入隊員名單開場（不用上傳圖片、不耗圖片辨識額度）。
+        名字用逗號、空白或換行分隔都可以。
+        用法：!startsession 熊爺,柒柒,Open匠
+             !startsession 熊爺 柒柒 Open匠
+        開場後就跟上傳圖片辨識一樣，可以接著用 !item 記錄寶物、!sell 結算、!claim 領取。
+        """
+        raw_names = [
+            n.strip()
+            for n in names_text.replace("\n", ",").replace("、", ",").replace(" ", ",").split(",")
+            if n.strip()
+        ]
+        if not raw_names:
+            await ctx.send("⚠️ 至少要輸入一個隊員名字。用法：`!startsession 熊爺,柒柒,Open匠`")
+            return
+
+        members = await build_session_members(self.store, ctx.guild, raw_names)
+        self.bot.active_session = {
+            "id": new_session_id(), "members": members, "next_item_index": 0,
+        }
+        names = "、".join(m["display_name"] for m in members)
+        unmatched = [m["name"] for m in members if not m["discord_id"]]
+
+        reply = (
+            f"**✅ 已建立場次 `{self.bot.active_session['id']}`，出席 {len(members)} 人：**\n```{names}```\n"
+            f"接下來可以用 `!item 寶物名稱` 記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤；"
+            f"這場沒有掉落的話用 `!noloot` 記錄出席。"
+        )
+        if unmatched:
+            reply += (
+                f"\n\n⚠️ 這些名字還沒對應到 Discord 帳號：{'、'.join(unmatched)}\n"
+                f"他們要先用 `!profile` 登記角色，之後再打一次 `!syncmembers` 就會自動補上。"
+            )
+        await ctx.send(reply)
+
     @commands.command(name="noloot")
     async def no_loot(self, ctx):
         """
@@ -334,6 +381,27 @@ class Sessions(commands.Cog):
 
         reply, err = await record_items(
             self.bot, [item_name], item_type=item_type, operator=ctx.author.display_name
+        )
+        await ctx.send(err or reply)
+
+    @commands.command(name="items")
+    async def add_items(self, ctx, *, names_text: str):
+        """
+        一次記錄多樣寶物（都算「分潤」類型），名字用逗號、換行分隔。
+        用法：!items 屠龍刀,精靈弓,神槍王
+        每一樣都會各自拿到自己的編號，之後分別用 !sell 編號 金額 結算。
+        """
+        item_names = [
+            n.strip()
+            for n in names_text.replace("\n", ",").replace("、", ",").split(",")
+            if n.strip()
+        ]
+        if not item_names:
+            await ctx.send("⚠️ 至少要輸入一樣寶物名稱。用法：`!items 屠龍刀,精靈弓`")
+            return
+
+        reply, err = await record_items(
+            self.bot, item_names, item_type="分潤", operator=ctx.author.display_name
         )
         await ctx.send(err or reply)
 
