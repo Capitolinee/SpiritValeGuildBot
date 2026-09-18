@@ -9,6 +9,7 @@ import discord
 from discord.ext import commands
 
 from helpers import resolve_display_name, now_str
+from store import SHEET_SESSIONS
 
 PROMPT = """
 你是一個遊戲紀錄助手。請判斷這張圖片的內容類型，並依照下列規則回傳「純 JSON」，
@@ -519,6 +520,31 @@ class Sessions(commands.Cog):
             await ctx.send("⚠️ 這個指令需要「管理伺服器」權限才能使用。")
         elif isinstance(error, commands.MemberNotFound):
             await ctx.send("⚠️ 找不到這個成員，請用 @提及 的方式指定對象。")
+
+    @commands.command(name="syncmembers")
+    async def sync_members(self, ctx):
+        """
+        把「場次記錄」裡沒有 Discord ID 的舊記錄，重新比對現在登記的角色資料，
+        找得到就補上（適合在有人事後才補登 !profile 的情況下使用）。
+        """
+        async with self.store.lock:
+            backfilled = await asyncio.to_thread(self.store.backfill_discord_ids)
+
+        if not backfilled:
+            await ctx.send("沒有發現需要補上 Discord ID 的記錄。")
+            return
+
+        # 順便把 DC名稱（E欄）也補上實際的 Discord 顯示名稱，這部分需要問 Discord API，
+        # 所以在這裡（有 guild 物件可用）做，store.py 那邊只負責補 Discord ID。
+        name_updates = []
+        for row, uid, char_name in backfilled:
+            display = await resolve_display_name(uid, char_name, ctx.guild)
+            name_updates.append((row, 5, [display]))
+        if name_updates:
+            await asyncio.to_thread(self.store.batch_update_cells, SHEET_SESSIONS, name_updates)
+
+        lines = "\n".join(f"[{row}] {name}" for row, _, name in backfilled)
+        await ctx.send(f"✅ 已補上 {len(backfilled)} 筆記錄的 Discord ID：\n```{lines}```")
 
     @commands.command(name="guildfund")
     async def guild_fund(self, ctx):
