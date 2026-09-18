@@ -106,15 +106,23 @@ class SheetsStore:
 
     # ---------- 通用 row 操作 ----------
 
-    def get_rows(self, sheet_name: str) -> list:
-        """回傳這張表所有非空白列，每筆是 dict（含 _row 實際列號），跳過完全空白的列。"""
+    def get_rows(self, sheet_name: str, key_col_index: int = 1) -> list:
+        """
+        回傳這張表所有「真的有資料」的列，每筆是 dict（含 _row 實際列號）。
+        判斷「有沒有資料」只看 key_col_index 這一欄，不是看整列任何欄位有沒有內容——
+        因為公式欄本來就會算出 0、打勾格本來就有格式，這些「非真正資料」的內容
+        不該被誤判成「這列已經有資料」，否則會一路把整段預先格式化的空白列都當成占用中。
+        場次記錄表因為捐獻列的場次ID（A欄）本來就允許留空，呼叫時要傳 key_col_index=2
+        （日期時間欄），改用這欄判斷才不會漏掉捐獻列。
+        """
         values = self.ws(sheet_name).get_all_values()
         if not values:
             return []
         headers = values[0]
         rows = []
         for i, row in enumerate(values[1:], start=2):
-            if not any(cell.strip() for cell in row):
+            key_cell = row[key_col_index - 1] if len(row) >= key_col_index else ""
+            if not key_cell.strip():
                 continue
             d = {headers[j]: (row[j] if j < len(row) else "") for j in range(len(headers))}
             d["_row"] = i
@@ -384,7 +392,7 @@ class SheetsStore:
     # ---------- 場次記錄 ----------
 
     def get_session_rows(self, session_id: str) -> list:
-        return [r for r in self.get_rows(SHEET_SESSIONS) if r.get("場次ID", "").strip() == session_id]
+        return [r for r in self.get_rows(SHEET_SESSIONS, key_col_index=2) if r.get("場次ID", "").strip() == session_id]
 
     def next_item_index(self, session_id: str) -> int:
         indices = [
@@ -477,7 +485,7 @@ class SheetsStore:
         total = 0.0
         details = []
         updates = []
-        for r in self.get_rows(SHEET_SESSIONS):
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
             if r.get("類型") != "分潤":
                 continue
             if r.get("Discord ID", "").strip() != str(discord_id):
@@ -501,7 +509,7 @@ class SheetsStore:
     def pending_for_user(self, discord_id: str) -> dict:
         total = 0.0
         details = []
-        for r in self.get_rows(SHEET_SESSIONS):
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
             if r.get("類型") != "分潤":
                 continue
             if r.get("Discord ID", "").strip() != str(discord_id):
@@ -542,7 +550,7 @@ class SheetsStore:
 
     def guild_fund_total(self) -> float:
         total = 0.0
-        for r in self.get_rows(SHEET_SESSIONS):
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
             if r.get("類型") == "公會" and r.get("售出金額", "").strip():
                 total += float(r["售出金額"])
         return total
