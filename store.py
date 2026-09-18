@@ -594,10 +594,11 @@ class SheetsStore:
 
         # C=塔團 D=DiscordID E=DC名稱 → 填成收下的人
         self.write_row(SHEET_SESSIONS, keep["_row"], [matched_name, uid or "", display], start_col=3)
-        # H=類型 I=來源/貢獻者
-        self.write_row(SHEET_SESSIONS, keep["_row"], ["自用", f"免費給 {matched_name}"], start_col=8)
+        # H=類型 I=來源/貢獻者（誰拿走的已經記在塔團/DC名稱欄，這裡只記處理方式）
+        self.write_row(SHEET_SESSIONS, keep["_row"], ["自用", "成員免費領取"], start_col=8)
         # J=售出金額 K=均分$$ L=已領 M=領取時間
-        self.write_row(SHEET_SESSIONS, keep["_row"], [0, "", "", ""], start_col=10)
+        # 東西當下就交出去了，所以已領打勾、領取時間記成現在
+        self.write_row(SHEET_SESSIONS, keep["_row"], [0, "", True, now_str()], start_col=10)
 
         # 其他多餘的分潤列整列刪掉（從後面往前刪，避免刪除後列號位移）
         for r in sorted(target_rows[1:], key=lambda x: x["_row"], reverse=True):
