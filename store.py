@@ -608,6 +608,37 @@ class SheetsStore:
             "discord_id": uid, "removed_rows": len(target_rows) - 1,
         }
 
+    def change_item_type(self, session_id: str, item_index: int, new_type: str,
+                          item_name: str = None) -> dict:
+        """
+        把還沒結算的寶物改成別的類型（例如原本要分潤、改成歸公會之後再處理）。
+        改成「公會」或「自用」時只留一列（那兩種類型本來就不分人），多餘的分潤列會刪掉。
+        """
+        target_rows = [
+            r for r in self.get_session_rows(session_id)
+            if r.get("寶物編號", "").strip() == str(item_index)
+            and (item_name is None or r.get("掉落", "").strip() == item_name)
+        ]
+        if not target_rows:
+            return {"ok": False, "reason": "not_found"}
+        if any(r.get("售出金額", "").strip() for r in target_rows):
+            return {"ok": False, "reason": "already_sold"}
+
+        found_name = target_rows[0].get("掉落", "")
+        keep = target_rows[0]
+
+        if new_type in ("公會", "自用"):
+            # C=塔團 D=DiscordID E=DC名稱 清空（這兩種類型不掛在特定人身上）
+            self.write_row(SHEET_SESSIONS, keep["_row"], ["", "", ""], start_col=3)
+            self.write_row(SHEET_SESSIONS, keep["_row"], [new_type], start_col=8)
+            for r in sorted(target_rows[1:], key=lambda x: x["_row"], reverse=True):
+                self.delete_row(SHEET_SESSIONS, r["_row"])
+        else:
+            for r in target_rows:
+                self.write_row(SHEET_SESSIONS, r["_row"], [new_type], start_col=8)
+
+        return {"ok": True, "item_name": found_name, "new_type": new_type}
+
     def claim_for_user(self, discord_id: str, session_id: str = None) -> dict:
         """把這個使用者所有（或指定場次）尚未領取的分潤列標記已領。回傳明細。"""
         now = now_str()
