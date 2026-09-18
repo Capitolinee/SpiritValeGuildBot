@@ -30,6 +30,9 @@ class NameModal(discord.ui.Modal):
         view = JobSelectView(self.store, name, jobs)
         await interaction.followup.send(f"名字：**{name}**\n請選擇你的職業：", view=view, ephemeral=True)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await _report_view_error(interaction, error)
+
 
 async def finalize_profile(store, interaction: discord.Interaction, name: str, job: str, jobs: dict, position: str = ""):
     info = jobs.get(job, {})
@@ -54,14 +57,14 @@ async def finalize_profile(store, interaction: discord.Interaction, name: str, j
 
 
 class PositionSelect(discord.ui.Select):
-    """選職業之後接著選戰鬥位置，選完才真正寫入。"""
+    """選職業之後接著選戰鬥位置，選完才真正寫入。位置清單從「職業管理」表動態讀取。"""
 
-    def __init__(self, store, name: str, job: str, jobs: dict):
+    def __init__(self, store, name: str, job: str, jobs: dict, positions: list):
         self.store = store
         self.name = name
         self.job = job
         self.jobs = jobs
-        options = [discord.SelectOption(label=p) for p in ["DPS", "坦克", "奶媽", "BUFF", "其他"]]
+        options = [discord.SelectOption(label=p) for p in positions[:24]]
         options.append(discord.SelectOption(label="不設定位置", value="__SKIP__"))
         super().__init__(placeholder="選擇這隻角色的戰鬥位置", options=options, min_values=1, max_values=1)
 
@@ -71,10 +74,43 @@ class PositionSelect(discord.ui.Select):
         await finalize_profile(self.store, interaction, self.name, self.job, self.jobs, position)
 
 
+async def _report_view_error(interaction: discord.Interaction, error: Exception):
+    """按鈕/選單背後發生例外時，把錯誤顯示給使用者看，而不是默默卡住沒反應。"""
+    print(f"⚠️ 互動發生錯誤：{error!r}", flush=True)
+    message = f"❌ 執行時發生錯誤：{error}"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as e:
+        print(f"⚠️ 連錯誤訊息都送不出去：{e!r}", flush=True)
+
+
 class PositionSelectView(discord.ui.View):
-    def __init__(self, store, name: str, job: str, jobs: dict):
+    def __init__(self, store, name: str, job: str, jobs: dict, positions: list):
         super().__init__(timeout=120)
-        self.add_item(PositionSelect(store, name, job, jobs))
+        self.add_item(PositionSelect(store, name, job, jobs, positions))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        await _report_view_error(interaction, error)
+
+
+async def show_position_step(store, interaction: discord.Interaction, name: str, job: str, jobs: dict):
+    """
+    選完職業後的下一步：有設定位置清單就跳出選單，完全沒設定過的話直接跳過，
+    當作不設定位置寫入，避免因為管理員還沒建立位置清單就卡住整個流程。
+    """
+    positions = await asyncio.to_thread(store.get_positions)
+    if not positions:
+        await interaction.response.defer()
+        await finalize_profile(store, interaction, name, job, jobs, "")
+        return
+    view = PositionSelectView(store, name, job, jobs, positions)
+    await interaction.response.edit_message(
+        content=f"名字：**{name}**\n職業：**{job}**\n請選擇戰鬥位置：",
+        view=view,
+    )
 
 
 class JobSelect(discord.ui.Select):
@@ -100,11 +136,7 @@ class JobSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         chosen = self.values[0]
         if chosen == "__STOP__":
-            view = PositionSelectView(self.store, self.name, self.current_job, self.jobs)
-            await interaction.response.edit_message(
-                content=f"名字：**{self.name}**\n職業：**{self.current_job}**\n請選擇戰鬥位置：",
-                view=view,
-            )
+            await show_position_step(self.store, interaction, self.name, self.current_job, self.jobs)
             return
 
         children = get_children_jobs(self.jobs, chosen)
@@ -115,17 +147,16 @@ class JobSelect(discord.ui.Select):
                 view=view,
             )
         else:
-            view = PositionSelectView(self.store, self.name, chosen, self.jobs)
-            await interaction.response.edit_message(
-                content=f"名字：**{self.name}**\n職業：**{chosen}**\n請選擇戰鬥位置：",
-                view=view,
-            )
+            await show_position_step(self.store, interaction, self.name, chosen, self.jobs)
 
 
 class JobSelectView(discord.ui.View):
     def __init__(self, store, name: str, jobs: dict, current_job: str = None):
         super().__init__(timeout=120)
         self.add_item(JobSelect(store, name, jobs, current_job=current_job))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        await _report_view_error(interaction, error)
 
 
 class StartProfileView(discord.ui.View):
@@ -140,6 +171,9 @@ class StartProfileView(discord.ui.View):
             await interaction.response.send_message("這個按鈕是給發起的人用的，你可以自己打 `!profile` 喔。", ephemeral=True)
             return
         await interaction.response.send_modal(NameModal(self.store))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        await _report_view_error(interaction, error)
 
 
 class Profiles(commands.Cog):
