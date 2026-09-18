@@ -8,7 +8,6 @@ import discord
 from discord.ext import commands
 
 from helpers import resolve_display_name, now_str
-from store import SHEET_SESSIONS
 
 PROMPT = """
 你是一個遊戲紀錄助手。請判斷這張圖片的內容類型，並依照下列規則回傳「純 JSON」，
@@ -84,11 +83,7 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
 
     summary = "、".join(recorded)
     where = f"場次 `{session_id}`" if session_id else "捐獻清單"
-    reply = f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```"
-    warning = await asyncio.to_thread(store.capacity_warning_for, SHEET_SESSIONS)
-    if warning:
-        reply += f"\n\n{warning}"
-    return reply, None
+    return f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```", None
 
 
 class EditModal(discord.ui.Modal):
@@ -153,9 +148,6 @@ class ConfirmView(discord.ui.View):
             f"**✅ 已建立場次 `{session_id}`，出席：**\n```{names}```\n"
             f"（已標記這場沒有掉落寶物，出席已直接記錄。）"
         )
-        warning = await asyncio.to_thread(store.capacity_warning_for, SHEET_SESSIONS)
-        if warning:
-            content += f"\n\n{warning}"
         await interaction.edit_original_response(content=content, view=None)
         self.stop()
 
@@ -303,11 +295,7 @@ class Sessions(commands.Cog):
         now = now_str()
         async with self.store.lock:
             await asyncio.to_thread(self.store.record_attendance, session["id"], now, session["members"])
-        reply = f"✅ 已補記錄場次 `{session['id']}` 的出席（沒有掉落寶物）。"
-        warning = await asyncio.to_thread(self.store.capacity_warning_for, SHEET_SESSIONS)
-        if warning:
-            reply += f"\n\n{warning}"
-        await ctx.send(reply)
+        await ctx.send(f"✅ 已補記錄場次 `{session['id']}` 的出席（沒有掉落寶物）。")
 
     @commands.command(name="item")
     async def add_item(self, ctx, *, text: str):
