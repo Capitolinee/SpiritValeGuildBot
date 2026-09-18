@@ -87,7 +87,11 @@ async def on_ready():
     print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
     try:
         synced = await bot.tree.sync()
-        print(f"✅ 已同步 {len(synced)} 個斜線指令", flush=True)
+        print(
+            f"✅ 已同步 {len(synced)} 個「/」開頭的斜線指令到 Discord"
+            f"（例如 /claim、/pending 這種用 / 打的指令，同步後 Discord 才會認得）",
+            flush=True,
+        )
     except Exception as e:
         print(f"⚠️ 同步斜線指令失敗：{e}", flush=True)
 
