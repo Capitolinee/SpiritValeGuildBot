@@ -297,15 +297,15 @@ class SellSelectView(discord.ui.View):
 
 
 class GiveToReceiverModal(discord.ui.Modal):
-    """選好寶物後，跳出視窗輸入是免費給誰。"""
+    """選好寶物後，跳出視窗輸入領取者的角色名稱。"""
 
     def __init__(self, store, item: dict):
-        super().__init__(title="免費給誰？")
+        super().__init__(title="登記免費領取")
         self.store = store
         self.item = item
         self.receiver_input = discord.ui.TextInput(
-            label=f"「{item['name'][:30]}」給誰？",
-            placeholder="輸入登記過的角色名稱，例如 熊爺",
+            label=f"「{item['name'][:30]}」的領取者",
+            placeholder="輸入登記過的角色名稱",
             required=True,
             max_length=50,
         )
@@ -340,12 +340,12 @@ class GiveToReceiverModal(discord.ui.Modal):
             return
 
         await interaction.edit_original_response(
-            content=f"🎁 「{result['item_name']}」已改成免費給 **{result['receiver']}**（類型：自用，不分潤）。",
+            content=f"🎁 「{result['item_name']}」已登記為成員免費領取（類型：自用，不分潤，已記錄領取時間）。",
             view=None,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
-        print(f"⚠️ 免費給人時發生錯誤：{error!r}", flush=True)
+        print(f"⚠️ 登記免費領取時發生錯誤：{error!r}", flush=True)
         try:
             await interaction.followup.send(f"❌ 執行時發生錯誤：{error}", ephemeral=True)
         except Exception:
@@ -367,7 +367,7 @@ class GiveToSelect(discord.ui.Select):
             if it["item_type"] == "分潤":
                 desc += f"　原本 {it['n_rows']} 人平分"
             options.append(discord.SelectOption(label=label[:100], value=key, description=desc[:100]))
-        super().__init__(placeholder="選擇要免費給人的寶物", options=options, min_values=1, max_values=1)
+        super().__init__(placeholder="選擇要登記免費領取的寶物", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
@@ -410,7 +410,7 @@ class LootActionView(discord.ui.View):
         await interaction.response.send_modal(SellAmountModal(self.store, self.item))
         self.stop()
 
-    @discord.ui.button(label="🎁 免費給成員", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🎁 成員免費領取", style=discord.ButtonStyle.primary)
     async def give(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_owner(interaction):
             return
@@ -778,7 +778,7 @@ class Sessions(commands.Cog):
                 return
             view = GiveToSelectView(self.store, ctx.author.id, items)
             more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
-            await ctx.send(f"請選擇要免費給人的寶物：{more}", view=view)
+            await ctx.send(f"請選擇要登記免費領取的寶物：{more}", view=view)
             return
 
         if len(args) == 2:
@@ -819,11 +819,11 @@ class Sessions(commands.Cog):
             if result["reason"] == "not_found":
                 await ctx.send(f"⚠️ 找不到編號 {index}，請用 `!sessioninfo` 確認編號。")
             else:
-                await ctx.send(f"⚠️ 編號 {index} 已經結算過了，不能再改成免費給人。")
+                await ctx.send(f"⚠️ 編號 {index} 已經結算過了，不能再登記免費領取。")
             return
 
         await ctx.send(
-            f"🎁 「{result['item_name']}」已改成免費給 **{result['receiver']}**（類型：自用，不分潤）。"
+            f"🎁 「{result['item_name']}」已登記為成員免費領取（類型：自用，不分潤，已記錄領取時間）。"
         )
 
     @commands.command(name="sessioninfo")
