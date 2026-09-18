@@ -53,10 +53,11 @@ async def build_session_members(store, guild, raw_names: list) -> list:
 
 
 async def record_items(bot, item_names: list, item_type: str = "分潤", contributor: str = None,
-                        force_no_session: bool = False):
+                        force_no_session: bool = False, operator: str = ""):
     """
     把一批寶物名稱記錄進去。
     分潤類型需要目前有進行中的場次（bot.active_session）；公會/自用可以有場次也可以沒有（捐獻）。
+    operator：誰觸發了這次記錄，寫進場次記錄表的「操作者」欄。
     回傳 (成功訊息, 是否有錯誤)。
     """
     store = bot.store
@@ -77,7 +78,7 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
             else:
                 idx = None
             await asyncio.to_thread(
-                store.append_item_rows, session_id, now, members, name, idx, item_type, contributor
+                store.append_item_rows, session_id, now, members, name, idx, item_type, contributor, operator
             )
             recorded.append(name)
 
@@ -141,7 +142,9 @@ class ConfirmView(discord.ui.View):
         self.bot.active_session = {"id": session_id, "members": members, "next_item_index": 0}
 
         async with store.lock:
-            await asyncio.to_thread(store.record_attendance, session_id, now, members)
+            await asyncio.to_thread(
+                store.record_attendance, session_id, now, members, interaction.user.display_name
+            )
 
         names = "、".join(m["display_name"] for m in members)
         content = (
@@ -169,7 +172,9 @@ class ConfirmView(discord.ui.View):
                 f"接下來可以用 `!item 寶物名稱` 或上傳寶物圖片記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤。"
             )
         else:
-            reply, err = await record_items(self.bot, self.payload, item_type="分潤")
+            reply, err = await record_items(
+                self.bot, self.payload, item_type="分潤", operator=interaction.user.display_name
+            )
             return err or reply
 
     @discord.ui.button(label="✅ 確認正確", style=discord.ButtonStyle.success)
@@ -294,7 +299,9 @@ class Sessions(commands.Cog):
             return
         now = now_str()
         async with self.store.lock:
-            await asyncio.to_thread(self.store.record_attendance, session["id"], now, session["members"])
+            await asyncio.to_thread(
+                self.store.record_attendance, session["id"], now, session["members"], ctx.author.display_name
+            )
         await ctx.send(f"✅ 已補記錄場次 `{session['id']}` 的出席（沒有掉落寶物）。")
 
     @commands.command(name="item")
@@ -310,7 +317,9 @@ class Sessions(commands.Cog):
         if len(parts) == 2 and parts[1] in ("分潤", "公會", "自用"):
             item_name, item_type = parts
 
-        reply, err = await record_items(self.bot, [item_name], item_type=item_type)
+        reply, err = await record_items(
+            self.bot, [item_name], item_type=item_type, operator=ctx.author.display_name
+        )
         await ctx.send(err or reply)
 
     @commands.command(name="donate")
@@ -320,7 +329,8 @@ class Sessions(commands.Cog):
         用法：!donate 屠龍刀 牡羊
         """
         reply, err = await record_items(
-            self.bot, [item_name], item_type="公會", contributor=contributor, force_no_session=True
+            self.bot, [item_name], item_type="公會", contributor=contributor, force_no_session=True,
+            operator=ctx.author.display_name,
         )
         await ctx.send(err or reply)
 
