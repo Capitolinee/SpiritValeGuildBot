@@ -33,14 +33,6 @@ SHEET_SESSIONS = "場次記錄"
 SHEET_JOBS = "職業管理"
 SHEET_ACCOUNTS = "帳號基本資料"
 
-# 表格裡實際手動拖曳/貼上公式到第幾列，機器人只能安全寫到這裡（超過這個範圍，
-# 那一列會沒有公式、算不出數字）。之後表格端拖更長，記得同步把這個環境變數改大，
-# 不然機器人自己還是會覺得「到 1000 列就滿了」，明明表格早就拖更長了。
-MAX_ROW = int(os.environ.get("FORMULA_FILL_LIMIT", "1000"))
-
-# 剩餘列數低於這個門檻時，寫入資料的回覆會附上警告，提醒你該去表格端把公式拖長了
-WARNING_THRESHOLD = 50
-
 # 容易造成誤判的「形似字元」對照表：左邊會被視為跟右邊相同。
 CONFUSABLE_CHAR_MAP = {
     "ㄚ": "丫", "ㄧ": "一", "ㄩ": "凵", "O": "0", "l": "1",
@@ -57,6 +49,38 @@ def normalize_name(name: str) -> str:
 def _col_letter(n: int) -> str:
     """1 -> A, 2 -> B ... 只用在 row=1 的情況，所以可以簡單用 rowcol_to_a1 再去掉最後的 '1'。"""
     return gspread.utils.rowcol_to_a1(1, n)[:-1]
+
+
+def _char_attendance_formula(row: int) -> str:
+    return (f"=SUMIFS('{SHEET_SESSIONS}'!$N:$N,'{SHEET_SESSIONS}'!$D:$D,A{row},"
+            f"'{SHEET_SESSIONS}'!$C:$C,C{row})")
+
+
+def _char_earnings_formula(row: int) -> str:
+    return (f"=SUMIFS('{SHEET_SESSIONS}'!$K:$K,'{SHEET_SESSIONS}'!$D:$D,A{row},"
+            f"'{SHEET_SESSIONS}'!$C:$C,C{row},'{SHEET_SESSIONS}'!$H:$H,\"分潤\")")
+
+
+def _account_attendance_formula(row: int) -> str:
+    return f"=SUMIFS('{SHEET_SESSIONS}'!$N:$N,'{SHEET_SESSIONS}'!$D:$D,A{row})"
+
+
+def _account_earnings_formula(row: int) -> str:
+    return f"=SUMIFS('{SHEET_SESSIONS}'!$K:$K,'{SHEET_SESSIONS}'!$D:$D,A{row},'{SHEET_SESSIONS}'!$H:$H,\"分潤\")"
+
+
+def _account_claimed_formula(row: int) -> str:
+    return (f"=SUMIFS('{SHEET_SESSIONS}'!$K:$K,'{SHEET_SESSIONS}'!$D:$D,A{row},"
+            f"'{SHEET_SESSIONS}'!$H:$H,\"分潤\",'{SHEET_SESSIONS}'!$L:$L,TRUE())")
+
+
+def _account_pending_formula(row: int) -> str:
+    return f"=G{row}-H{row}"
+
+
+def _session_first_occurrence_formula(row: int) -> str:
+    """這欄用成長式範圍（$A$2:A{row}），本來就隨列數自動擴大，不需要整欄參照。"""
+    return f'=IF($D{row}="","",IF(COUNTIFS($A$2:A{row},A{row},$D$2:D{row},D{row})=1,1,0))'
 
 
 class SheetsStore:
@@ -97,13 +121,16 @@ class SheetsStore:
             rows.append(d)
         return rows
 
-    def find_first_empty_row(self, sheet_name: str, key_col_index: int = 1, max_row: int = MAX_ROW) -> int:
-        """找到第一個「這個欄位是空的」列號，用來決定新資料要寫在哪一列。"""
+    def find_first_empty_row(self, sheet_name: str, key_col_index: int = 1) -> int:
+        """
+        找到第一個「這個欄位是空的」列號，用來決定新資料要寫在哪一列。
+        直接照這欄實際存在多少資料來判斷，不設任何上限，資料多長都找得到正確位置。
+        """
         col_values = self.ws(sheet_name).col_values(key_col_index)
-        for r in range(2, max_row + 1):
-            if r > len(col_values) or not col_values[r - 1].strip():
+        for r in range(2, len(col_values) + 1):
+            if not col_values[r - 1].strip():
                 return r
-        return max_row + 1
+        return len(col_values) + 1
 
     def write_row(self, sheet_name: str, row_number: int, values: list, start_col: int = 1):
         """把 values 依序寫進指定列，從 start_col 開始（1-indexed）。"""
@@ -111,18 +138,29 @@ class SheetsStore:
         end = f"{_col_letter(start_col + len(values) - 1)}{row_number}"
         self.ws(sheet_name).update(f"{start}:{end}", [values])
 
-    def append_rows_batch(self, sheet_name: str, values_list: list, start_col: int = 1, key_col_index: int = 1):
+    def append_rows_batch(self, sheet_name: str, values_list: list, start_col: int = 1, key_col_index: int = 1,
+                           extra_formulas: list = None):
         """
-        一次性把多列資料寫入（從第一個空白列開始，連續往下填），用「一次」API 呼叫寫完，
-        比一列一列呼叫 write_row 快很多。values_list 裡每一列的長度要一致。
+        一次性把多列資料寫入（從第一個空白列開始，連續往下填），用「一次」API 呼叫寫完。
+        extra_formulas: [(col_index, formula_fn), ...]，formula_fn(row_number) 回傳這一列該欄位的公式字串，
+        確保機器人新增的每一列都自帶自己需要的公式，資料量再大也不會漏算。
         """
         if not values_list:
-            return
+            return None
         start_row = self.find_first_empty_row(sheet_name, key_col_index=key_col_index)
         end_row = start_row + len(values_list) - 1
         start_letter = _col_letter(start_col)
         end_letter = _col_letter(start_col + len(values_list[0]) - 1)
         self.ws(sheet_name).update(f"{start_letter}{start_row}:{end_letter}{end_row}", values_list)
+
+        if extra_formulas:
+            updates = []
+            for r in range(start_row, end_row + 1):
+                for col, formula_fn in extra_formulas:
+                    updates.append((r, col, [formula_fn(r)]))
+            self.batch_update_cells(sheet_name, updates)
+
+        return start_row
 
     def batch_update_cells(self, sheet_name: str, updates: list):
         """
@@ -144,45 +182,20 @@ class SheetsStore:
     def delete_row(self, sheet_name: str, row_number: int):
         self.ws(sheet_name).delete_rows(row_number)
 
-    def get_sheet_usage(self, sheet_name: str) -> dict:
-        """
-        查這張表目前用到第幾列、離「公式拖曳範圍上限」(MAX_ROW) 還剩多少列。
-        用最後一個非空白列的實際列號來判斷，不是用資料筆數（避免中間有刪除留下的空缺誤判）。
-        """
-        rows = self.get_rows(sheet_name)
-        used_row = max((r["_row"] for r in rows), default=1)
-        return {
-            "sheet": sheet_name,
-            "used_row": used_row,
-            "limit": MAX_ROW,
-            "remaining": MAX_ROW - used_row,
-        }
-
-    def get_all_usage(self) -> list:
-        return [self.get_sheet_usage(name) for name in (SHEET_CHARACTERS, SHEET_SESSIONS, SHEET_ACCOUNTS)]
-
-    def capacity_warning_for(self, sheet_name: str) -> str:
-        """如果指定的表快接近公式拖曳範圍上限，回傳一句警告文字；還夠用就回傳 None。"""
-        usage = self.get_sheet_usage(sheet_name)
-        if usage["remaining"] <= WARNING_THRESHOLD:
-            return (
-                f"⚠️ 「{sheet_name}」目前用到第 {usage['used_row']} 列，"
-                f"公式只拖曳到第 {usage['limit']} 列，只剩 {usage['remaining']} 列可用！"
-                f"請去 Google Sheets 把公式往下拖曳延伸（範例操作問我），不然快沒地方寫了。"
-            )
-        return None
-
     @staticmethod
-    def _first_empty_row_from(rows: list, max_row: int = MAX_ROW) -> int:
+    def _first_empty_row_from(rows: list) -> int:
         """
         從已經讀到的 rows（get_rows 的結果，每筆帶 _row）直接算出第一個空白列，
-        不用再另外打一次 API 去問。仍然會正確找回被刪除留下的空缺列。
+        不用再另外打一次 API 去問。仍然會正確找回被刪除留下的空缺列，不設任何上限。
         """
+        if not rows:
+            return 2
         occupied = {r["_row"] for r in rows}
-        for r in range(2, max_row + 1):
+        max_existing = max(occupied)
+        for r in range(2, max_existing + 1):
             if r not in occupied:
                 return r
-        return max_row + 1
+        return max_existing + 1
 
     # ---------- 職業 ----------
 
@@ -266,6 +279,11 @@ class SheetsStore:
                 return "updated"
         row_num = self._first_empty_row_from(rows)
         self.write_row(SHEET_CHARACTERS, row_num, [str(discord_id), display_name, char_name, job, position])
+        self.write_row(
+            SHEET_CHARACTERS, row_num,
+            [_char_attendance_formula(row_num), _char_earnings_formula(row_num)],
+            start_col=6,
+        )
         self.ensure_account_row(discord_id, display_name)
         return "created"
 
@@ -286,6 +304,16 @@ class SheetsStore:
                 return
         row_num = self._first_empty_row_from(rows)
         self.write_row(SHEET_ACCOUNTS, row_num, [str(discord_id), display_name, "", "", ""])
+        self.write_row(
+            SHEET_ACCOUNTS, row_num,
+            [
+                _account_attendance_formula(row_num),
+                _account_earnings_formula(row_num),
+                _account_claimed_formula(row_num),
+                _account_pending_formula(row_num),
+            ],
+            start_col=6,
+        )
 
     def get_account_stats(self, discord_id: str) -> dict:
         for r in self.get_rows(SHEET_ACCOUNTS):
@@ -331,7 +359,10 @@ class SheetsStore:
                 session_id, when_iso, m.get("name", ""), m.get("discord_id") or "",
                 m.get("display_name", m.get("name", "")), "", "", "出席", "", "", "", "", "",
             ])
-        self.append_rows_batch(SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2)
+        self.append_rows_batch(
+            SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2,
+            extra_formulas=[(14, _session_first_occurrence_formula)],
+        )
 
     def append_item_rows(self, session_id, when_iso, members, item_name, item_index, item_type, contributor):
         """
@@ -353,7 +384,10 @@ class SheetsStore:
                 item_name, item_index if item_index is not None else "",
                 item_type, contributor or "", "", "", "", "",
             ])
-        self.append_rows_batch(SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2)
+        self.append_rows_batch(
+            SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2,
+            extra_formulas=[(14, _session_first_occurrence_formula)],
+        )
 
     def sell_item(self, session_id: str, item_index: int, amount: int) -> dict:
         """把指定場次+編號的寶物填上售出金額，分潤類型會平分給每一列。回傳結果摘要。"""
