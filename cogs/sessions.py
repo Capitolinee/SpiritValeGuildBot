@@ -45,20 +45,19 @@ def new_session_id() -> str:
 async def build_session_members(store, guild, raw_names: list) -> list:
     """
     把辨識到的名字，對應到 Discord 帳號 + 顯示名稱，組成場次的出席名單（一次查完所有名字，不逐個查表）。
-    如果同一個 Discord 帳號底下有多隻角色，剛好都被列進同一份名單裡（例如隊員名單重複列到，
-    或這個人真的帶兩隻角色但只能算一份），這裡會自動去重複，同一個帳號一場只會算一次，
-    避免分潤被多算一份、也避免出席次數統計被互相蓋掉。
+    同一個 Discord 帳號底下的不同角色各自算一份（帶兩隻角色出團就分兩份），
+    所以這裡只對「完全相同的角色名字」去重複，不對 Discord 帳號去重複。
     """
     lookup = await asyncio.to_thread(store.find_users_by_character_names, raw_names)
     members = []
-    seen_uids = set()
+    seen_names = set()
     for raw_name in raw_names:
         uid, matched_name = lookup.get(raw_name, (None, None))
         char_name = matched_name or raw_name
-        if uid and uid in seen_uids:
-            continue  # 同一個 Discord 帳號已經算過一次了，不重複計入
-        if uid:
-            seen_uids.add(uid)
+        name_key = char_name.strip().lower()
+        if name_key in seen_names:
+            continue  # 同一個角色名字在名單裡重複列到，只算一次
+        seen_names.add(name_key)
         display = await resolve_display_name(uid, char_name, guild)
         members.append({"discord_id": uid, "name": char_name, "display_name": display})
     return members
@@ -283,7 +282,15 @@ class Sessions(commands.Cog):
                 )
                 parsed = parse_gemini_json(result.output_text)
                 kind = parsed.get("type", "unknown")
-                payload = [n for n in parsed.get("data", []) if isinstance(n, str) and n.strip()]
+                # Gemini 有時候會把多個項目塞進同一個字串（例如 ["屠龍刀,精靈弓"]），
+                # 這裡再拆一次，不完全信任它有正確分項。
+                payload = []
+                for raw in parsed.get("data", []):
+                    if not isinstance(raw, str):
+                        continue
+                    for piece in raw.replace("\n", ",").replace("、", ",").split(","):
+                        if piece.strip():
+                            payload.append(piece.strip())
 
                 if kind == "unknown" or not payload:
                     await message.channel.send("⚠️ 無法判斷這張圖片是隊員名單還是寶物記錄，或內容為空。")
