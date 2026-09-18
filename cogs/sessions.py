@@ -305,7 +305,7 @@ class GiveToReceiverModal(discord.ui.Modal):
         self.item = item
         self.receiver_input = discord.ui.TextInput(
             label=f"「{item['name'][:30]}」給誰？",
-            placeholder="輸入成員名字，例如 熊爺",
+            placeholder="輸入登記過的角色名稱，例如 熊爺",
             required=True,
             max_length=50,
         )
@@ -314,10 +314,23 @@ class GiveToReceiverModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         receiver = self.receiver_input.value.strip()
         await interaction.response.defer()
+
+        uid, matched_name = await asyncio.to_thread(
+            self.store.find_user_by_character_name, receiver
+        )
+        if not matched_name:
+            await interaction.followup.send(
+                f"⚠️ 找不到角色「{receiver}」，請確認角色名稱有沒有打錯，"
+                f"或這個人是不是還沒用 `!profile` 登記過。確認後重新打一次 `!giveto`。",
+                ephemeral=True,
+            )
+            return
+        display = await resolve_display_name(uid, matched_name, interaction.guild)
+
         async with self.store.lock:
             result = await asyncio.to_thread(
                 self.store.give_item_to_member, self.item["session_id"], self.item["item_index"],
-                receiver, self.item["name"],
+                receiver, self.item["name"], display,
             )
 
         if not result["ok"]:
@@ -670,9 +683,20 @@ class Sessions(commands.Cog):
             await ctx.send("⚠️ 編號必須是數字。")
             return
 
+        uid, matched_name = await asyncio.to_thread(
+            self.store.find_user_by_character_name, receiver
+        )
+        if not matched_name:
+            await ctx.send(
+                f"⚠️ 找不到角色「{receiver}」，請確認角色名稱有沒有打錯，"
+                f"或這個人是不是還沒用 `!profile` 登記過。"
+            )
+            return
+        display = await resolve_display_name(uid, matched_name, ctx.guild)
+
         async with self.store.lock:
             result = await asyncio.to_thread(
-                self.store.give_item_to_member, session_id, index, receiver
+                self.store.give_item_to_member, session_id, index, receiver, None, display
             )
 
         if not result["ok"]:
