@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -7,6 +10,7 @@ from discord.ext import commands
 from google import genai
 
 from store import SheetsStore
+import audit
 
 # --- 背景 HTTP 伺服器（讓 Render Web Service 保持健康連線） ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -79,13 +83,13 @@ async def on_command_error(ctx, error):
         await ctx.send(f"⚠️ 參數格式錯誤：{error}")
         return
     original = getattr(error, "original", error)
-    print(f"⚠️ 指令錯誤（{ctx.command}）：{original!r}", flush=True)
+    audit.error(f"指令錯誤：{ctx.command}", original, who=ctx.author.display_name)
     await ctx.send(f"❌ 執行 `{ctx.command}` 時發生錯誤：{original}")
 
 
 @bot.event
 async def on_ready():
-    print(f"🤖 機器人已順利上線：{bot.user.name}", flush=True)
+    audit.system(f"機器人上線：{bot.user.name}")
 
     # 設定機器人在成員清單上顯示的狀態（就是「正在玩 ⋯⋯」那一行）
     # 想換樣式的話改 ACTIVITY_TYPE / ACTIVITY_TEXT 這兩個環境變數就好，不用改程式碼：
