@@ -4,6 +4,7 @@ from discord.ext import commands
 
 from cogs.jobs import get_tier1_jobs, get_children_jobs
 from helpers import resolve_display_name
+import audit
 
 
 class NameModal(discord.ui.Modal):
@@ -53,6 +54,11 @@ async def finalize_profile(store, interaction: discord.Interaction, name: str, j
     )
     if image_url:
         embed.set_thumbnail(url=image_url)
+    audit.audit(
+        "新增角色" if result == "created" else "更新角色",
+        who=display_name,
+        detail=f"角色 {name}｜職業 {job}" + (f"｜位置 {position}" if position else ""),
+    )
     await interaction.edit_original_response(content=None, embed=embed, view=None)
 
 
@@ -76,7 +82,7 @@ class PositionSelect(discord.ui.Select):
 
 async def _report_view_error(interaction: discord.Interaction, error: Exception):
     """按鈕/選單背後發生例外時，把錯誤顯示給使用者看，而不是默默卡住沒反應。"""
-    print(f"⚠️ 互動發生錯誤：{error!r}", flush=True)
+    audit.error("互動發生錯誤", error, who=interaction.user.display_name)
     message = f"❌ 執行時發生錯誤：{error}"
     try:
         if interaction.response.is_done():
@@ -226,6 +232,10 @@ class Profiles(commands.Cog):
         if not removed:
             await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !myprofiles 確認編號。")
             return
+        audit.audit(
+            "刪除角色", who=ctx.author.display_name,
+            detail=f"角色 {removed.get('角色名稱')}（{removed.get('職業')}）",
+        )
         await ctx.send(f"🗑️ 已刪除角色：{removed.get('角色名稱')}（{removed.get('職業')}）")
 
     @commands.command(name="setavailability")
@@ -257,6 +267,10 @@ class Profiles(commands.Cog):
                 self.store.update_availability, str(ctx.author.id), ctx.author.display_name,
                 weekday, weekend, note,
             )
+        audit.audit(
+            "更新可出席時間", who=ctx.author.display_name,
+            detail=f"平日={weekday}｜假日={weekend}｜備註={note}",
+        )
         await ctx.send("✅ 已更新你的可出席時間設定。")
 
     @commands.hybrid_command(name="myavailability")

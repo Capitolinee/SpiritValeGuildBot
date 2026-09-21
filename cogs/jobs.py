@@ -1,6 +1,8 @@
 import asyncio
 from discord.ext import commands
 
+import audit
+
 
 def get_tier1_jobs(jobs: dict) -> list:
     return [n for n, info in jobs.items() if info.get("tier", 1) == 1]
@@ -49,6 +51,7 @@ class Jobs(commands.Cog):
             await asyncio.to_thread(self.store.upsert_job, job_name, tier, parent, image_url)
 
         detail = f"第 {tier} 轉" + (f"，承接自「{parent}」" if parent else "")
+        audit.audit("設定職業", who=ctx.author.display_name, detail=f"{job_name}｜{detail}")
         await ctx.send(f"✅ 已設定職業「{job_name}」（{detail}）。")
 
     @commands.command(name="deljob")
@@ -64,6 +67,7 @@ class Jobs(commands.Cog):
                 await ctx.send(f"⚠️ 「{job_name}」還有下一轉職業（{', '.join(children)}）承接自它，請先處理那些職業。")
                 return
             await asyncio.to_thread(self.store.delete_job, job_name)
+        audit.audit("刪除職業", who=ctx.author.display_name, detail=job_name)
         await ctx.send(f"🗑️ 已刪除職業「{job_name}」。")
 
     @commands.command(name="jobs")
@@ -94,6 +98,7 @@ class Jobs(commands.Cog):
         if result == "exists":
             await ctx.send(f"⚠️ 「{name}」已經存在，不用重複新增。")
             return
+        audit.audit("新增位置", who=ctx.author.display_name, detail=name)
         await ctx.send(f"✅ 已新增位置「{name}」。")
 
     @commands.command(name="delposition")
@@ -104,6 +109,7 @@ class Jobs(commands.Cog):
         if not removed:
             await ctx.send(f"⚠️ 找不到位置「{name}」，用 !positions 確認目前有哪些。")
             return
+        audit.audit("刪除位置", who=ctx.author.display_name, detail=name)
         await ctx.send(f"🗑️ 已刪除位置「{name}」。")
 
     @commands.command(name="positions")

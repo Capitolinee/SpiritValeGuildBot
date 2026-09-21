@@ -10,6 +10,7 @@ from discord.ext import commands
 
 from helpers import resolve_display_name, now_str
 from store import SHEET_SESSIONS
+import audit
 
 PROMPT = """
 你是一個遊戲紀錄助手。請判斷這張圖片的內容類型，並依照下列規則回傳「純 JSON」，
@@ -95,6 +96,10 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
 
     summary = "、".join(recorded)
     where = f"場次 `{session_id}`" if session_id else "捐獻清單"
+    audit.audit(
+        "記錄寶物", who=operator or "（未知）",
+        detail=f"場次 {session_id or '（捐獻）'}｜類型 {item_type}｜{summary}",
+    )
     return f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```", None
 
 
@@ -158,6 +163,10 @@ class ConfirmView(discord.ui.View):
             )
 
         names = "、".join(m["display_name"] for m in members)
+        audit.audit(
+            "開場（無掉落）", who=interaction.user.display_name,
+            detail=f"場次 {session_id}｜出席 {len(members)} 人：{names}",
+        )
         content = (
             f"**✅ 已建立場次 `{session_id}`，出席：**\n```{names}```\n"
             f"（已標記這場沒有掉落寶物，出席已直接記錄。）"
@@ -178,6 +187,10 @@ class ConfirmView(discord.ui.View):
                 "id": new_session_id(), "members": members, "next_item_index": 0,
             }
             names = "、".join(m["display_name"] for m in members)
+            audit.audit(
+                "開場（圖片辨識）", who=interaction.user.display_name,
+                detail=f"場次 {self.bot.active_session['id']}｜出席 {len(members)} 人：{names}",
+            )
             return (
                 f"**✅ 已建立場次 `{self.bot.active_session['id']}`，出席：**\n```{names}```\n"
                 f"接下來可以用 `!item 寶物名稱` 或上傳寶物圖片記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤。"
@@ -249,6 +262,12 @@ class SellAmountModal(discord.ui.Modal):
             await interaction.edit_original_response(content=msg, view=None)
             return
 
+        audit.audit(
+            "結算寶物", who=interaction.user.display_name,
+            detail=(f"{result['item_name']}｜類型 {result['item_type']}｜售出 {amount}"
+                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.2f}"
+                       if result["item_type"] == "分潤" else "｜進公會基金")),
+        )
         text = f"💰 「{result['item_name']}」已賣出 **{amount}**"
         if result["item_type"] == "分潤":
             text += (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.2f}**。"
@@ -339,6 +358,10 @@ class GiveToReceiverModal(discord.ui.Modal):
             await interaction.edit_original_response(content=msg, view=None)
             return
 
+        audit.audit(
+            "登記免費領取", who=interaction.user.display_name,
+            detail=f"{result['item_name']}｜領取者 {result['receiver']}（{display}）",
+        )
         await interaction.edit_original_response(
             content=f"🎁 「{result['item_name']}」已登記為成員免費領取（類型：自用，不分潤，已記錄領取時間）。",
             view=None,
@@ -432,6 +455,10 @@ class LootActionView(discord.ui.View):
                    if result["reason"] == "not_found" else "⚠️ 這樣寶物已經結算過了。")
             await interaction.edit_original_response(content=msg, view=None)
             return
+        audit.audit(
+            "改為公會收藏", who=interaction.user.display_name,
+            detail=f"{result['item_name']}",
+        )
         await interaction.edit_original_response(
             content=(f"🏦 「{result['item_name']}」已改成公會收藏（類型：公會）。"
                      f"之後要賣掉換錢進基金，再用 `!loot` 選它結算就好。"),
@@ -485,11 +512,15 @@ class LootSelectView(discord.ui.View):
 
 
 class ClaimSelect(discord.ui.Select):
+    # 捐獻的寶物場次ID 是空字串，Discord 選項的 value 不能是空字串，
+    # 所以用這個哨符代表「沒有場次ID 的那一批」
+    BLANK_SESSION = "__BLANK__"
+
     def __init__(self, store, author_id: int, pending_sessions: list):
-        options = [
-            discord.SelectOption(label=f"{sid}（待領 {amt:.2f}）", value=sid)
-            for sid, amt in pending_sessions[:24]
-        ]
+        options = []
+        for sid, amt in pending_sessions[:24]:
+            label = f"{sid}（待領 {amt:.2f}）" if sid else f"捐獻寶物（待領 {amt:.2f}）"
+            options.append(discord.SelectOption(label=label, value=sid or self.BLANK_SESSION))
         options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
         super().__init__(placeholder="選擇要領取哪一場", options=options, min_values=1, max_values=1)
         self.store = store
@@ -501,7 +532,12 @@ class ClaimSelect(discord.ui.Select):
             return
         chosen = self.values[0]
         uid = str(interaction.user.id)
-        session_id = None if chosen == "__ALL__" else chosen
+        if chosen == "__ALL__":
+            session_id = None
+        elif chosen == self.BLANK_SESSION:
+            session_id = ""
+        else:
+            session_id = chosen
 
         await interaction.response.defer()
         async with self.store.lock:
@@ -511,6 +547,11 @@ class ClaimSelect(discord.ui.Select):
             await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
             return
         detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+        audit.audit(
+            "領取分潤", who=interaction.user.display_name,
+            detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
+                f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
+        )
         await interaction.edit_original_response(
             content=f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", view=None
         )
@@ -614,6 +655,10 @@ class Sessions(commands.Cog):
         names = "、".join(m["display_name"] for m in members)
         unmatched = [m["name"] for m in members if not m["discord_id"]]
 
+        audit.audit(
+            "開場（手動輸入）", who=ctx.author.display_name,
+            detail=f"場次 {self.bot.active_session['id']}｜出席 {len(members)} 人：{names}",
+        )
         reply = (
             f"**✅ 已建立場次 `{self.bot.active_session['id']}`，出席 {len(members)} 人：**\n```{names}```\n"
             f"接下來可以用 `!item 寶物名稱` 記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤；"
@@ -642,6 +687,10 @@ class Sessions(commands.Cog):
             await asyncio.to_thread(
                 self.store.record_attendance, session["id"], now, session["members"], ctx.author.display_name
             )
+        audit.audit(
+            "補記出席（無掉落）", who=ctx.author.display_name,
+            detail=f"場次 {session['id']}｜{len(session['members'])} 人",
+        )
         await ctx.send(f"✅ 已補記錄場次 `{session['id']}` 的出席（沒有掉落寶物）。")
 
     @commands.command(name="item")
@@ -757,6 +806,12 @@ class Sessions(commands.Cog):
                 await ctx.send(f"⚠️ 編號 {index} 已經賣過了，不能重複結算。")
             return
 
+        audit.audit(
+            "結算寶物", who=ctx.author.display_name,
+            detail=(f"{result['item_name']}｜類型 {result['item_type']}｜售出 {amount}"
+                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.2f}"
+                       if result["item_type"] == "分潤" else "｜進公會基金")),
+        )
         await ctx.send(
             f"💰 「{result['item_name']}」已賣出 **{amount}**"
             + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.2f}**。隊員可以用 `!claim` 領取。"
@@ -822,6 +877,10 @@ class Sessions(commands.Cog):
                 await ctx.send(f"⚠️ 編號 {index} 已經結算過了，不能再登記免費領取。")
             return
 
+        audit.audit(
+            "登記免費領取", who=ctx.author.display_name,
+            detail=f"{result['item_name']}｜領取者 {result['receiver']}（{display}）",
+        )
         await ctx.send(
             f"🎁 「{result['item_name']}」已登記為成員免費領取（類型：自用，不分潤，已記錄領取時間）。"
         )
@@ -895,6 +954,11 @@ class Sessions(commands.Cog):
                 await ctx.send(f"場次 `{session_id}` 沒有可領取的分潤。", ephemeral=True)
                 return
             detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+            audit.audit(
+                "領取分潤", who=ctx.author.display_name,
+                detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
+                    f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
+            )
             await ctx.send(f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", ephemeral=True)
             return
 
@@ -907,10 +971,17 @@ class Sessions(commands.Cog):
             async with self.store.lock:
                 result = await asyncio.to_thread(self.store.claim_for_user, uid, pending_sessions[0][0])
             detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+            audit.audit(
+                "領取分潤", who=ctx.author.display_name,
+                detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
+                    f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
+            )
             await ctx.send(f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", ephemeral=True)
             return
 
-        lines = "\n".join(f"- {sid}：待領 {amt:.2f}" for sid, amt in pending_sessions)
+        lines = "\n".join(
+            f"- {sid or '捐獻寶物'}：待領 {amt:.2f}" for sid, amt in pending_sessions
+        )
         view = ClaimSelectView(self.store, ctx.author.id, pending_sessions)
         await ctx.send(f"你有多場待領分潤，請選擇要領取哪一場：\n```{lines}```", view=view, ephemeral=True)
 
@@ -944,6 +1015,11 @@ class Sessions(commands.Cog):
             return
 
         detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+        audit.audit(
+            "管理員代為標記已領", who=ctx.author.display_name,
+            detail=f"對象 {member.display_name}｜共 {result['total']:.2f}｜" + "；".join(
+                f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
+        )
         await ctx.send(
             f"✅ 已由 {ctx.author.display_name} 代為標記 {member.display_name} 的分潤為已領，"
             f"共 **{result['total']:.2f}**：\n```{detail_text}```"
@@ -979,6 +1055,10 @@ class Sessions(commands.Cog):
             await asyncio.to_thread(self.store.batch_update_cells, SHEET_SESSIONS, name_updates)
 
         lines = "\n".join(f"[{row}] {name}" for row, _, name in backfilled)
+        audit.audit(
+            "回溯補上帳號對應", who=ctx.author.display_name,
+            detail=f"{len(backfilled)} 筆｜" + "；".join(f"第{row}列 {name}" for row, _, name in backfilled),
+        )
         await ctx.send(f"✅ 已補上 {len(backfilled)} 筆記錄的 Discord ID：\n```{lines}```")
 
     @commands.command(name="guildfund")
