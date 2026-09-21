@@ -641,7 +641,12 @@ class SheetsStore:
         return {"ok": True, "item_name": found_name, "new_type": new_type}
 
     def claim_for_user(self, discord_id: str, session_id: str = None) -> dict:
-        """把這個使用者所有（或指定場次）尚未領取的分潤列標記已領。回傳明細。"""
+        """
+        把這個使用者尚未領取的分潤列標記已領。回傳明細。
+        session_id=None 代表不限場次（全部領取）；傳入字串就只領那一場——
+        注意捐獻的寶物場次ID 是空字串，所以這裡要用 is not None 判斷，
+        不能直接用 if session_id，否則空字串會被當成「沒指定」而整包全領。
+        """
         now = now_str()
         total = 0.0
         details = []
@@ -651,7 +656,7 @@ class SheetsStore:
                 continue
             if r.get("Discord ID", "").strip() != str(discord_id):
                 continue
-            if session_id and r.get("場次ID", "").strip() != session_id:
+            if session_id is not None and r.get("場次ID", "").strip() != session_id:
                 continue
             already = str(r.get("已領", "")).strip().upper() == "TRUE"
             sale = r.get("售出金額", "").strip()
@@ -691,6 +696,55 @@ class SheetsStore:
         for session_id, item_name, amt in self.pending_for_user(discord_id)["details"]:
             by_session[session_id] = by_session.get(session_id, 0) + amt
         return list(by_session.items())
+
+    def pending_items_for_user(self, discord_id: str) -> list:
+        """
+        回傳這個人每一筆待領（以「每一樣寶物」為單位，不是以場次為單位）。
+        [{"row": 列號, "session_id":..., "item_name":..., "amount":...}, ...]
+        row 是這一列在「場次記錄」表的實際列號，用來精確指定要領哪一筆。
+        """
+        items = []
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
+            if r.get("類型") != "分潤":
+                continue
+            if r.get("Discord ID", "").strip() != str(discord_id):
+                continue
+            already = str(r.get("已領", "")).strip().upper() == "TRUE"
+            sale = r.get("售出金額", "").strip()
+            per_person = r.get("均分$$", "").strip()
+            if already or not sale or not per_person:
+                continue
+            items.append({
+                "row": r["_row"],
+                "session_id": r.get("場次ID", ""),
+                "item_name": r.get("掉落", ""),
+                "amount": float(per_person),
+            })
+        return items
+
+    def claim_item_row(self, discord_id: str, row: int) -> dict:
+        """
+        領取單一一筆待領（用實際列號精確指定是哪一筆，避免同場同寶物混在一起誤領）。
+        會重新核對這一列還是「未領、屬於這個人」才會標記，防止跟別的操作打架。
+        """
+        rows = {r["_row"]: r for r in self.get_rows(SHEET_SESSIONS, key_col_index=2)}
+        r = rows.get(row)
+        if not r:
+            return {"ok": False, "reason": "not_found"}
+        if r.get("類型") != "分潤" or r.get("Discord ID", "").strip() != str(discord_id):
+            return {"ok": False, "reason": "not_found"}
+        already = str(r.get("已領", "")).strip().upper() == "TRUE"
+        sale = r.get("售出金額", "").strip()
+        per_person = r.get("均分$$", "").strip()
+        if already or not sale or not per_person:
+            return {"ok": False, "reason": "already_claimed"}
+
+        now = now_str()
+        self.batch_update_cells(SHEET_SESSIONS, [(row, 12, [True, now])])
+        return {
+            "ok": True, "session_id": r.get("場次ID", ""),
+            "item_name": r.get("掉落", ""), "amount": float(per_person),
+        }
 
     def unclaimed_for_session(self, session_id: str) -> dict:
         """回傳這個場次裡，誰還沒領錢 {key: amount}，key 是 discord_id 或 "raw:名字"。"""
@@ -752,5 +806,38 @@ class SheetsStore:
         values = ws.get_all_values()
         for i, row in enumerate(values[1:], start=2):
             if row and row[0].strip() == key:
+                ws.delete_rows(i)
+                return
+
+    # ---------- 公告翻譯設定（存在「翻譯設定」分頁，第一次用到時自動建立） ----------
+
+    def _translate_sheet(self):
+        try:
+            return self.ws("翻譯設定")
+        except gspread.WorksheetNotFound:
+            ss = self._ss()
+            ws = ss.add_worksheet(title="翻譯設定", rows=200, cols=1)
+            ws.update("A1", [["自動翻譯頻道ID"]], value_input_option="USER_ENTERED")
+            return ws
+
+    def get_translate_channels(self) -> set:
+        """回傳有開啟自動翻譯的頻道ID集合。"""
+        ws = self._translate_sheet()
+        values = ws.get_all_values()
+        return {row[0].strip() for row in values[1:] if row and row[0].strip()}
+
+    def add_translate_channel(self, channel_id: str):
+        ws = self._translate_sheet()
+        values = ws.get_all_values()
+        for row in values[1:]:
+            if row and row[0].strip() == channel_id:
+                return  # 已經有了，不重複加
+        ws.update(f"A{len(values) + 1}", [[channel_id]], value_input_option="USER_ENTERED")
+
+    def remove_translate_channel(self, channel_id: str):
+        ws = self._translate_sheet()
+        values = ws.get_all_values()
+        for i, row in enumerate(values[1:], start=2):
+            if row and row[0].strip() == channel_id:
                 ws.delete_rows(i)
                 return
