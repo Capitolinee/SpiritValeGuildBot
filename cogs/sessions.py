@@ -512,19 +512,19 @@ class LootSelectView(discord.ui.View):
 
 
 class ClaimSelect(discord.ui.Select):
-    # 捐獻的寶物場次ID 是空字串，Discord 選項的 value 不能是空字串，
-    # 所以用這個哨符代表「沒有場次ID 的那一批」
-    BLANK_SESSION = "__BLANK__"
-
-    def __init__(self, store, author_id: int, pending_sessions: list):
-        options = []
-        for sid, amt in pending_sessions[:24]:
-            label = f"{sid}（待領 {amt:.2f}）" if sid else f"捐獻寶物（待領 {amt:.2f}）"
-            options.append(discord.SelectOption(label=label, value=sid or self.BLANK_SESSION))
-        options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
-        super().__init__(placeholder="選擇要領取哪一場", options=options, min_values=1, max_values=1)
+    def __init__(self, store, author_id: int, items: list):
         self.store = store
         self.author_id = author_id
+        self.items = {}
+        options = []
+        for it in items[:24]:
+            key = str(it["row"])
+            self.items[key] = it
+            session_label = it["session_id"] or "捐獻寶物"
+            label = f"{it['item_name']}（{session_label}，+{it['amount']:.2f}）"
+            options.append(discord.SelectOption(label=label[:100], value=key))
+        options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
+        super().__init__(placeholder="選擇要領取哪一樣", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
@@ -532,35 +532,45 @@ class ClaimSelect(discord.ui.Select):
             return
         chosen = self.values[0]
         uid = str(interaction.user.id)
-        if chosen == "__ALL__":
-            session_id = None
-        elif chosen == self.BLANK_SESSION:
-            session_id = ""
-        else:
-            session_id = chosen
-
         await interaction.response.defer()
-        async with self.store.lock:
-            result = await asyncio.to_thread(self.store.claim_for_user, uid, session_id)
 
-        if not result["details"]:
-            await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
+        if chosen == "__ALL__":
+            async with self.store.lock:
+                result = await asyncio.to_thread(self.store.claim_for_user, uid, None)
+            if not result["details"]:
+                await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
+                return
+            detail_text = "\n".join(f"{sid or '捐獻寶物'}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+            audit.audit(
+                "領取分潤", who=interaction.user.display_name,
+                detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
+                    f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
+            )
+            await interaction.edit_original_response(
+                content=f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", view=None
+            )
             return
-        detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+
+        item = self.items[chosen]
+        async with self.store.lock:
+            result = await asyncio.to_thread(self.store.claim_item_row, uid, item["row"])
+
+        if not result["ok"]:
+            await interaction.edit_original_response(content="這筆待領已經被處理掉了（可能剛被領過）。", view=None)
+            return
         audit.audit(
             "領取分潤", who=interaction.user.display_name,
-            detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
-                f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
+            detail=f"{result['session_id'] or '捐獻寶物'} {result['item_name']} {result['amount']:.2f}",
         )
         await interaction.edit_original_response(
-            content=f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", view=None
+            content=f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.2f}**", view=None
         )
 
 
 class ClaimSelectView(discord.ui.View):
-    def __init__(self, store, author_id: int, pending_sessions: list):
+    def __init__(self, store, author_id: int, items: list):
         super().__init__(timeout=120)
-        self.add_item(ClaimSelect(store, author_id, pending_sessions))
+        self.add_item(ClaimSelect(store, author_id, items))
 
 
 class Sessions(commands.Cog):
@@ -573,6 +583,12 @@ class Sessions(commands.Cog):
         if message.author.bot:
             return
         if not message.attachments:
+            return
+
+        # 開啟自動翻譯的頻道，不要拿去做隊員/寶物圖片辨識，
+        # 否則公告裡的圖片會白白吃掉辨識額度。
+        translate_cog = self.bot.get_cog("Translate")
+        if translate_cog and str(message.channel.id) in getattr(translate_cog, "channels", set()):
             return
 
         for attachment in message.attachments:
@@ -942,8 +958,8 @@ class Sessions(commands.Cog):
     async def claim(self, ctx, session_id: str = None):
         """
         領取自己尚未領取的分潤。用 /claim 打的話只有你看得到。
-        用法：!claim            → 只有一場待領時直接領取；多場時跳選單
-             !claim 場次ID     → 直接領取指定場次
+        用法：!claim            → 只有一筆待領時直接領取；多筆時跳選單（一樣一樣選）
+             !claim 場次ID     → 直接領取指定場次的全部
         """
         uid = str(ctx.author.id)
 
@@ -962,28 +978,30 @@ class Sessions(commands.Cog):
             await ctx.send(f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", ephemeral=True)
             return
 
-        pending_sessions = await asyncio.to_thread(self.store.pending_sessions_for_user, uid)
-        if not pending_sessions:
+        items = await asyncio.to_thread(self.store.pending_items_for_user, uid)
+        if not items:
             await ctx.send("目前沒有可領取的分潤。", ephemeral=True)
             return
 
-        if len(pending_sessions) == 1:
+        if len(items) == 1:
+            item = items[0]
             async with self.store.lock:
-                result = await asyncio.to_thread(self.store.claim_for_user, uid, pending_sessions[0][0])
-            detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+                result = await asyncio.to_thread(self.store.claim_item_row, uid, item["row"])
+            if not result["ok"]:
+                await ctx.send("這筆待領已經被處理掉了（可能剛被領過）。", ephemeral=True)
+                return
             audit.audit(
                 "領取分潤", who=ctx.author.display_name,
-                detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
-                    f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
+                detail=f"{result['session_id'] or '捐獻寶物'} {result['item_name']} {result['amount']:.2f}",
             )
-            await ctx.send(f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", ephemeral=True)
+            await ctx.send(f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.2f}**", ephemeral=True)
             return
 
         lines = "\n".join(
-            f"- {sid or '捐獻寶物'}：待領 {amt:.2f}" for sid, amt in pending_sessions
+            f"- {it['item_name']}（{it['session_id'] or '捐獻寶物'}）：+{it['amount']:.2f}" for it in items
         )
-        view = ClaimSelectView(self.store, ctx.author.id, pending_sessions)
-        await ctx.send(f"你有多場待領分潤，請選擇要領取哪一場：\n```{lines}```", view=view, ephemeral=True)
+        view = ClaimSelectView(self.store, ctx.author.id, items)
+        await ctx.send(f"你有 {len(items)} 筆待領，請選擇要領取哪一樣：\n```{lines}```", view=view, ephemeral=True)
 
     @commands.hybrid_command(name="pending")
     async def pending(self, ctx):
