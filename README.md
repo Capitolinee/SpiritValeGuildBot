@@ -31,7 +31,7 @@ Once it's running, you'll see "機器人已順利上線" in the console. Type `!
 ## A few commands to get a feel for it
 
 ```
-!startsession 熊爺,柒柒,Open匠   # start a session without a screenshot
+!startsession A,B,C   # start a session without a screenshot
 !loot                            # pick an item, decide what to do with it
 !claim                           # claim your own share
 !profile                         # register your character
