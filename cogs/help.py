@@ -41,11 +41,6 @@ HELP_SECTIONS = [
         ("!positions", "查看戰鬥位置選項"),
         ("!addposition 名稱 / !delposition 名稱", "新增／刪除戰鬥位置"),
     ]),
-    ("🌐 公告翻譯", [
-        ("!addtranslate", "讓這個頻道的新訊息自動翻成繁中回覆（需管理權限）"),
-        ("!deltranslate", "取消這個頻道的自動翻譯"),
-        ("!translates", "查看哪些頻道開啟了自動翻譯"),
-    ]),
     ("🔒 頻道限制", [
         ("!viewlogs [audit|error] [幾天前] [行數]", "直接在 Discord 讀取稽核/錯誤記錄（需管理權限）"),
         ("!setthreadrules 指令1,指令2", "限制這個討論串只能用哪些指令"),
