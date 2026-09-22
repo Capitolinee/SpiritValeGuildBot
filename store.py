@@ -46,6 +46,20 @@ def normalize_name(name: str) -> str:
     return normalized
 
 
+def _sanitize(value):
+    """
+    防止公式注入（formula injection）：使用者輸入的文字如果開頭是
+    = + - @ 這幾個會被 Google Sheets 當成公式起始符號的字元，
+    用 USER_ENTERED 模式寫入時會被誤判成公式去執行（例如有人把角色名稱
+    設成 =IMPORTXML(...) 之類的，可能造成資料外洩或試算表被搞亂）。
+    這裡在前面加一個單引號，強制 Google Sheets 當成純文字處理，
+    不影響其他一般文字/數字/布林值的寫入行為。
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 def _col_letter(n: int) -> str:
     """1 -> A, 2 -> B ... 只用在 row=1 的情況，所以可以簡單用 rowcol_to_a1 再去掉最後的 '1'。"""
     return gspread.utils.rowcol_to_a1(1, n)[:-1]
@@ -161,9 +175,15 @@ class SheetsStore:
         if needed_row > ws.row_count:
             ws.add_rows(needed_row - ws.row_count + 100)
 
-    def write_row(self, sheet_name: str, row_number: int, values: list, start_col: int = 1):
-        """把 values 依序寫進指定列，從 start_col 開始（1-indexed）。"""
+    def write_row(self, sheet_name: str, row_number: int, values: list, start_col: int = 1, raw: bool = False):
+        """
+        把 values 依序寫進指定列，從 start_col 開始（1-indexed）。
+        raw=False（預設）：自動防止公式注入，使用者輸入的文字不會被誤判成公式。
+        raw=True：只在寫入「機器人自己產生的公式字串」時使用，跳過防注入處理。
+        """
         self._ensure_row_capacity(sheet_name, row_number)
+        if not raw:
+            values = [_sanitize(v) for v in values]
         start = f"{_col_letter(start_col)}{row_number}"
         end = f"{_col_letter(start_col + len(values) - 1)}{row_number}"
         self.ws(sheet_name).update(f"{start}:{end}", [values], value_input_option="USER_ENTERED")
@@ -174,45 +194,48 @@ class SheetsStore:
         一次性把多列資料寫入（從第一個空白列開始，連續往下填），用「一次」API 呼叫寫完。
         extra_formulas: [(col_index, formula_fn), ...]，formula_fn(row_number) 回傳這一列該欄位的公式字串，
         確保機器人新增的每一列都自帶自己需要的公式，資料量再大也不會漏算。
+        values_list 一律視為使用者輸入，自動防止公式注入；extra_formulas 是機器人自己產生的公式，不受影響。
         """
         if not values_list:
             return None
         start_row = self.find_first_empty_row(sheet_name, key_col_index=key_col_index)
         end_row = start_row + len(values_list) - 1
         self._ensure_row_capacity(sheet_name, end_row)
+        sanitized = [[_sanitize(v) for v in row] for row in values_list]
         start_letter = _col_letter(start_col)
         end_letter = _col_letter(start_col + len(values_list[0]) - 1)
-        self.ws(sheet_name).update(f"{start_letter}{start_row}:{end_letter}{end_row}", values_list, value_input_option="USER_ENTERED")
+        self.ws(sheet_name).update(f"{start_letter}{start_row}:{end_letter}{end_row}", sanitized, value_input_option="USER_ENTERED")
 
         if extra_formulas:
             updates = []
             for r in range(start_row, end_row + 1):
                 for col, formula_fn in extra_formulas:
                     updates.append((r, col, [formula_fn(r)]))
-            self.batch_update_cells(sheet_name, updates)
+            self.batch_update_cells(sheet_name, updates, raw=True)
 
         return start_row
 
-    def batch_update_cells(self, sheet_name: str, updates: list):
+    def batch_update_cells(self, sheet_name: str, updates: list, raw: bool = False):
         """
         一次性更新多個（可能不連續的）位置。updates 是 [(row, start_col, values), ...]，
         用 gspread 的 batch_update 一次送出，避免每一列各打一次 API。
+        raw=False（預設）：自動防止公式注入。raw=True：寫入機器人自己產生的公式時使用。
         """
         if not updates:
             return
         self._ensure_row_capacity(sheet_name, max(row for row, _, _ in updates))
         data = []
         for row, start_col, values in updates:
+            if not raw:
+                values = [_sanitize(v) for v in values]
             start_letter = _col_letter(start_col)
             end_letter = _col_letter(start_col + len(values) - 1)
             data.append({"range": f"{start_letter}{row}:{end_letter}{row}", "values": [values]})
         self.ws(sheet_name).batch_update(data, value_input_option="USER_ENTERED")
 
-
-
     def update_cell(self, sheet_name: str, row: int, col: int, value):
         letter = _col_letter(col)
-        self.ws(sheet_name).update(f"{letter}{row}", [[value]], value_input_option="USER_ENTERED")
+        self.ws(sheet_name).update(f"{letter}{row}", [[_sanitize(value)]], value_input_option="USER_ENTERED")
 
     def delete_row(self, sheet_name: str, row_number: int):
         self.ws(sheet_name).delete_rows(row_number)
@@ -381,7 +404,7 @@ class SheetsStore:
         self.write_row(
             SHEET_CHARACTERS, row_num,
             [_char_attendance_formula(row_num), _char_earnings_formula(row_num)],
-            start_col=6,
+            start_col=6, raw=True,
         )
         self.ensure_account_row(discord_id, display_name)
         return "created"
@@ -411,7 +434,7 @@ class SheetsStore:
                 _account_claimed_formula(row_num),
                 _account_pending_formula(row_num),
             ],
-            start_col=6,
+            start_col=6, raw=True,
         )
 
     def get_account_stats(self, discord_id: str) -> dict:
