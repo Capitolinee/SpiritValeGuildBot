@@ -265,12 +265,12 @@ class SellAmountModal(discord.ui.Modal):
         audit.audit(
             "結算寶物", who=interaction.user.display_name,
             detail=(f"{result['item_name']}｜類型 {result['item_type']}｜售出 {amount}"
-                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.2f}"
+                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.0f}"
                        if result["item_type"] == "分潤" else "｜進公會基金")),
         )
         text = f"💰 「{result['item_name']}」已賣出 **{amount}**"
         if result["item_type"] == "分潤":
-            text += (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.2f}**。"
+            text += (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。"
                      f"隊員可以用 `!claim` 領取。")
         else:
             text += "，已計入公會基金。"
@@ -521,7 +521,7 @@ class ClaimSelect(discord.ui.Select):
             key = str(it["row"])
             self.items[key] = it
             session_label = it["session_id"] or "捐獻寶物"
-            label = f"{it['item_name']}（{session_label}，+{it['amount']:.2f}）"
+            label = f"{it['item_name']}（{session_label}，+{it['amount']:.0f}）"
             options.append(discord.SelectOption(label=label[:100], value=key))
         options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
         super().__init__(placeholder="選擇要領取哪一樣", options=options, min_values=1, max_values=1)
@@ -540,14 +540,14 @@ class ClaimSelect(discord.ui.Select):
             if not result["details"]:
                 await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
                 return
-            detail_text = "\n".join(f"{sid or '捐獻寶物'}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+            detail_text = "\n".join(f"{sid or '捐獻寶物'}：{name} +{amt:.0f}" for sid, name, amt in result["details"])
             audit.audit(
                 "領取分潤", who=interaction.user.display_name,
                 detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
                     f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
             )
             await interaction.edit_original_response(
-                content=f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", view=None
+                content=f"✅ 已領取，共 **{result['total']:.0f}**：\n```{detail_text}```", view=None
             )
             return
 
@@ -563,7 +563,7 @@ class ClaimSelect(discord.ui.Select):
             detail=f"{result['session_id'] or '捐獻寶物'} {result['item_name']} {result['amount']:.2f}",
         )
         await interaction.edit_original_response(
-            content=f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.2f}**", view=None
+            content=f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.0f}**", view=None
         )
 
 
@@ -825,12 +825,12 @@ class Sessions(commands.Cog):
         audit.audit(
             "結算寶物", who=ctx.author.display_name,
             detail=(f"{result['item_name']}｜類型 {result['item_type']}｜售出 {amount}"
-                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.2f}"
+                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.0f}"
                        if result["item_type"] == "分潤" else "｜進公會基金")),
         )
         await ctx.send(
             f"💰 「{result['item_name']}」已賣出 **{amount}**"
-            + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.2f}**。隊員可以用 `!claim` 領取。"
+            + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。隊員可以用 `!claim` 領取。"
                if result["item_type"] == "分潤" else "，已計入公會基金。")
         )
 
@@ -951,7 +951,7 @@ class Sessions(commands.Cog):
                 display = f"{key[4:]}（未綁定 Discord 帳號，需人工處理）"
             else:
                 display = await resolve_display_name(key, key, ctx.guild)
-            lines.append(f"- {display}：{amount:.2f}")
+            lines.append(f"- {display}：{amount:.0f}")
         await ctx.send("**💸 尚未領款：**\n```" + "\n".join(lines) + "```")
 
     @commands.hybrid_command(name="claim")
@@ -969,13 +969,13 @@ class Sessions(commands.Cog):
             if not result["details"]:
                 await ctx.send(f"場次 `{session_id}` 沒有可領取的分潤。", ephemeral=True)
                 return
-            detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+            detail_text = "\n".join(f"{sid}：{name} +{amt:.0f}" for sid, name, amt in result["details"])
             audit.audit(
                 "領取分潤", who=ctx.author.display_name,
                 detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
                     f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
             )
-            await ctx.send(f"✅ 已領取，共 **{result['total']:.2f}**：\n```{detail_text}```", ephemeral=True)
+            await ctx.send(f"✅ 已領取，共 **{result['total']:.0f}**：\n```{detail_text}```", ephemeral=True)
             return
 
         items = await asyncio.to_thread(self.store.pending_items_for_user, uid)
@@ -994,11 +994,11 @@ class Sessions(commands.Cog):
                 "領取分潤", who=ctx.author.display_name,
                 detail=f"{result['session_id'] or '捐獻寶物'} {result['item_name']} {result['amount']:.2f}",
             )
-            await ctx.send(f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.2f}**", ephemeral=True)
+            await ctx.send(f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.0f}**", ephemeral=True)
             return
 
         lines = "\n".join(
-            f"- {it['item_name']}（{it['session_id'] or '捐獻寶物'}）：+{it['amount']:.2f}" for it in items
+            f"- {it['item_name']}（{it['session_id'] or '捐獻寶物'}）：+{it['amount']:.0f}" for it in items
         )
         view = ClaimSelectView(self.store, ctx.author.id, items)
         await ctx.send(f"你有 {len(items)} 筆待領，請選擇要領取哪一樣：\n```{lines}```", view=view, ephemeral=True)
@@ -1010,8 +1010,8 @@ class Sessions(commands.Cog):
         if not result["details"]:
             await ctx.send("目前沒有待領取的分潤。", ephemeral=True)
             return
-        text = "\n".join(f"{sid}：{name}（{amt:.2f}）" for sid, name, amt in result["details"])
-        await ctx.send(f"**💰 待領取分潤，共 {result['total']:.2f}：**\n```{text}```", ephemeral=True)
+        text = "\n".join(f"{sid}：{name}（{amt:.0f}）" for sid, name, amt in result["details"])
+        await ctx.send(f"**💰 待領取分潤，共 {result['total']:.0f}：**\n```{text}```", ephemeral=True)
 
     @commands.command(name="forceclaim")
     @commands.has_permissions(manage_guild=True)
@@ -1032,7 +1032,7 @@ class Sessions(commands.Cog):
             await ctx.send(f"{member.display_name} 目前 {scope}沒有待領取的分潤。")
             return
 
-        detail_text = "\n".join(f"{sid}：{name} +{amt:.2f}" for sid, name, amt in result["details"])
+        detail_text = "\n".join(f"{sid}：{name} +{amt:.0f}" for sid, name, amt in result["details"])
         audit.audit(
             "管理員代為標記已領", who=ctx.author.display_name,
             detail=f"對象 {member.display_name}｜共 {result['total']:.2f}｜" + "；".join(
@@ -1040,7 +1040,7 @@ class Sessions(commands.Cog):
         )
         await ctx.send(
             f"✅ 已由 {ctx.author.display_name} 代為標記 {member.display_name} 的分潤為已領，"
-            f"共 **{result['total']:.2f}**：\n```{detail_text}```"
+            f"共 **{result['total']:.0f}**：\n```{detail_text}```"
         )
 
     @force_claim.error
@@ -1083,7 +1083,7 @@ class Sessions(commands.Cog):
     async def guild_fund(self, ctx):
         """查看公會基金總額。"""
         total = await asyncio.to_thread(self.store.guild_fund_total)
-        await ctx.send(f"🏦 公會基金總額：**{total:.2f}**")
+        await ctx.send(f"🏦 公會基金總額：**{total:.0f}**")
 
 
 async def setup(bot):
