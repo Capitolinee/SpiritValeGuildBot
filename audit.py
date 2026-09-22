@@ -15,7 +15,10 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 TW_TZ = timezone(timedelta(hours=8))
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_DIR = os.environ.get(
+    "LOG_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
+)
 
 
 def _ensure_dir():
