@@ -111,6 +111,20 @@ def _session_first_occurrence_by_char_formula(row: int) -> str:
     return f'=IF($C{row}="","",IF(COUNTIFS($A$2:A{row},A{row},$C$2:C{row},C{row})=1,1,0))'
 
 
+def _session_color_formula(row: int) -> str:
+    """
+    色碼(輔助)：同一場次+同一樣寶物（用場次ID+寶物編號當分組鍵）自動上同一個顏色，
+    捐獻的寶物場次ID是空的，用「donation-列號」當獨立分組鍵，不會跟別的捐獻混在一起。
+    這是鏈式公式（要回頭看前一列），跟前一列比對分組鍵是否相同，相同就沿用同一個顏色，
+    不同就往下一個顏色輪替（MOD ...+1,6 是 6 色循環）。純視覺效果，不影響任何金額/出席次數計算。
+    """
+    prev = row - 1
+    return (
+        f'=IF($F{row}="","",IF(IF($A{row}="","donation-"&ROW(),$A{row}&"|"&$G{row})'
+        f'=IF($A{prev}="","donation-"&ROW()-1,$A{prev}&"|"&$G{prev}),O{prev},MOD(N(O{prev})+1,6)))'
+    )
+
+
 class SheetsStore:
     """所有 Google Sheets 讀寫都透過這個類別，方法都是同步的（gspread 本身是同步函式庫），
     cogs 呼叫時要自己包 asyncio.to_thread。"""
@@ -488,6 +502,7 @@ class SheetsStore:
             SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2,
             extra_formulas=[
                 (14, _session_first_occurrence_formula),
+                (15, _session_color_formula),
                 (16, lambda r: operator),
                 (17, _session_first_occurrence_by_char_formula),
             ],
@@ -519,6 +534,7 @@ class SheetsStore:
             SHEET_SESSIONS, rows_data, start_col=1, key_col_index=2,
             extra_formulas=[
                 (14, _session_first_occurrence_formula),
+                (15, _session_color_formula),
                 (16, lambda r: operator),
                 (17, _session_first_occurrence_by_char_formula),
             ],
