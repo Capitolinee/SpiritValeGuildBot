@@ -1,4 +1,9 @@
 import asyncio
+import os
+from datetime import datetime, timezone, timedelta
+
+import audit
+import discord
 from discord.ext import commands
 
 RULE_MANAGEMENT_COMMANDS = {
@@ -110,6 +115,49 @@ class AccessControl(commands.Cog):
             await asyncio.to_thread(self.store.clear_channel_rules, key)
         self.rules_cache.pop(key, None)
         await ctx.send("✅ 已解除這個論壇的預設限制。")
+
+    @commands.command(name="viewlogs")
+    @commands.has_permissions(manage_guild=True)
+    async def view_logs(self, ctx, log_type: str = "audit", days_ago: int = 0, lines: int = 30):
+        """
+        直接在 Discord 讀取稽核記錄，不用去 Railway 或裝任何工具。
+        用法：!viewlogs                    → 今天的稽核記錄，最後 30 行
+             !viewlogs audit 1            → 昨天的稽核記錄
+             !viewlogs error 0 50         → 今天的錯誤記錄，最後 50 行
+        需要「管理伺服器」權限。
+        """
+        if log_type not in ("audit", "error"):
+            await ctx.send("⚠️ log_type 只能是 `audit` 或 `error`。")
+            return
+
+        TW_TZ = timezone(timedelta(hours=8))
+        target_date = (datetime.now(TW_TZ) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        path = os.path.join(audit.LOG_DIR, f"{log_type}-{target_date}.txt")
+
+        if not os.path.exists(path):
+            await ctx.send(f"⚠️ 找不到 `{log_type}-{target_date}.txt`，這天可能沒有任何記錄，或路徑不對。\n目前 log 存放路徑：`{audit.LOG_DIR}`")
+            return
+
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        if not content.strip():
+            await ctx.send(f"`{log_type}-{target_date}.txt` 是空的。")
+            return
+
+        # 內容不長就直接貼在訊息裡；太長就整個檔案當附件傳，避免被截斷看不到頭尾
+        tail = "\n".join(content.splitlines()[-lines:])
+        if len(tail) <= 1800:
+            await ctx.send(f"**📄 {log_type}-{target_date}.txt（最後 {lines} 行）：**\n```{tail}```")
+        else:
+            import io
+            file = discord.File(io.BytesIO(content.encode("utf-8")), filename=f"{log_type}-{target_date}.txt")
+            await ctx.send(f"**📄 {log_type}-{target_date}.txt**（內容較長，整份用附件傳送）：", file=file)
+
+    @view_logs.error
+    async def view_logs_error(self, ctx, error):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("⚠️ 這個指令需要「管理伺服器」權限才能使用。")
 
     @commands.command(name="forumrules")
     async def show_forum_rules(self, ctx):
