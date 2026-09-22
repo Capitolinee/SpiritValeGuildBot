@@ -1,0 +1,11 @@
+# 含金鑰，絕對不要上傳
+.env
+env.txt
+
+# 稽核記錄（本機資料，不需要進版本控制）
+logs/
+
+# Python
+venv/
+__pycache__/
+*.pyc
