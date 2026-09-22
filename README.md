@@ -1,203 +1,44 @@
-# 靈谷公會出席與分潤管理機器人
+# 🏰 SpiritVale Guild Bot
 
-Discord 機器人，負責記錄出席、寶物掉落、分潤結算與領取，資料全部存在 Google Sheets（不是資料庫），方便公會幹部直接開表格看、手動微調。
+Guild loot tracking by hand is a pain — who showed up, what dropped, who gets paid, who's already claimed. A raid ends and it's all buried in chat, and good luck reconstructing it the next day.
 
----
+This bot exists to fix that. Send it a screenshot of the party and it reads out who was there. Loot drops, you log it with a command. It figures out who gets paid what, tracks who's claimed, and writes all of it into a Google Sheet — open it anytime, or just let the bot run the show.
 
-## 檔案結構
+## What it does
 
-```
-bot.py                  # 進入點：健康檢查伺服器、載入 cogs、設定狀態顯示、啟動機器人
-store.py                # Google Sheets 儲存層，所有 gspread 操作都在這裡
-helpers.py              # 時間格式（台灣時區）、Discord 顯示名稱解析
-audit.py                # 稽核記錄，寫進 logs/ 底下的每日 txt 檔案
-requirements.txt
-啟動機器人.bat            # Windows 本機執行用，雙擊即可啟動
-cogs/
-  jobs.py               # 職業樹、戰鬥位置清單管理
-  profiles.py           # 角色資料、可出席時間
-  sessions.py           # 開場、寶物記錄／結算／領取（整個系統最核心的部分）
-  access_control.py     # 討論串/論壇指令限制
-  translate.py          # 公告自動翻譯成繁體中文
-  help.py               # 中文版 !help
-```
+- 📸 Reads party rosters and loot drops from screenshots, or skip the screenshot and just type it in
+- 💰 `!loot` handles the whole "sell it and split, give it to someone free, or hold it for the guild" decision in one place
+- 🧾 `!claim` lets everyone grab their own cut instead of an officer wiring money around
+- 🧑 Members register their own character, class, and availability — no manual roster to maintain
+- 📊 Everything lives in a Google Sheet, so it's transparent and anyone can check it
+- 📝 Every action gets an audit log entry, so disputes have a paper trail
 
----
+Data lives in Google Sheets on purpose, not a database — officers don't need to learn SQL, and anyone can open the sheet and understand what happened, or tweak it by hand if needed.
 
-## 環境變數
-
-| 變數 | 說明 |
-|---|---|
-| `GEMINI_API_KEY` | 圖片辨識、公告翻譯用 |
-| `DISCORD_TOKEN` | 機器人登入用 |
-| `GOOGLE_SHEET_ID` | 試算表網址裡 `/d/` 跟 `/edit` 中間那段 |
-| `GOOGLE_SERVICE_ACCOUNT_B64` | 服務帳號 JSON 金鑰的 base64 |
-| `ACTIVITY_TYPE`（選填） | 狀態顯示類型：`playing`／`watching`／`listening`／`competing`，預設 `playing` |
-| `ACTIVITY_TEXT`（選填） | 狀態顯示文字，預設「!loot 管理公會分潤」 |
-
-不需要 `GITHUB_*` 系列（已經從 GitHub JSON 換成 Google Sheets 了）。
-
----
-
-## Google Sheets 結構
-
-試算表需要這幾個分頁，**分頁名稱要完全一致**（機器人是照名稱去找的）：
-
-### 角色資料
-| 欄 | 內容 |
-|---|---|
-| A | Discord ID（隱藏） |
-| B | Discord 顯示名稱 |
-| C | 角色名稱 |
-| D | 職業 |
-| E | 位置 |
-| F | 出席次數（公式，機器人新增列時自動補） |
-| G | 分潤總額（公式） |
-| H | 色碼(輔助)（公式，同帳號同色分組用） |
-
-角色層級的統計：每隻角色各自累積自己的出席與分潤，同一帳號底下的角色互不影響（例如一個人帶兩隻角色出團，兩隻角色各自算一次出席）。
-
-### 場次記錄
-| 欄 | 內容 |
-|---|---|
-| A | 場次ID（隱藏；捐獻的寶物這欄留空） |
-| B | 日期時間（台灣時間） |
-| C | 塔團（角色名稱） |
-| D | Discord ID（隱藏） |
-| E | DC名稱 |
-| F | 掉落 |
-| G | 寶物編號（隱藏） |
-| H | 類型：分潤／公會／自用／出席 |
-| I | 來源/貢獻者 |
-| J | 售出金額 |
-| K | 均分$$（每人分到的錢，帳號/角色的分潤總額是加總這欄，不是 J） |
-| L | 已領 |
-| M | 領取時間 |
-| N | 同場首筆(輔助)（帳號層級去重複，公式） |
-| O | 色碼(輔助)（公式） |
-| P | 操作者（誰觸發了這筆記錄） |
-| Q | 同場角色首筆(輔助)（角色層級去重複，公式） |
-
-**類型說明**：
-- `分潤`：每個出席者各一列，賣出後平分
-- `公會`：進公會基金，只有一列，不分人
-- `自用`：直接由某人領取，不進基金，只有一列，領取當下就記錄已領＋領取時間
-- `出席`：純出席記錄，沒有掉落任何寶物
-
-### 職業管理
-| 欄 | 內容 |
-|---|---|
-| A | 職業名稱 |
-| B | 轉職層級 |
-| C | 承接自 |
-| D | 圖片網址 |
-| E | 位置名稱（跟職業資料共用同一張表，但欄位獨立管理，`!profile` 選位置時從這裡動態讀取） |
-
-### 帳號基本資料
-| 欄 | 內容 |
-|---|---|
-| A | Discord ID（隱藏） |
-| B | Discord 顯示名稱 |
-| C | 平日可出席 |
-| D | 假日可出席 |
-| E | 其他時間備註 |
-| F | 出席次數（公式，帳號層級加總） |
-| G | 分潤總額（公式） |
-| H | 已領總額（公式） |
-| I | 待領總額（公式） |
-
-### 系統設定、翻譯設定
-機器人第一次要用到時會自動建立，分別存討論串/論壇的指令限制規則、公告自動翻譯的頻道清單，不用手動建。
-
----
-
-## 完整指令列表
-
-打 `!help` 隨時看最新版本，這裡列的是分類整理：
-
-### 開場與出席
-- 上傳隊員截圖 → 辨識後按 **✅ 確認正確**（開場，等寶物才寫入）／**📋 這場沒有掉落寶物**（開場並直接記出席）／**✏️ 修改後再存**
-- `!startsession 名字1,名字2` — 手動打字開場，不耗圖片辨識額度
-- `!noloot` — 已開場但事後才確定沒掉寶，補記出席
-- `!sessioninfo` — 查看目前場次
-- `!syncmembers` — 有人事後補登角色時，回頭補上舊記錄的帳號對應
-
-### 寶物處理
-- `!loot` — **推薦用這個**：選寶物 → 選擇賣出分潤／成員免費領取／歸公會
-- 上傳寶物截圖 → 辨識後記入目前場次（分潤類型；同一字串裡有多個名稱會自動拆開）
-- `!item 寶物名稱 [分潤|公會|自用]` — 手動記錄一樣
-- `!items 名稱1,名稱2` — 一次記錄多樣（都是分潤）
-- `!donate 寶物名稱 貢獻者` — 記錄捐獻給公會的寶物（不需要場次）
-- `!sell`（跳選單）／`!sell 編號 金額`／`!sell 場次ID 編號 金額` — 結算
-- `!giveto`（跳選單）／`!giveto 編號 角色名稱` — 登記成員免費領取（會嚴格比對角色名稱，比對不到會擋下來）
-
-### 分潤領取
-- `!claim` / `/claim` — 領取自己的分潤
-- `!pending` / `/pending` — 查看自己待領的金額
-- `!unclaimed` — 查看這場還有誰沒領
-- `!forceclaim @某人 [場次ID]` — 管理員代為標記已領（需要「管理伺服器」權限）
-- `!guildfund` — 查看公會基金總額
-
-### 角色資料
-- `!profile` — 登記角色（名字→職業→位置，位置清單沒設定的話會自動跳過這步）
-- `!profiles` / `!myprofiles` / `/myprofiles` — 查看角色
-- `!delprofile 編號`
-- `!setavailability weekday=yes weekend=no note=...` — 設定可出席時段
-- `!myavailability` / `/myavailability`
-
-### 職業與位置
-- `!jobs` / `!addjob 名稱 tier=1 [parent=上一轉] [image=網址]` / `!deljob 名稱`
-- `!positions` / `!addposition 名稱` / `!delposition 名稱`
-
-### 公告翻譯
-- `!addtranslate`（或 `!addtranslate #頻道`）— 開啟該頻道的自動翻譯，之後新訊息會直接在下方回覆繁中翻譯（需管理權限）
-- `!deltranslate` — 關閉
-- `!translates` — 查看目前哪些頻道有開啟
-
-### 頻道限制
-- `!setthreadrules` / `!clearthreadrules` / `!threadrules`
-- `!setforumrules` / `!clearforumrules` / `!forumrules`
-
----
-
-## 跟最早設計的主要差異
-
-1. **場次不持久化**：`bot.active_session` 只存在記憶體，重啟後要重新開場；已經寫進表格的資料不受影響。
-2. **公式自動延伸**：機器人新增角色/帳號/場次記錄時，會自動把該列需要的公式（用整欄參照）一起寫入，不受表格「手動拖曳過的範圍」限制；表格本身的格線列數不夠時，機器人也會自動幫表格加列。
-3. **同帳號多角色各自計出席**：不會因為同一人帶兩隻角色出團就被去重複，兩隻角色各自算一次（但完全同名的重複列會被去重）。
-4. **時間一律台灣時區**：所有寫入的日期時間都是 UTC+8，不是伺服器的 UTC。
-5. **稽核記錄**：所有寫入動作（開場、記錄寶物、結算、領取、改角色資料等）都會寫進 `logs/audit-日期.txt`，錯誤會寫進 `logs/error-日期.txt`（含完整堆疊），關掉機器人也不會消失。
-6. **拿掉的舊功能**：`!dedupemembers`、GitHub 版的 `!syncmembers`、全域寶物清單、`!clearmembers` 系列——這些概念在新架構下不適用或還沒實作。
-
----
-
-## 已知限制
-
-- Google Sheets API 有呼叫頻率限制，正常公會用量不會碰到；短時間大量操作可能被限流。
-- Gemini 圖片辨識／公告翻譯共用同一組免費額度，`gemini-3.6-flash` 免費層是**每天** 20 次，不是每分鐘。額度用完時，圖片辨識可以用 `!startsession` + `!items` 純打字流程完全避開；翻譯功能則會直接告知額度用完、附上原文連結。
-- 色碼分組（同帳號同色的視覺效果）沒有跟公式自動延伸機制整合，資料量超過表格原本手動拖曳的範圍時，新資料不會自動套色，但不影響任何金額或出席次數計算。
-- 公告翻譯只認得「頻道」，不會過濾該頻道裡是哪個機器人發的訊息，如果同一個頻道有多個機器人在發無關內容，也會一併被翻譯、一併耗用額度。
-
----
-
-## 部署方式
-
-支援三種：
-
-1. **Render**：GitHub repo 接上去，設定好環境變數，Start Command 是 `python bot.py`。免費層會在閒置一段時間後休眠。
-2. **Railway**：操作方式跟 Render 幾乎一樣（連 GitHub、設環境變數、自動部署），24 小時不會休眠，實測這支 bot 的用量遠低於 Hobby 方案內建的 $5 額度。建議在 Dashboard 設定 Usage Limits（用量硬上限）當保險絲。
-3. **本機執行**：雙擊 `啟動機器人.bat`，需要先建立 `.env` 檔案（或依你本機習慣的環境變數設定方式）與 Python 虛擬環境。電腦關機/睡眠機器人就會下線。
-
-**同一時間只能有一個地方在跑**，多處同時連線會用同一組 `DISCORD_TOKEN` 互相搶訊息。
-
-### 本機測試
+## Getting started
 
 ```bash
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # Mac/Linux
+git clone this-repo
+cd SpiritValeGuildBot
 pip install -r requirements.txt
 python bot.py
 ```
 
-本機測試跟正式環境共用同一份 Google 試算表，測試資料會寫進去，建議測完清理，或另外準備一份測試專用的試算表。
+You'll need to set a few environment variables before it'll actually connect (Discord token, a couple of API keys). See `store.py`'s header comment for the exact sheet layout it expects.
+
+Once it's running, you'll see "機器人已順利上線" in the console. Type `!help` in Discord to see everything it can do.
+
+## A few commands to get a feel for it
+
+```
+!startsession 熊爺,柒柒,Open匠   # start a session without a screenshot
+!loot                            # pick an item, decide what to do with it
+!claim                           # claim your own share
+!profile                         # register your character
+```
+
+There's a lot more — job trees, channel permissions, audit log lookup — all covered by `!help`.
+
+## License
+
+See [LICENSE](./LICENSE).
