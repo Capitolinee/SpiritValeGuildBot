@@ -5,6 +5,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
 from discord.ext import commands
 from google import genai
+from gspread.exceptions import APIError
 
 from store import SheetsStore
 import audit
@@ -86,8 +87,20 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.BadArgument):
         await ctx.send(f"⚠️ 參數格式錯誤：{error}", ephemeral=True)
         return
-    original = getattr(error, "original", error)
+    # 用 / 打的指令，錯誤會被包好幾層（HybridCommandError → CommandInvokeError → 真正的錯誤），
+    # 一路拆到最裡面，才能判斷真正的原因（你截圖裡顯示 "Command ... raised an exception" 就是沒拆乾淨）
+    original = error
+    while getattr(original, "original", None) is not None:
+        original = original.original
     audit.error(f"指令錯誤：{ctx.command}", original, who=ctx.author.display_name)
+
+    if isinstance(original, APIError) and (original.code in (408, 429) or original.code >= 500):
+        await ctx.send(
+            "⚠️ Google 試算表暫時無法連線（已經自動重試約 30 秒仍然失敗），"
+            "這是 Google 那邊的狀況，資料沒有遺失，請過幾分鐘再試一次。",
+            ephemeral=True,
+        )
+        return
     await ctx.send(f"❌ 執行 `{ctx.command}` 時發生錯誤：{original}", ephemeral=True)
 
 

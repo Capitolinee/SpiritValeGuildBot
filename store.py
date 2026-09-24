@@ -18,9 +18,11 @@ import os
 import base64
 import json
 import asyncio
+import time
 from datetime import datetime, timezone
 
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 from helpers import now_str
@@ -125,6 +127,34 @@ def _session_color_formula(row: int) -> str:
     )
 
 
+class _RetryHTTPClient(gspread.HTTPClient):
+    """
+    Google Sheets 偶爾會回 503（服務暫時無法使用）、500、429（呼叫太頻繁）、408（逾時）
+    這類「過一下就好」的暫時性錯誤。這裡遇到時自動等 2、4、8、16 秒逐次重試（最多約 30 秒），
+    Google 恢復就繼續執行，使用者不用手動重打指令；真的持續故障就放棄、把錯誤回報出來。
+
+    不用 gspread 內建的 BackOffHTTPClient，是因為它的次數上限判斷有 bug
+    （先把等待秒數壓在上限內、再檢查有沒有超過上限，永遠成立），
+    Google 長時間故障時會無限重試、一直握著寫入鎖，把其他所有人的指令也卡死。
+    """
+    _RETRY_WAITS = (2, 4, 8, 16)
+
+    @staticmethod
+    def _is_transient(err: APIError) -> bool:
+        code = err.code
+        return code in (408, 429) or code >= 500
+
+    def request(self, *args, **kwargs):
+        for wait in self._RETRY_WAITS:
+            try:
+                return super().request(*args, **kwargs)
+            except APIError as err:
+                if not self._is_transient(err):
+                    raise
+                time.sleep(wait)
+        return super().request(*args, **kwargs)  # 最後一次，再失敗就把錯誤丟出去
+
+
 class SheetsStore:
     """所有 Google Sheets 讀寫都透過這個類別，方法都是同步的（gspread 本身是同步函式庫），
     cogs 呼叫時要自己包 asyncio.to_thread。"""
@@ -133,7 +163,7 @@ class SheetsStore:
         b64 = os.environ["GOOGLE_SERVICE_ACCOUNT_B64"]
         creds_dict = json.loads(base64.b64decode(b64))
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-        self.client = gspread.authorize(creds)
+        self.client = gspread.authorize(creds, http_client=_RetryHTTPClient)
         self.sheet_id = os.environ["GOOGLE_SHEET_ID"]
         self.lock = asyncio.Lock()
         self._spreadsheet = None
