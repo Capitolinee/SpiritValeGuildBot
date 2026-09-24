@@ -68,20 +68,27 @@ EXTENSIONS = [
 
 @bot.event
 async def on_command_error(ctx, error):
+    # ephemeral=True：用 / 打的指令，錯誤訊息只有打的人看得到；用 ! 打的會照常公開顯示
     if isinstance(error, commands.CommandNotFound):
         return
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("⚠️ 這個指令需要「管理伺服器」權限才能使用。", ephemeral=True)
+        return
     if isinstance(error, commands.CheckFailure):
-        await ctx.send(f"⚠️ {error}")
+        await ctx.send(f"⚠️ {error}", ephemeral=True)
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"⚠️ 缺少必要參數：`{error.param.name}`，請確認指令用法。")
+        await ctx.send(f"⚠️ 缺少必要參數：`{error.param.name}`，請確認指令用法（打 /help 查看）。", ephemeral=True)
+        return
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.send("⚠️ 找不到這個成員，請用 @提及 的方式指定對象。", ephemeral=True)
         return
     if isinstance(error, commands.BadArgument):
-        await ctx.send(f"⚠️ 參數格式錯誤：{error}")
+        await ctx.send(f"⚠️ 參數格式錯誤：{error}", ephemeral=True)
         return
     original = getattr(error, "original", error)
     audit.error(f"指令錯誤：{ctx.command}", original, who=ctx.author.display_name)
-    await ctx.send(f"❌ 執行 `{ctx.command}` 時發生錯誤：{original}")
+    await ctx.send(f"❌ 執行 `{ctx.command}` 時發生錯誤：{original}", ephemeral=True)
 
 
 @bot.event
@@ -95,7 +102,7 @@ async def on_ready():
     #   listening → 正在聽 ⋯⋯
     #   competing → 正在參加 ⋯⋯
     activity_type = os.getenv("ACTIVITY_TYPE", "playing").lower()
-    activity_text = os.getenv("ACTIVITY_TEXT", "!loot 管理公會分潤")
+    activity_text = os.getenv("ACTIVITY_TEXT", "/loot 管理公會分潤")
     activity_map = {
         "playing": discord.ActivityType.playing,
         "watching": discord.ActivityType.watching,

@@ -1,5 +1,8 @@
 import asyncio
+from typing import Optional
+
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from cogs.jobs import get_tier1_jobs, get_children_jobs
@@ -24,7 +27,7 @@ class NameModal(discord.ui.Modal):
         jobs = await asyncio.to_thread(self.store.get_jobs)
         if not jobs:
             await interaction.followup.send(
-                "⚠️ 目前還沒有設定任何職業，請先請管理員用 `!addjob 職業名稱 tier=1` 新增職業。",
+                "⚠️ 目前還沒有設定任何職業，請先請管理員用 `/addjob` 新增職業。",
                 ephemeral=True,
             )
             return
@@ -174,7 +177,7 @@ class StartProfileView(discord.ui.View):
     @discord.ui.button(label="📝 設定角色資料", style=discord.ButtonStyle.primary)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("這個按鈕是給發起的人用的，你可以自己打 `!profile` 喔。", ephemeral=True)
+            await interaction.response.send_message("這個按鈕是給發起的人用的，你可以自己打 `/profile` 喔。", ephemeral=True)
             return
         await interaction.response.send_modal(NameModal(self.store))
 
@@ -187,18 +190,23 @@ class Profiles(commands.Cog):
         self.bot = bot
         self.store = bot.store
 
-    @commands.command(name="profile")
+    @commands.hybrid_command(name="profile", description="登記或更新自己的角色（名字＋職業＋位置）")
     async def set_profile(self, ctx):
-        """設定你自己的角色資料（名字＋職業）。"""
+        """設定你自己的角色資料（名字＋職業＋位置）。"""
+        # 用 / 打的話直接跳出輸入視窗，不用先按按鈕，頻道也不會留下任何訊息
+        if ctx.interaction is not None:
+            await ctx.interaction.response.send_modal(NameModal(self.store))
+            return
         view = StartProfileView(self.store, ctx.author.id)
         await ctx.send(f"{ctx.author.mention} 點下面的按鈕開始設定你的角色資料：", view=view)
 
-    @commands.command(name="profiles")
+    @commands.hybrid_command(name="profiles", description="查看所有人登記的角色")
     async def list_profiles(self, ctx):
         """列出目前所有人設定的角色資料。"""
+        await ctx.defer(ephemeral=True)
         chars = await asyncio.to_thread(self.store.get_characters)
         if not chars:
-            await ctx.send("目前還沒有人設定角色資料，用 `!profile` 開始設定。")
+            await ctx.send("目前還沒有人設定角色資料，用 /profile 開始設定。", ephemeral=True)
             return
 
         by_user = {}
@@ -212,56 +220,53 @@ class Profiles(commands.Cog):
             lines.append(f"<@{uid}>：{char_text}")
         text = "\n".join(lines)
         for i in range(0, len(text), 1800):
-            await ctx.send(f"**🧑‍🤝‍🧑 角色資料：**\n{text[i:i+1800]}")
+            await ctx.send(f"**🧑‍🤝‍🧑 角色資料：**\n{text[i:i+1800]}", ephemeral=True)
 
-    @commands.hybrid_command(name="myprofiles")
+    @commands.hybrid_command(name="myprofiles", description="查看自己名下的角色")
     async def my_profiles(self, ctx):
-        """列出自己名下的所有角色。用 /myprofiles 打的話只有你看得到。"""
+        """列出自己名下的所有角色（附編號，給 /delprofile 用）。"""
+        await ctx.defer(ephemeral=True)
         chars = await asyncio.to_thread(self.store.get_user_characters, str(ctx.author.id))
         if not chars:
-            await ctx.send("你還沒有設定任何角色，用 `!profile` 開始設定。", ephemeral=True)
+            await ctx.send("你還沒有設定任何角色，用 /profile 開始設定。", ephemeral=True)
             return
         lines = [f"[{i}] {c.get('角色名稱')}（{c.get('職業')}）" for i, c in enumerate(chars)]
         await ctx.send("**🧑 你目前的角色：**\n```" + "\n".join(lines) + "```", ephemeral=True)
 
-    @commands.command(name="delprofile")
+    @commands.hybrid_command(name="delprofile", description="刪除自己名下的某隻角色")
+    @app_commands.describe(index="角色編號（用 /myprofiles 查）")
     async def delete_profile(self, ctx, index: int):
-        """刪除自己名下指定編號的角色。用法：!delprofile 0（編號用 !myprofiles 查）"""
+        """刪除自己名下指定編號的角色。"""
+        await ctx.defer(ephemeral=True)
         async with self.store.lock:
             removed = await asyncio.to_thread(self.store.delete_character, str(ctx.author.id), index)
         if not removed:
-            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 !myprofiles 確認編號。")
+            await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 /myprofiles 確認編號。", ephemeral=True)
             return
         audit.audit(
             "刪除角色", who=ctx.author.display_name,
             detail=f"角色 {removed.get('角色名稱')}（{removed.get('職業')}）",
         )
-        await ctx.send(f"🗑️ 已刪除角色：{removed.get('角色名稱')}（{removed.get('職業')}）")
+        await ctx.send(f"🗑️ 已刪除角色：{removed.get('角色名稱')}（{removed.get('職業')}）", ephemeral=True)
 
-    @commands.command(name="setavailability")
-    async def set_availability(self, ctx, *, options: str = ""):
+    @commands.hybrid_command(name="setavailability", description="設定自己平常可出席的時段")
+    @app_commands.describe(
+        weekday="平日可以出席嗎",
+        weekend="假日可以出席嗎",
+        note="其他時間備註，例如 平日8:00~9:00",
+    )
+    async def set_availability(self, ctx, weekday: Optional[bool] = None,
+                               weekend: Optional[bool] = None, *, note: Optional[str] = None):
         """
-        設定你平常可出席的時段（平日/假日可以都設，也可以都不設，改用備註手動說明）。
-        用法：!setavailability weekday=yes weekend=no
-             !setavailability weekday=no weekend=no note=平日8:00~9:00
+        設定你平常可出席的時段（沒填的欄位維持原本設定不變）。
+        用法：/setavailability weekday:True weekend:False
+             !setavailability yes no 平日8:00~9:00
         """
-        opts = {}
-        for token in options.split():
-            if "=" in token:
-                k, v = token.split("=", 1)
-                opts[k.strip().lower()] = v.strip()
-
-        def to_bool(s):
-            return s.lower() in ("yes", "true", "y", "1", "是")
-
-        weekday = to_bool(opts["weekday"]) if "weekday" in opts else None
-        weekend = to_bool(opts["weekend"]) if "weekend" in opts else None
-        note = opts.get("note")
-
         if weekday is None and weekend is None and note is None:
-            await ctx.send("⚠️ 用法：`!setavailability weekday=yes weekend=no note=平日8:00~9:00`（三個參數都可省略，不填的欄位不會被改動）")
+            await ctx.send("⚠️ 至少要填一個欄位（平日、假日、或備註），沒填的欄位不會被改動。", ephemeral=True)
             return
 
+        await ctx.defer(ephemeral=True)
         async with self.store.lock:
             await asyncio.to_thread(
                 self.store.update_availability, str(ctx.author.id), ctx.author.display_name,
@@ -271,14 +276,15 @@ class Profiles(commands.Cog):
             "更新可出席時間", who=ctx.author.display_name,
             detail=f"平日={weekday}｜假日={weekend}｜備註={note}",
         )
-        await ctx.send("✅ 已更新你的可出席時間設定。")
+        await ctx.send("✅ 已更新你的可出席時間設定。", ephemeral=True)
 
-    @commands.hybrid_command(name="myavailability")
+    @commands.hybrid_command(name="myavailability", description="查看自己的可出席時間設定")
     async def my_availability(self, ctx):
-        """查看自己目前的可出席時間設定。用 /myavailability 打的話只有你看得到。"""
+        """查看自己目前的可出席時間設定。"""
+        await ctx.defer(ephemeral=True)
         stats = await asyncio.to_thread(self.store.get_account_stats, str(ctx.author.id))
         if not stats:
-            await ctx.send("你還沒有任何角色資料，先用 `!profile` 設定一隻角色。", ephemeral=True)
+            await ctx.send("你還沒有任何角色資料，先用 /profile 設定一隻角色。", ephemeral=True)
             return
         weekday = "✅" if str(stats.get("平日可出席", "")).strip().upper() == "TRUE" else "❌"
         weekend = "✅" if str(stats.get("假日可出席", "")).strip().upper() == "TRUE" else "❌"

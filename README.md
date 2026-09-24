@@ -7,8 +7,8 @@ This bot exists to fix that. Send it a screenshot of the party and it reads out 
 ## What it does
 
 - 📸 Reads party rosters and loot drops from screenshots, or skip the screenshot and just type it in
-- 💰 `!loot` handles the whole "sell it and split, give it to someone free, or hold it for the guild" decision in one place
-- 🧾 `!claim` lets everyone grab their own cut instead of an officer wiring money around
+- 💰 `/loot` handles the whole "sell it and split, give it to someone free, or hold it for the guild" decision in one place
+- 🧾 `/claim` lets everyone grab their own cut instead of an officer wiring money around
 - 🧑 Members register their own character, class, and availability — no manual roster to maintain
 - 📊 Everything lives in a Google Sheet, so it's transparent and anyone can check it
 - 📝 Every action gets an audit log entry, so disputes have a paper trail
@@ -26,18 +26,20 @@ python bot.py
 
 You'll need to set a few environment variables before it'll actually connect (Discord token, a couple of API keys). See `store.py`'s header comment for the exact sheet layout it expects.
 
-Once it's running, you'll see "機器人已順利上線" in the console. Type `!help` in Discord to see everything it can do.
+Once it's running, you'll see "機器人已順利上線" in the console. Type `/help` in Discord to see everything it can do.
 
 ## A few commands to get a feel for it
 
 ```
-!startsession A,B,C   # start a session without a screenshot
-!loot                            # pick an item, decide what to do with it
-!claim                           # claim your own share
-!profile                         # register your character
+/startsession names:熊爺,柒柒,Open匠   # start a session without a screenshot
+/loot                                 # pick an item, decide what to do with it
+/claim                                # claim your own share
+/profile                              # register your character
 ```
 
-There's a lot more — job trees, channel permissions, audit log lookup — all covered by `!help`.
+There's a lot more — job trees, channel permissions, audit log lookup — all covered by `/help`.
+
+Every command works as a slash command, and most replies are only visible to you, so channels stay clean. The old `!` prefix still works too.
 
 ## License
 

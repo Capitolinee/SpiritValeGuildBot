@@ -5,7 +5,10 @@ import mimetypes
 import re
 from datetime import datetime, timezone
 
+from typing import Literal, Optional
+
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from helpers import resolve_display_name, now_str
@@ -37,6 +40,23 @@ def parse_gemini_json(raw_text: str) -> dict:
             cleaned = cleaned[4:]
         cleaned = cleaned.strip()
     return json.loads(cleaned)
+
+
+async def finish_menu(interaction: discord.Interaction, text: str):
+    """
+    選單操作完成後的收尾：
+    - 選單是私密的（用 / 叫出來、只有操作者看得到）→ 把私密選單收掉，結果公告到頻道讓大家看到
+    - 選單本來就是公開的（用 ! 叫出來）→ 直接把選單訊息改成結果
+    """
+    msg = interaction.message
+    if msg is not None and msg.flags.ephemeral:
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            await interaction.edit_original_response(content="✅ 已完成，結果已公告在頻道。", view=None)
+        await interaction.channel.send(f"{text}\n-# 由 {interaction.user.display_name} 操作")
+    else:
+        await interaction.edit_original_response(content=text, view=None)
 
 
 def new_session_id() -> str:
@@ -78,7 +98,7 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
     members = session["members"] if (session and item_type == "分潤") else []
 
     if item_type == "分潤" and not session:
-        return None, "⚠️ 目前沒有進行中的場次，請先上傳隊員圖片，或改用 `!donate` 記錄捐獻的寶物。"
+        return None, "⚠️ 目前沒有進行中的場次，請先上傳隊員圖片，或改用 `/donate` 記錄捐獻的寶物。"
 
     now = now_str()
     recorded = []
@@ -193,7 +213,7 @@ class ConfirmView(discord.ui.View):
             )
             return (
                 f"**✅ 已建立場次 `{self.bot.active_session['id']}`，出席：**\n```{names}```\n"
-                f"接下來可以用 `!item 寶物名稱` 或上傳寶物圖片記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤。"
+                f"接下來可以用 `/item` 或上傳寶物圖片記錄掉落，之後用 `/loot` 處理寶物。"
             )
         else:
             reply, err = await record_items(
@@ -246,7 +266,7 @@ class SellAmountModal(discord.ui.Modal):
         try:
             amount = int(raw)
         except ValueError:
-            await interaction.response.send_message("⚠️ 金額必須是數字，請重新打一次 `!sell`。", ephemeral=True)
+            await interaction.response.send_message("⚠️ 金額必須是數字，請重新打一次 `/sell`。", ephemeral=True)
             return
 
         await interaction.response.defer()
@@ -271,10 +291,10 @@ class SellAmountModal(discord.ui.Modal):
         text = f"💰 「{result['item_name']}」已賣出 **{amount}**"
         if result["item_type"] == "分潤":
             text += (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。"
-                     f"隊員可以用 `!claim` 領取。")
+                     f"隊員可以用 `/claim` 領取。")
         else:
             text += "，已計入公會基金。"
-        await interaction.edit_original_response(content=text, view=None)
+        await finish_menu(interaction, text)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         print(f"⚠️ 結算時發生錯誤：{error!r}", flush=True)
@@ -303,7 +323,7 @@ class SellSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("這是別人發起的結算，你可以自己打 `!sell` 喔。", ephemeral=True)
+            await interaction.response.send_message("這是別人發起的結算，你可以自己打 `/sell` 喔。", ephemeral=True)
             return
         item = self.items[self.values[0]]
         await interaction.response.send_modal(SellAmountModal(self.store, item))
@@ -340,7 +360,7 @@ class GiveToReceiverModal(discord.ui.Modal):
         if not matched_name:
             await interaction.followup.send(
                 f"⚠️ 找不到角色「{receiver}」，請確認角色名稱有沒有打錯，"
-                f"或這個人是不是還沒用 `!profile` 登記過。確認後重新打一次 `!giveto`。",
+                f"或這個人是不是還沒用 `/profile` 登記過。確認後重新打一次 `/giveto`。",
                 ephemeral=True,
             )
             return
@@ -362,9 +382,9 @@ class GiveToReceiverModal(discord.ui.Modal):
             "登記免費領取", who=interaction.user.display_name,
             detail=f"{result['item_name']}｜領取者 {result['receiver']}（{display}）",
         )
-        await interaction.edit_original_response(
-            content=f"🎁 「{result['item_name']}」已登記為成員免費領取（類型：自用，不分潤，已記錄領取時間）。",
-            view=None,
+        await finish_menu(
+            interaction,
+            f"🎁 「{result['item_name']}」已登記為成員免費領取（類型：自用，不分潤，已記錄領取時間）。",
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
@@ -394,7 +414,7 @@ class GiveToSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("這是別人發起的操作，你可以自己打 `!giveto` 喔。", ephemeral=True)
+            await interaction.response.send_message("這是別人發起的操作，你可以自己打 `/giveto` 喔。", ephemeral=True)
             return
         item = self.items[self.values[0]]
         await interaction.response.send_modal(GiveToReceiverModal(self.store, item))
@@ -421,7 +441,7 @@ class LootActionView(discord.ui.View):
     async def _check_owner(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "這是別人發起的操作，你可以自己打 `!loot` 喔。", ephemeral=True
+                "這是別人發起的操作，你可以自己打 `/loot` 喔。", ephemeral=True
             )
             return False
         return True
@@ -459,10 +479,10 @@ class LootActionView(discord.ui.View):
             "改為公會收藏", who=interaction.user.display_name,
             detail=f"{result['item_name']}",
         )
-        await interaction.edit_original_response(
-            content=(f"🏦 「{result['item_name']}」已改成公會收藏（類型：公會）。"
-                     f"之後要賣掉換錢進基金，再用 `!loot` 選它結算就好。"),
-            view=None,
+        await finish_menu(
+            interaction,
+            (f"🏦 「{result['item_name']}」已改成公會收藏（類型：公會）。"
+             f"之後要賣掉換錢進基金，再用 `/loot` 選它結算就好。"),
         )
         self.stop()
 
@@ -493,7 +513,7 @@ class LootSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("這是別人發起的操作，你可以自己打 `!loot` 喔。", ephemeral=True)
+            await interaction.response.send_message("這是別人發起的操作，你可以自己打 `/loot` 喔。", ephemeral=True)
             return
         item = self.items[self.values[0]]
         when = item["when"][:16] if item["when"] else "（無日期）"
@@ -528,7 +548,7 @@ class ClaimSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("這是別人發起的領取，你可以自己打 `!claim` 喔。", ephemeral=True)
+            await interaction.response.send_message("這是別人發起的領取，你可以自己打 `/claim` 喔。", ephemeral=True)
             return
         chosen = self.values[0]
         uid = str(interaction.user.id)
@@ -646,62 +666,54 @@ class Sessions(commands.Cog):
                 else:
                     await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
 
-    @commands.command(name="startsession")
-    async def start_session(self, ctx, *, names_text: str):
-        """
-        手動輸入隊員名單開場（不用上傳圖片、不耗圖片辨識額度）。
-        名字用逗號、空白或換行分隔都可以。
-        用法：!startsession 熊爺,柒柒,Open匠
-             !startsession 熊爺 柒柒 Open匠
-        開場後就跟上傳圖片辨識一樣，可以接著用 !item 記錄寶物、!sell 結算、!claim 領取。
-        """
+    @commands.hybrid_command(name="startsession", description="手動輸入隊員名單開場（不用截圖）")
+    @app_commands.describe(names="隊員角色名稱，用逗號或空白分隔，例如 熊爺,柒柒,Open匠")
+    async def start_session(self, ctx, *, names: str):
+        """手動輸入隊員名單開場（不用上傳圖片、不耗圖片辨識額度）。"""
         raw_names = [
             n.strip()
-            for n in names_text.replace("\n", ",").replace("、", ",").replace(" ", ",").split(",")
+            for n in names.replace("\n", ",").replace("、", ",").replace(" ", ",").split(",")
             if n.strip()
         ]
         if not raw_names:
-            await ctx.send("⚠️ 至少要輸入一個隊員名字。用法：`!startsession 熊爺,柒柒,Open匠`")
+            await ctx.send("⚠️ 至少要輸入一個隊員名字，例如 `熊爺,柒柒,Open匠`。", ephemeral=True)
             return
 
+        await ctx.defer()
         members = await build_session_members(self.store, ctx.guild, raw_names)
         self.bot.active_session = {
             "id": new_session_id(), "members": members, "next_item_index": 0,
         }
-        names = "、".join(m["display_name"] for m in members)
+        names_text = "、".join(m["display_name"] for m in members)
         unmatched = [m["name"] for m in members if not m["discord_id"]]
 
         audit.audit(
             "開場（手動輸入）", who=ctx.author.display_name,
-            detail=f"場次 {self.bot.active_session['id']}｜出席 {len(members)} 人：{names}",
+            detail=f"場次 {self.bot.active_session['id']}｜出席 {len(members)} 人：{names_text}",
         )
         reply = (
-            f"**✅ 已建立場次 `{self.bot.active_session['id']}`，出席 {len(members)} 人：**\n```{names}```\n"
-            f"接下來可以用 `!item 寶物名稱` 記錄掉落，賣掉後用 `!sell 編號 金額` 結算分潤；"
-            f"這場沒有掉落的話用 `!noloot` 記錄出席。"
+            f"**✅ 已建立場次 `{self.bot.active_session['id']}`，出席 {len(members)} 人：**\n```{names_text}```\n"
+            f"接下來用 `/item` 記錄掉落、`/loot` 處理寶物；這場沒有掉落的話用 `/noloot` 記錄出席。"
         )
         if unmatched:
             reply += (
                 f"\n\n⚠️ 這些名字還沒對應到 Discord 帳號：{'、'.join(unmatched)}\n"
-                f"他們要先用 `!profile` 登記角色，之後再打一次 `!syncmembers` 就會自動補上。"
+                f"他們要先用 `/profile` 登記角色，之後再用 `/syncmembers` 就會自動補上。"
             )
         await ctx.send(reply)
 
-    @commands.command(name="noloot")
+    @commands.hybrid_command(name="noloot", description="這場沒有掉落寶物，直接記錄出席")
     async def no_loot(self, ctx):
-        """
-        如果目前進行中的場次確定沒有掉落寶物，用這個指令補記錄出席
-        （適合用在已經用一般流程確認過名單、事後才確定沒有掉寶的情況；
-        如果一開始就知道沒有掉寶，直接按隊員確認畫面上的「📋 這場沒有掉落寶物」按鈕更快）。
-        """
+        """已經開場、事後才確定這場沒有掉寶時，補記錄出席。"""
         session = self.bot.active_session
         if not session:
-            await ctx.send("目前沒有進行中的場次。")
+            await ctx.send("目前沒有進行中的場次。", ephemeral=True)
             return
-        now = now_str()
+        await ctx.defer()
         async with self.store.lock:
             await asyncio.to_thread(
-                self.store.record_attendance, session["id"], now, session["members"], ctx.author.display_name
+                self.store.record_attendance, session["id"], now_str(), session["members"],
+                ctx.author.display_name,
             )
         audit.audit(
             "補記出席（無掉落）", who=ctx.author.display_name,
@@ -709,109 +721,83 @@ class Sessions(commands.Cog):
         )
         await ctx.send(f"✅ 已補記錄場次 `{session['id']}` 的出席（沒有掉落寶物）。")
 
-    @commands.command(name="item")
-    async def add_item(self, ctx, *, text: str):
-        """
-        記錄寶物掉落，預設是「分潤」類型（需要有進行中的場次）。
-        用法：!item 寶物名稱
-             !item 寶物名稱 公會    → 明確指定類型（分潤/公會/自用）
-        """
-        parts = text.rsplit(maxsplit=1)
-        item_type = "分潤"
-        item_name = text
-        if len(parts) == 2 and parts[1] in ("分潤", "公會", "自用"):
-            item_name, item_type = parts
-
+    @commands.hybrid_command(name="item", description="記錄一樣寶物掉落")
+    @app_commands.describe(name="寶物名稱", item_type="類型（預設分潤）")
+    async def add_item(self, ctx, name: str, item_type: Literal["分潤", "公會", "自用"] = "分潤"):
+        """記錄一樣寶物掉落，預設是「分潤」類型（需要有進行中的場次）。"""
+        await ctx.defer()
         reply, err = await record_items(
-            self.bot, [item_name], item_type=item_type, operator=ctx.author.display_name
+            self.bot, [name], item_type=item_type, operator=ctx.author.display_name
         )
         await ctx.send(err or reply)
 
-    @commands.command(name="items")
-    async def add_items(self, ctx, *, names_text: str):
-        """
-        一次記錄多樣寶物（都算「分潤」類型），名字用逗號、換行分隔。
-        用法：!items 屠龍刀,精靈弓,神槍王
-        每一樣都會各自拿到自己的編號，之後分別用 !sell 編號 金額 結算。
-        """
+    @commands.hybrid_command(name="items", description="一次記錄多樣寶物（都算分潤）")
+    @app_commands.describe(names="寶物名稱，用逗號分隔，例如 屠龍刀,精靈弓")
+    async def add_items(self, ctx, *, names: str):
+        """一次記錄多樣寶物（都算「分潤」類型），每一樣都會各自拿到自己的編號。"""
         item_names = [
             n.strip()
-            for n in names_text.replace("\n", ",").replace("、", ",").split(",")
+            for n in names.replace("\n", ",").replace("、", ",").split(",")
             if n.strip()
         ]
         if not item_names:
-            await ctx.send("⚠️ 至少要輸入一樣寶物名稱。用法：`!items 屠龍刀,精靈弓`")
+            await ctx.send("⚠️ 至少要輸入一樣寶物名稱，例如 `屠龍刀,精靈弓`。", ephemeral=True)
             return
-
+        await ctx.defer()
         reply, err = await record_items(
             self.bot, item_names, item_type="分潤", operator=ctx.author.display_name
         )
         await ctx.send(err or reply)
 
-    @commands.command(name="donate")
-    async def donate_item(self, ctx, item_name: str, *, contributor: str = None):
-        """
-        記錄捐獻的寶物（不屬於任何場次，不能分潤，只能是公會或自用）。
-        用法：!donate 屠龍刀 牡羊
-        """
+    @commands.hybrid_command(name="donate", description="記錄捐獻給公會的寶物")
+    @app_commands.describe(item_name="寶物名稱", contributor="貢獻者（選填）")
+    async def donate_item(self, ctx, item_name: str, *, contributor: Optional[str] = None):
+        """記錄捐獻的寶物（不屬於任何場次，歸公會）。"""
+        await ctx.defer()
         reply, err = await record_items(
             self.bot, [item_name], item_type="公會", contributor=contributor, force_no_session=True,
             operator=ctx.author.display_name,
         )
         await ctx.send(err or reply)
 
-    @commands.command(name="loot")
-    async def loot(self, ctx):
-        """
-        以寶物為出發點的整合指令：先選一樣還沒結算的寶物，再決定要對它做什麼
-        （賣出分潤／免費給成員／歸公會）。等同於 !sell、!giveto 的合併版本。
-        用法：!loot
-        """
+    async def _send_item_picker(self, ctx, view_cls, prompt: str):
+        """列出還沒結算的寶物讓操作者選（用 / 叫出來時選單只有操作者看得到）。"""
+        await ctx.defer(ephemeral=True)
         items = await asyncio.to_thread(self.store.list_unsold_items)
         if not items:
-            await ctx.send("目前沒有任何還沒結算的寶物。")
+            await ctx.send("目前沒有任何還沒結算的寶物。", ephemeral=True)
             return
-        view = LootSelectView(self.store, ctx.author.id, items)
+        view = view_cls(self.store, ctx.author.id, items)
         more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
-        await ctx.send(f"請選擇要處理的寶物：{more}", view=view)
+        await ctx.send(f"{prompt}{more}", view=view, ephemeral=True)
 
-    @commands.command(name="sell")
-    async def sell_item(self, ctx, *args):
-        """
-        結算寶物售出金額。
-        用法：!sell                        → 跳出選單（日期＋寶物名稱），選完再輸入金額
-             !sell 編號 金額            → 直接對目前進行中的場次結算
-             !sell 場次ID 編號 金額     → 直接對指定場次結算
-        """
-        if not args:
-            items = await asyncio.to_thread(self.store.list_unsold_items)
-            if not items:
-                await ctx.send("目前沒有任何還沒結算的寶物。")
-                return
-            view = SellSelectView(self.store, ctx.author.id, items)
-            more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
-            await ctx.send(f"請選擇要結算的寶物：{more}", view=view)
+    @commands.hybrid_command(name="loot", description="選一樣寶物：賣出分潤／免費領取／歸公會")
+    async def loot(self, ctx):
+        """以寶物為出發點的整合指令：先選寶物，再決定要賣出、免費給成員、還是歸公會。"""
+        await self._send_item_picker(ctx, LootSelectView, "請選擇要處理的寶物：")
+
+    @commands.hybrid_command(name="sell", description="結算寶物售出金額（不填參數就跳選單）")
+    @app_commands.describe(
+        index="寶物編號（不填就跳選單）",
+        amount="售出金額",
+        session_id="場次ID（不填就是目前進行中的場次）",
+    )
+    async def sell_item(self, ctx, index: Optional[int] = None, amount: Optional[int] = None,
+                        session_id: Optional[str] = None):
+        """結算寶物售出金額。不填參數會跳出選單。"""
+        if index is None and amount is None:
+            await self._send_item_picker(ctx, SellSelectView, "請選擇要結算的寶物：")
             return
-
-        if len(args) == 2:
+        if index is None or amount is None:
+            await ctx.send("⚠️ 編號跟金額要一起填，或兩個都不填改用選單。", ephemeral=True)
+            return
+        if session_id is None:
             if not self.bot.active_session:
-                await ctx.send("⚠️ 目前沒有進行中的場次，請直接打 `!sell` 用選單，或用 `!sell 場次ID 編號 金額`。")
+                await ctx.send("⚠️ 目前沒有進行中的場次，請指定場次ID，或直接用 `/sell` 跳選單。", ephemeral=True)
                 return
             session_id = self.bot.active_session["id"]
-            index_raw, amount_raw = args
-        elif len(args) == 3:
-            session_id, index_raw, amount_raw = args
-        else:
-            await ctx.send("⚠️ 用法：`!sell`（選單）、`!sell 編號 金額` 或 `!sell 場次ID 編號 金額`")
-            return
 
-        try:
-            index = int(index_raw)
-            amount = int(amount_raw)
-        except ValueError:
-            await ctx.send("⚠️ 編號跟金額都必須是數字。")
-            return
-
+        await ctx.defer()
         async with self.store.lock:
             result = await asyncio.to_thread(self.store.sell_item, session_id, index, amount)
 
@@ -825,58 +811,42 @@ class Sessions(commands.Cog):
         audit.audit(
             "結算寶物", who=ctx.author.display_name,
             detail=(f"{result['item_name']}｜類型 {result['item_type']}｜售出 {amount}"
-                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.0f}"
+                    + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.2f}"
                        if result["item_type"] == "分潤" else "｜進公會基金")),
         )
         await ctx.send(
             f"💰 「{result['item_name']}」已賣出 **{amount}**"
-            + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。隊員可以用 `!claim` 領取。"
+            + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。隊員可以用 `/claim` 領取。"
                if result["item_type"] == "分潤" else "，已計入公會基金。")
         )
 
-    @commands.command(name="giveto")
-    async def give_to(self, ctx, *args):
-        """
-        原本要分潤的寶物，改成免費給某個成員（類型改「自用」、金額 0，不用分錢）。
-        用法：!giveto                           → 跳出選單（日期＋寶物名稱），選完再輸入給誰
-             !giveto 編號 成員名稱             → 直接對目前進行中的場次
-             !giveto 場次ID 編號 成員名稱     → 直接對指定場次
-        """
-        if not args:
-            items = await asyncio.to_thread(self.store.list_unsold_items)
-            if not items:
-                await ctx.send("目前沒有任何還沒結算的寶物。")
-                return
-            view = GiveToSelectView(self.store, ctx.author.id, items)
-            more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
-            await ctx.send(f"請選擇要登記免費領取的寶物：{more}", view=view)
+    @commands.hybrid_command(name="giveto", description="登記寶物由成員免費領取（不填參數就跳選單）")
+    @app_commands.describe(
+        index="寶物編號（不填就跳選單）",
+        receiver="領取者的角色名稱",
+        session_id="場次ID（不填就是目前進行中的場次）",
+    )
+    async def give_to(self, ctx, index: Optional[int] = None, receiver: Optional[str] = None,
+                      session_id: Optional[str] = None):
+        """原本要分潤的寶物，改成由某個成員免費領取（類型改「自用」、金額 0）。"""
+        if index is None and receiver is None:
+            await self._send_item_picker(ctx, GiveToSelectView, "請選擇要登記免費領取的寶物：")
             return
-
-        if len(args) == 2:
+        if index is None or receiver is None:
+            await ctx.send("⚠️ 編號跟角色名稱要一起填，或兩個都不填改用選單。", ephemeral=True)
+            return
+        if session_id is None:
             if not self.bot.active_session:
-                await ctx.send("⚠️ 目前沒有進行中的場次，請直接打 `!giveto` 用選單，或用 `!giveto 場次ID 編號 成員名稱`。")
+                await ctx.send("⚠️ 目前沒有進行中的場次，請指定場次ID，或直接用 `/giveto` 跳選單。", ephemeral=True)
                 return
             session_id = self.bot.active_session["id"]
-            index_raw, receiver = args
-        elif len(args) == 3:
-            session_id, index_raw, receiver = args
-        else:
-            await ctx.send("⚠️ 用法：`!giveto`（選單）、`!giveto 編號 成員名稱` 或 `!giveto 場次ID 編號 成員名稱`")
-            return
 
-        try:
-            index = int(index_raw)
-        except ValueError:
-            await ctx.send("⚠️ 編號必須是數字。")
-            return
-
-        uid, matched_name = await asyncio.to_thread(
-            self.store.find_user_by_character_name, receiver
-        )
+        await ctx.defer()
+        uid, matched_name = await asyncio.to_thread(self.store.find_user_by_character_name, receiver)
         if not matched_name:
             await ctx.send(
                 f"⚠️ 找不到角色「{receiver}」，請確認角色名稱有沒有打錯，"
-                f"或這個人是不是還沒用 `!profile` 登記過。"
+                f"或這個人是不是還沒用 `/profile` 登記過。"
             )
             return
         display = await resolve_display_name(uid, matched_name, ctx.guild)
@@ -888,7 +858,7 @@ class Sessions(commands.Cog):
 
         if not result["ok"]:
             if result["reason"] == "not_found":
-                await ctx.send(f"⚠️ 找不到編號 {index}，請用 `!sessioninfo` 確認編號。")
+                await ctx.send(f"⚠️ 找不到編號 {index}，請用 `/sessioninfo` 確認編號。")
             else:
                 await ctx.send(f"⚠️ 編號 {index} 已經結算過了，不能再登記免費領取。")
             return
@@ -901,19 +871,21 @@ class Sessions(commands.Cog):
             f"🎁 「{result['item_name']}」已登記為成員免費領取（類型：自用，不分潤，已記錄領取時間）。"
         )
 
-    @commands.command(name="sessioninfo")
+    @commands.hybrid_command(name="sessioninfo", description="查看目前場次的出席名單與寶物狀態")
     async def session_info(self, ctx):
         """查看目前進行中場次的出席名單與寶物狀態。"""
         session = self.bot.active_session
         if not session:
-            await ctx.send("目前沒有進行中的場次。")
+            await ctx.send("目前沒有進行中的場次。", ephemeral=True)
             return
+        await ctx.defer(ephemeral=True)
         rows = await asyncio.to_thread(self.store.get_session_rows, session["id"])
 
         by_index = {}
         for r in rows:
-            idx = r.get("寶物編號", "")
-            by_index.setdefault(idx, []).append(r)
+            if r.get("類型") == "出席":
+                continue
+            by_index.setdefault(r.get("寶物編號", ""), []).append(r)
 
         names = "、".join(m["display_name"] for m in session["members"])
         lines = [f"場次 ID：{session['id']}", f"出席：{names}", "寶物："]
@@ -924,25 +896,27 @@ class Sessions(commands.Cog):
             if first.get("售出金額", "").strip():
                 status = f"已賣 {first['售出金額']}"
                 if first.get("均分$$", "").strip():
-                    status += f"（每人 {first['均分$$']}）"
+                    status += f"（每人 {float(first['均分$$']):.0f}）"
             else:
                 status = "未賣出"
             lines.append(f"  [{idx}] {first.get('掉落')}（{first.get('類型')}）：{status}")
 
-        await ctx.send("```" + "\n".join(lines) + "```")
+        await ctx.send("```" + "\n".join(lines) + "```", ephemeral=True)
 
-    @commands.command(name="unclaimed")
-    async def show_unclaimed(self, ctx, session_id: str = None):
-        """查看場次裡還有誰沒領錢。不填場次ID時查目前進行中的場次。"""
+    @commands.hybrid_command(name="unclaimed", description="查看場次裡還有誰沒領錢")
+    @app_commands.describe(session_id="場次ID（不填就是目前進行中的場次）")
+    async def show_unclaimed(self, ctx, session_id: Optional[str] = None):
+        """查看場次裡還有誰沒領錢。"""
         if not session_id:
             if not self.bot.active_session:
-                await ctx.send("目前沒有進行中的場次，請指定場次ID：`!unclaimed 場次ID`。")
+                await ctx.send("目前沒有進行中的場次，請指定場次ID。", ephemeral=True)
                 return
             session_id = self.bot.active_session["id"]
 
+        await ctx.defer(ephemeral=True)
         pending = await asyncio.to_thread(self.store.unclaimed_for_session, session_id)
         if not pending:
-            await ctx.send("✅ 這個場次目前沒有人有待領款項。")
+            await ctx.send("✅ 這個場次目前沒有人有待領款項。", ephemeral=True)
             return
 
         lines = []
@@ -952,15 +926,13 @@ class Sessions(commands.Cog):
             else:
                 display = await resolve_display_name(key, key, ctx.guild)
             lines.append(f"- {display}：{amount:.0f}")
-        await ctx.send("**💸 尚未領款：**\n```" + "\n".join(lines) + "```")
+        await ctx.send("**💸 尚未領款：**\n```" + "\n".join(lines) + "```", ephemeral=True)
 
-    @commands.hybrid_command(name="claim")
-    async def claim(self, ctx, session_id: str = None):
-        """
-        領取自己尚未領取的分潤。用 /claim 打的話只有你看得到。
-        用法：!claim            → 只有一筆待領時直接領取；多筆時跳選單（一樣一樣選）
-             !claim 場次ID     → 直接領取指定場次的全部
-        """
+    @commands.hybrid_command(name="claim", description="領取自己的分潤")
+    @app_commands.describe(session_id="只領指定場次的全部（不填就一樣一樣選）")
+    async def claim(self, ctx, session_id: Optional[str] = None):
+        """領取自己尚未領取的分潤。只有一筆直接領，多筆會跳選單一樣一樣選。"""
+        await ctx.defer(ephemeral=True)
         uid = str(ctx.author.id)
 
         if session_id:
@@ -984,9 +956,8 @@ class Sessions(commands.Cog):
             return
 
         if len(items) == 1:
-            item = items[0]
             async with self.store.lock:
-                result = await asyncio.to_thread(self.store.claim_item_row, uid, item["row"])
+                result = await asyncio.to_thread(self.store.claim_item_row, uid, items[0]["row"])
             if not result["ok"]:
                 await ctx.send("這筆待領已經被處理掉了（可能剛被領過）。", ephemeral=True)
                 return
@@ -1003,33 +974,30 @@ class Sessions(commands.Cog):
         view = ClaimSelectView(self.store, ctx.author.id, items)
         await ctx.send(f"你有 {len(items)} 筆待領，請選擇要領取哪一樣：\n```{lines}```", view=view, ephemeral=True)
 
-    @commands.hybrid_command(name="pending")
+    @commands.hybrid_command(name="pending", description="查看自己待領的分潤")
     async def pending(self, ctx):
-        """查看自己目前尚未領取的分潤總額與明細。用 /pending 打的話只有你看得到。"""
+        """查看自己目前尚未領取的分潤總額與明細。"""
+        await ctx.defer(ephemeral=True)
         result = await asyncio.to_thread(self.store.pending_for_user, str(ctx.author.id))
         if not result["details"]:
             await ctx.send("目前沒有待領取的分潤。", ephemeral=True)
             return
-        text = "\n".join(f"{sid}：{name}（{amt:.0f}）" for sid, name, amt in result["details"])
+        text = "\n".join(f"{sid or '捐獻寶物'}：{name}（{amt:.0f}）" for sid, name, amt in result["details"])
         await ctx.send(f"**💰 待領取分潤，共 {result['total']:.0f}：**\n```{text}```", ephemeral=True)
 
-    @commands.command(name="forceclaim")
+    @commands.hybrid_command(name="forceclaim", description="管理員：代為標記某人的分潤已領")
     @commands.has_permissions(manage_guild=True)
-    async def force_claim(self, ctx, member: discord.Member, session_id: str = None):
-        """
-        管理員專用：把某人尚未領取的分潤標記為已領（用在對方已經私下領過錢，
-        但沒有自己打 !claim 的情況，避免系統一直停在「未領」）。
-        用法：!forceclaim @某人            → 標記他所有場次的待領
-             !forceclaim @某人 場次ID     → 只標記指定場次
-        需要「管理伺服器」權限才能使用。
-        """
-        uid = str(member.id)
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(member="要標記的成員", session_id="只標記指定場次（選填）")
+    async def force_claim(self, ctx, member: discord.Member, session_id: Optional[str] = None):
+        """管理員專用：對方已經私下領過錢、但沒有自己領取時，代為標記已領。"""
+        await ctx.defer(ephemeral=True)
         async with self.store.lock:
-            result = await asyncio.to_thread(self.store.claim_for_user, uid, session_id)
+            result = await asyncio.to_thread(self.store.claim_for_user, str(member.id), session_id)
 
         if not result["details"]:
             scope = f"場次 `{session_id}` " if session_id else ""
-            await ctx.send(f"{member.display_name} 目前 {scope}沒有待領取的分潤。")
+            await ctx.send(f"{member.display_name} 目前 {scope}沒有待領取的分潤。", ephemeral=True)
             return
 
         detail_text = "\n".join(f"{sid}：{name} +{amt:.0f}" for sid, name, amt in result["details"])
@@ -1039,37 +1007,27 @@ class Sessions(commands.Cog):
                 f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
         )
         await ctx.send(
-            f"✅ 已由 {ctx.author.display_name} 代為標記 {member.display_name} 的分潤為已領，"
-            f"共 **{result['total']:.0f}**：\n```{detail_text}```"
+            f"✅ 已代為標記 {member.display_name} 的分潤為已領，"
+            f"共 **{result['total']:.0f}**：\n```{detail_text}```",
+            ephemeral=True,
         )
 
-    @force_claim.error
-    async def force_claim_error(self, ctx, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.send("⚠️ 這個指令需要「管理伺服器」權限才能使用。")
-        elif isinstance(error, commands.MemberNotFound):
-            await ctx.send("⚠️ 找不到這個成員，請用 @提及 的方式指定對象。")
-
-    @commands.command(name="syncmembers")
+    @commands.hybrid_command(name="syncmembers", description="有人補登角色後，回頭補上舊記錄的帳號對應")
     async def sync_members(self, ctx):
-        """
-        把「場次記錄」裡沒有 Discord ID 的舊記錄，重新比對現在登記的角色資料，
-        找得到就補上（適合在有人事後才補登 !profile 的情況下使用）。
-        """
+        """把「場次記錄」裡沒有 Discord ID 的舊記錄，重新比對角色資料補上。"""
+        await ctx.defer(ephemeral=True)
         async with self.store.lock:
             backfilled = await asyncio.to_thread(self.store.backfill_discord_ids)
 
         if not backfilled:
-            await ctx.send("沒有發現需要補上 Discord ID 的記錄。")
+            await ctx.send("沒有發現需要補上 Discord ID 的記錄。", ephemeral=True)
             return
 
-        # 順便把 DC名稱（E欄）也補上實際的 Discord 顯示名稱，這部分需要問 Discord API，
-        # 所以在這裡（有 guild 物件可用）做，store.py 那邊只負責補 Discord ID。
         name_updates = []
         for row, uid, char_name in backfilled:
             display = await resolve_display_name(uid, char_name, ctx.guild)
             name_updates.append((row, 5, [display]))
-        if name_updates:
+        async with self.store.lock:
             await asyncio.to_thread(self.store.batch_update_cells, SHEET_SESSIONS, name_updates)
 
         lines = "\n".join(f"[{row}] {name}" for row, _, name in backfilled)
@@ -1077,13 +1035,14 @@ class Sessions(commands.Cog):
             "回溯補上帳號對應", who=ctx.author.display_name,
             detail=f"{len(backfilled)} 筆｜" + "；".join(f"第{row}列 {name}" for row, _, name in backfilled),
         )
-        await ctx.send(f"✅ 已補上 {len(backfilled)} 筆記錄的 Discord ID：\n```{lines}```")
+        await ctx.send(f"✅ 已補上 {len(backfilled)} 筆記錄的 Discord ID：\n```{lines}```", ephemeral=True)
 
-    @commands.command(name="guildfund")
+    @commands.hybrid_command(name="guildfund", description="查看公會基金總額")
     async def guild_fund(self, ctx):
         """查看公會基金總額。"""
+        await ctx.defer(ephemeral=True)
         total = await asyncio.to_thread(self.store.guild_fund_total)
-        await ctx.send(f"🏦 公會基金總額：**{total:.0f}**")
+        await ctx.send(f"🏦 公會基金總額：**{total:.0f}**", ephemeral=True)
 
 
 async def setup(bot):
