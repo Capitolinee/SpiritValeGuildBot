@@ -33,7 +33,7 @@ class Jobs(commands.Cog):
         新增或更新職業。
         用法：/addjob job_name:戰士
              /addjob job_name:聖騎士 tier:2 parent:戰士
-             !addjob 聖騎士 2 戰士 https://.../paladin.png
+             /addjob job_name:聖騎士 tier:2 parent:戰士 image:https://.../paladin.png
         """
         await ctx.defer(ephemeral=True)
         async with self.store.lock:

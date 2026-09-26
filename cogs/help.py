@@ -54,15 +54,15 @@ class Help(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.hybrid_command(name="help", aliases=["說明", "指令"], description="查看所有指令說明")
+    @commands.hybrid_command(name="help", description="查看所有指令說明")
     async def show_help(self, ctx):
         """顯示所有指令說明。"""
         embed = discord.Embed(
             title="📖 指令總覽",
             description=(
                 "公會出席與分潤管理機器人。最常用的是 `/loot`（處理寶物）跟 `/claim`（領錢）。\n"
-                "所有指令也都能用 `!` 開頭打（例如 `!claim`），但用 `/` 比較乾淨，"
-                "大部分回覆只有你自己看得到。"
+                "指令一律用 `/` 打。開場跟寶物記錄的指令（startsession、noloot、item、items、"
+                "donate、loot、sell、giveto）出團時要快速連續打，也可以用 `!` 開頭。"
             ),
             color=discord.Color.blurple(),
         )

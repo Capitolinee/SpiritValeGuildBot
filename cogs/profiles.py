@@ -260,7 +260,7 @@ class Profiles(commands.Cog):
         """
         設定你平常可出席的時段（沒填的欄位維持原本設定不變）。
         用法：/setavailability weekday:True weekend:False
-             !setavailability yes no 平日8:00~9:00
+             /setavailability weekday:False weekend:False note:平日8:00~9:00
         """
         if weekday is None and weekend is None and note is None:
             await ctx.send("⚠️ 至少要填一個欄位（平日、假日、或備註），沒填的欄位不會被改動。", ephemeral=True)
