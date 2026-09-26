@@ -621,7 +621,11 @@ class Sessions(commands.Cog):
                 mime_type = mimetypes.guess_type(attachment.filename)[0] or "image/png"
                 image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-                result = self.bot.gemini.interactions.create(
+                # Gemini 讀一張圖要好幾秒，一定要丟到背景執行緒去跑。
+                # 直接呼叫的話整支機器人會凍住，這幾秒內別人打的 / 指令來不及在 3 秒內回應 Discord，
+                # 就會被當成「沒有反應」直接丟掉（! 指令只是晚點處理，所以看起來正常）。
+                result = await asyncio.to_thread(
+                    self.bot.gemini.interactions.create,
                     model=self.bot.gemini_model,
                     input=[
                         {"type": "text", "text": PROMPT},
