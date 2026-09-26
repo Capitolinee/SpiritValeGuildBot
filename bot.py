@@ -50,6 +50,24 @@ intents.members = True  # 需要在 Discord Developer Portal 開啟「Server Mem
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# 這些「開場與寶物記錄」類的指令，出團時常常要快速連續打，保留 ! 也能用；
+# 其他指令（查詢、設定、角色資料、管理）一律只能用 / 打，避免頻道被指令洗版。
+# 想調整哪些指令可以用 !，改這個清單就好。
+PREFIX_ALLOWED_COMMANDS = {
+    "startsession", "noloot",           # 開場、補記出席
+    "item", "items", "donate",          # 記錄寶物
+    "loot", "sell", "giveto",           # 處理寶物（賣出、免費領取、歸公會）
+}
+
+
+@bot.check
+async def slash_only_except_recording(ctx):
+    if ctx.interaction is not None:
+        return True  # 用 / 打的，一律放行
+    if ctx.command is None or ctx.command.name in PREFIX_ALLOWED_COMMANDS:
+        return True
+    raise commands.CheckFailure(f"這個指令只能用斜線打，請改用 `/{ctx.command.name}`。")
+
 # 掛在 bot 上，所有 cog 用 self.bot.store / self.bot.gemini 共用同一份
 bot.store = SheetsStore()
 bot.gemini = genai.Client(api_key=GEMINI_API_KEY)
