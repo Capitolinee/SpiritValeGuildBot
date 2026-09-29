@@ -593,7 +593,8 @@ class ClaimSelect(discord.ui.Select):
             session_label = it["session_id"] or "捐獻寶物"
             label = f"{it['item_name']}（{session_label}，+{it['amount']:.0f}）"
             options.append(discord.SelectOption(label=label[:100], value=key))
-        options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
+        if len(items) > 1:  # 只有一筆的話，「全部一起領取」就是那一筆，不重複列出
+            options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
         super().__init__(placeholder="選擇要領取哪一樣", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
@@ -987,7 +988,7 @@ class Sessions(commands.Cog):
     @commands.hybrid_command(name="claim", description="領取自己的分潤")
     @app_commands.describe(session_id="只領指定場次的全部（不填就一樣一樣選）")
     async def claim(self, ctx, session_id: Optional[str] = None):
-        """領取自己尚未領取的分潤。只有一筆直接領，多筆會跳選單一樣一樣選。"""
+        """領取自己尚未領取的分潤。一律先列出待領清單，自己選了才會領取，避免誤領。"""
         await ctx.defer(ephemeral=True)
         uid = str(ctx.author.id)
 
@@ -1009,19 +1010,6 @@ class Sessions(commands.Cog):
         items = await asyncio.to_thread(self.store.pending_items_for_user, uid)
         if not items:
             await ctx.send("目前沒有可領取的分潤。", ephemeral=True)
-            return
-
-        if len(items) == 1:
-            async with self.store.lock:
-                result = await asyncio.to_thread(self.store.claim_item_row, uid, items[0]["row"])
-            if not result["ok"]:
-                await ctx.send("這筆待領已經被處理掉了（可能剛被領過）。", ephemeral=True)
-                return
-            audit.audit(
-                "領取分潤", who=ctx.author.display_name,
-                detail=f"{result['session_id'] or '捐獻寶物'} {result['item_name']} {result['amount']:.2f}",
-            )
-            await ctx.send(f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.0f}**", ephemeral=True)
             return
 
         lines = "\n".join(
