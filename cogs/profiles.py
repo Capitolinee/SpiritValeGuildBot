@@ -49,20 +49,24 @@ async def finalize_profile(store, interaction: discord.Interaction, name: str, j
     async with store.lock:
         result = await asyncio.to_thread(store.upsert_character, user_id, display_name, name, job, position)
 
+    created = result["status"] == "created"
     desc = f"名字：**{name}**\n職業：**{job}**"
     if position:
         desc += f"\n位置：**{position}**"
+    if result["backfilled"]:
+        desc += f"\n\n📋 找到你登記之前參加過的 {result['backfilled']} 筆出團記錄，已經補上，出席次數跟分潤都會算進來。"
     embed = discord.Embed(
-        title="✅ 已更新角色資料" if result == "updated" else "✅ 已新增角色資料",
+        title="✅ 已新增角色資料" if created else "✅ 已更新角色資料",
         description=desc,
         color=discord.Color.green(),
     )
     if image_url:
         embed.set_thumbnail(url=image_url)
     audit.audit(
-        "新增角色" if result == "created" else "更新角色",
+        "新增角色" if created else "更新角色",
         who=display_name,
-        detail=f"角色 {name}｜職業 {job}" + (f"｜位置 {position}" if position else ""),
+        detail=f"角色 {name}｜職業 {job}" + (f"｜位置 {position}" if position else "")
+               + (f"｜補上場次記錄 {result['backfilled']} 筆" if result["backfilled"] else ""),
     )
     await interaction.edit_original_response(content=None, embed=embed, view=None)
 
