@@ -32,3 +32,11 @@ async def resolve_display_name(discord_id: str, fallback_name: str, guild: disco
         return f"（已離開的使用者 {discord_id}）"
     except Exception:
         return fallback_name or f"（使用者 {discord_id}）"
+
+
+def sort_warning(sort_result) -> str:
+    """角色資料排序沒通過檢查（已自動還原）時，要附在回覆裡的提醒；排序正常或沒有排序就回空字串。"""
+    if not sort_result or sort_result.get("ok"):
+        return ""
+    return (f"\n\n⚠️ 角色資料排序時檢查沒有通過，已經自動還原成排序前的樣子，資料沒有遺失。"
+            f"\n原因：{sort_result.get('reason')}")

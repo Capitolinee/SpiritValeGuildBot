@@ -20,6 +20,7 @@ import base64
 import json
 import asyncio
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 import gspread
@@ -156,6 +157,10 @@ def _session_color_formula(row: int) -> str:
         f'=IF({above("A")}="","donation-"&(ROW()-1),{above("A")}&"|"&{above("G")}),'
         f'{above("O")},MOD(N({above("O")})+1,6)))'
     )
+
+
+class DataIntegrityError(Exception):
+    """排序或寫入公式之後，檢查發現資料不一致或公式出錯。"""
 
 
 class _RetryHTTPClient(gspread.HTTPClient):
@@ -494,7 +499,7 @@ class SheetsStore:
                 self.write_row(SHEET_CHARACTERS, r["_row"],
                                 [str(discord_id), display_name, char_name, job, position])
                 self.ensure_account_row(discord_id, display_name)
-                return {"status": "updated", "backfilled": 0}  # ID 沒變、位置不動，不用排序
+                return {"status": "updated", "backfilled": 0, "sort": None}  # ID 沒變、位置不動，不用排序
         row_num = self._first_empty_row_from(rows)
         self.write_row(SHEET_CHARACTERS, row_num, [str(discord_id), display_name, char_name, job, position])
         self.write_row(
@@ -504,8 +509,8 @@ class SheetsStore:
         )
         self.ensure_account_row(discord_id, display_name)
         backfilled = self.backfill_sessions_for_character(char_name, discord_id, display_name)
-        self.sort_characters()
-        return {"status": "created", "backfilled": backfilled}
+        sort = self.sort_characters()
+        return {"status": "created", "backfilled": backfilled, "sort": sort}
 
     def backfill_sessions_for_character(self, char_name: str, discord_id: str, display_name: str) -> int:
         """
@@ -523,24 +528,89 @@ class SheetsStore:
             self.batch_update_cells(SHEET_SESSIONS, updates)
         return len(updates)
 
-    def sort_characters(self):
+    # 角色資料 F、G、H 三欄是公式（出席次數、分潤總額、色碼），其他欄都是資料
+    _CHAR_FORMULA_COLS = {5, 6, 7}   # 0 起算：F=5、G=6、H=7
+
+    def sort_characters(self) -> dict:
         """
-        角色資料依 Discord ID 排序（同一個人的角色再依角色名稱），同一個人的角色會排在一起。
-        排序在 Google 的伺服器上完成，機器人只送一個請求。
-        排序範圍涵蓋到這張表的最後一欄，右邊如果有自己加的欄位也會跟著整列移動，不會錯位。
-        排完把 F、G、H 三欄公式整塊重寫一次，確保每一列都指向自己那一列的資料、色碼也重新分組。
+        角色資料依 Discord ID 排序（同一個人的角色再依角色名稱），同一個人的角色會排在一起，
+        排完重寫 F、G、H 三欄公式。排序在 Google 的伺服器上完成，機器人只送請求。
+
+        排序會搬動所有資料，所以整個過程有保護：
+          1. 先把整張「角色資料」複製一份當備份
+          2. 排序前記下每一列的資料，排完再讀一次比對，確認每一列都還在、內容一字不差
+          3. 公式重寫後讀回計算結果，確認沒有 #REF!、#ERROR! 之類的錯誤
+          4. 任何一步出問題，就從備份原封不動貼回去，回到排序前的樣子
+          5. 全部通過才刪掉備份
+        排序範圍涵蓋到這張表的最後一欄，右邊如果有自己加的欄位也會跟著整列移動。
+
+        回傳 {"ok": True, "rows": 幾列} 或 {"ok": False, "reason": 原因}（此時已經還原）。
+        真的連還原都失敗才會丟出例外，並告知備份分頁的名稱，資料都還在那一頁。
         """
+        ss = self._ss()
         ws = self.ws(SHEET_CHARACTERS)
         last_row = len(ws.col_values(1))  # A 欄＝Discord ID，最後一筆資料在哪一列
         if last_row < 2:
-            return
-        if last_row >= 3:
-            ws.sort((1, "asc"), (3, "asc"), range=f"A2:{_col_letter(ws.col_count)}{last_row}")
-        formulas = [
-            [_char_attendance_formula(r), _char_earnings_formula(r), _char_color_formula(r)]
-            for r in range(2, last_row + 1)
-        ]
-        ws.update(f"F2:H{last_row}", formulas, value_input_option="USER_ENTERED")
+            return {"ok": True, "rows": 0}
+        width = ws.col_count
+        n_rows = last_row - 1
+        data_range = f"A2:{_col_letter(width)}{last_row}"
+
+        def data_snapshot() -> Counter:
+            """每一列的資料（不含 F、G、H 公式欄），當成一包來比，不管順序。"""
+            rows = ws.get(data_range, maintain_size=True)
+            return Counter(
+                tuple(v for i, v in enumerate(row) if i not in self._CHAR_FORMULA_COLS)
+                for row in rows
+            )
+
+        before = data_snapshot()
+        backup = ss.duplicate_sheet(
+            ws.id, new_sheet_name=f"角色資料_排序前備份_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+        try:
+            if n_rows >= 2:
+                ws.sort((1, "asc"), (3, "asc"), range=data_range)
+                if data_snapshot() != before:
+                    raise DataIntegrityError("排序前後的資料不一致（有列不見、重複，或內容被改動）")
+
+            formulas = [
+                [_char_attendance_formula(r), _char_earnings_formula(r), _char_color_formula(r)]
+                for r in range(2, last_row + 1)
+            ]
+            ws.update(f"F2:H{last_row}", formulas, value_input_option="USER_ENTERED")
+            results = ws.get(f"F2:H{last_row}", maintain_size=True)
+            broken = [i + 2 for i, row in enumerate(results) if any(str(v).startswith("#") for v in row)]
+            if broken:
+                raise DataIntegrityError(f"公式計算出錯（第 {'、'.join(map(str, broken[:10]))} 列）")
+        except Exception as e:
+            reason = str(e) if isinstance(e, DataIntegrityError) else f"{type(e).__name__}: {e}"
+            self._restore_from_backup(ss, backup, ws, last_row, width, before, data_snapshot)
+            return {"ok": False, "reason": reason}
+
+        ss.del_worksheet(backup)
+        return {"ok": True, "rows": n_rows}
+
+    def _restore_from_backup(self, ss, backup, ws, last_row, width, before, data_snapshot):
+        """
+        把備份分頁的內容（值、公式、格式）原封不動貼回「角色資料」，並確認還原後資料跟排序前一致。
+        還原成功就刪掉備份；還原失敗就保留備份分頁並丟出例外，讓管理員知道資料在哪裡。
+        """
+        grid = lambda sheet_id: {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": last_row,
+                                 "startColumnIndex": 0, "endColumnIndex": width}
+        try:
+            ss.batch_update({"requests": [{"copyPaste": {
+                "source": grid(backup.id), "destination": grid(ws.id),
+                "pasteType": "PASTE_NORMAL", "pasteOrientation": "NORMAL",
+            }}]})
+            if data_snapshot() != before:
+                raise DataIntegrityError("還原後的資料仍然不一致")
+        except Exception as e:
+            raise DataIntegrityError(
+                f"排序出錯，自動還原也失敗了（{e}）。排序前的完整資料保留在「{backup.title}」這個分頁，"
+                f"請不要刪掉它，可以從那裡複製回來，或用試算表的「檔案 → 版本記錄」還原。"
+            )
+        ss.del_worksheet(backup)
 
     def delete_character(self, discord_id: str, index: int):
         """index 是這個帳號角色清單裡的第幾個（0-based，跟 !myprofiles 顯示的編號一致）。"""
@@ -549,8 +619,7 @@ class SheetsStore:
             return None
         target = chars[index]
         self.delete_row(SHEET_CHARACTERS, target["_row"])
-        self.sort_characters()
-        return target
+        return {**target, "sort": self.sort_characters()}
 
     def ensure_account_row(self, discord_id: str, display_name: str):
         """確保帳號基本資料表裡有這個 Discord ID 的列，沒有就新增一列（可出席時間留空）。"""
@@ -597,10 +666,11 @@ class SheetsStore:
                 updates.append((r["_row"], 4, [str(new_id), display_name]))  # D=Discord ID、E=DC名稱
         if updates:
             self.batch_update_cells(SHEET_SESSIONS, updates)
-        self.sort_characters()  # ID 改了，要重新排到新主人的其他角色旁邊
+        sort = self.sort_characters()  # ID 改了，要重新排到新主人的其他角色旁邊
 
         return {
             "ok": True,
+            "sort": sort,
             "char_name": targets[0].get("角色名稱", char_name),
             "old_ids": sorted(i for i in old_ids if i),
             "character_rows": len(targets),
@@ -609,28 +679,34 @@ class SheetsStore:
 
     def repair_formulas(self) -> dict:
         """
-        把三張表所有現有資料列的公式欄，一次重新寫成最新版本。
+        把三張表所有現有資料列的公式欄，一次重新寫成最新版本，順便把角色資料依 Discord ID 排序。
         用途：修好已經出現 #REF! 的列，並把舊版公式換成「刪除列也不會壞」的新寫法。
-        只寫到每張表最後一筆資料為止，每一欄整塊一次寫入，不會一列一列打 API。
+
+        角色資料：走 sort_characters（有備份、前後比對、出錯自動還原）
+        場次記錄、帳號基本資料：只寫公式欄、不搬動資料，寫完讀回檢查有沒有計算錯誤
         """
+        sort = self.sort_characters()
+
         def write_block(sheet, first_col, last_col, last_row, makers):
             if last_row < 2:
-                return 0
+                return {"rows": 0, "broken": []}
+            rng = f"{first_col}2:{last_col}{last_row}"
             rows = [[make(r) for make in makers] for r in range(2, last_row + 1)]
-            self.ws(sheet).update(f"{first_col}2:{last_col}{last_row}", rows, value_input_option="USER_ENTERED")
-            return len(rows)
+            ws = self.ws(sheet)
+            ws.update(rng, rows, value_input_option="USER_ENTERED")
+            results = ws.get(rng, maintain_size=True)
+            broken = [i + 2 for i, row in enumerate(results) if any(str(v).startswith("#") for v in row)]
+            return {"rows": len(rows), "broken": broken}
 
         last_session = len(self.ws(SHEET_SESSIONS).col_values(2))   # B 欄＝日期時間
-        last_char = len(self.ws(SHEET_CHARACTERS).col_values(1))    # A 欄＝Discord ID
-        last_acct = len(self.ws(SHEET_ACCOUNTS).col_values(1))
+        last_acct = len(self.ws(SHEET_ACCOUNTS).col_values(1))      # A 欄＝Discord ID
         return {
+            "角色資料": sort,
             # 場次記錄：N、O 相鄰一起寫；P 是「發錢的人」資料欄不能動，所以 Q 另外寫
             "場次記錄": write_block(SHEET_SESSIONS, "N", "O", last_session,
                                     [_session_first_occurrence_formula, _session_color_formula]),
             "場次記錄Q": write_block(SHEET_SESSIONS, "Q", "Q", last_session,
                                      [_session_first_occurrence_by_char_formula]),
-            "角色資料": write_block(SHEET_CHARACTERS, "F", "H", last_char,
-                                    [_char_attendance_formula, _char_earnings_formula, _char_color_formula]),
             "帳號基本資料": write_block(SHEET_ACCOUNTS, "F", "I", last_acct,
                                       [_account_attendance_formula, _account_earnings_formula,
                                        _account_claimed_formula, _account_pending_formula]),
