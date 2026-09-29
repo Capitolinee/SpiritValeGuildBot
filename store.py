@@ -5,7 +5,7 @@ Google Sheets 儲存層。
 工作表結構（欄位順序不能亂動，公式欄位機器人永遠不寫）：
 
 角色資料：   A DiscordID(隱藏) B顯示名稱 C角色名稱 D職業 E位置
-             F出席次數(公式) G分潤總額(公式) H色碼(公式)
+             F出席次數(公式) G分潤總額(公式) H色碼(公式)（依 Discord ID 排序）
 場次記錄：   A場次ID(隱藏) B日期時間 C塔團 D DiscordID(隱藏) E DC名稱 F掉落 G寶物編號(隱藏)
              H類型 I來源/貢獻者 J售出金額 K均分$$ L已領 M領取時間 N同場首筆(公式)
              O色碼(公式) P發錢的人 Q同場角色首筆(公式)
@@ -85,6 +85,21 @@ def _char_attendance_formula(row: int) -> str:
 def _char_earnings_formula(row: int) -> str:
     return (f"=SUMIFS('{SHEET_SESSIONS}'!$K:$K,'{SHEET_SESSIONS}'!$D:$D,A{row},"
             f"'{SHEET_SESSIONS}'!$C:$C,C{row},'{SHEET_SESSIONS}'!$H:$H,\"分潤\")")
+
+
+def _char_color_formula(row: int) -> str:
+    """
+    角色資料 H 欄「色碼(輔助)」：跟上一列是同一個 Discord ID 就沿用同一個顏色，不同就換下一色（6 色循環）。
+    配合依 Discord ID 排序，同一個人的角色會排在一起、顯示同一個顏色。
+    「上一列」用 INDEX(範圍, 範圍列數) 取範圍的最後一格，刪列時範圍會自動縮小，不會變成 #REF!。
+    """
+    prev = row - 1
+
+    def above(col: str) -> str:
+        return f"INDEX(${col}$1:${col}{prev},ROWS(${col}$1:${col}{prev}))"
+
+    return (f'=IF($A{row}="","",IF($A{row}={above("A")},{above("H")},'
+            f'MOD(N({above("H")})+1,6)))')
 
 
 def _account_attendance_formula(row: int) -> str:
@@ -466,8 +481,12 @@ class SheetsStore:
             result[name] = match
         return result
 
-    def upsert_character(self, discord_id: str, display_name: str, char_name: str, job: str, position: str = "") -> str:
-        """新增或更新一隻角色。同名角色（正規化後）視為同一隻，更新職業/位置；否則新增一列。"""
+    def upsert_character(self, discord_id: str, display_name: str, char_name: str, job: str, position: str = "") -> dict:
+        """
+        新增或更新一隻角色。同名角色（正規化後）視為同一隻，更新職業/位置；否則新增一列。
+        新建角色時，會把場次記錄裡這隻角色還沒對應到帳號的舊記錄補上，然後重新排序角色資料。
+        回傳 {"status": "created" 或 "updated", "backfilled": 補上了幾筆場次記錄}。
+        """
         key = normalize_name(char_name)
         rows = self.get_characters()
         for r in rows:
@@ -475,7 +494,7 @@ class SheetsStore:
                 self.write_row(SHEET_CHARACTERS, r["_row"],
                                 [str(discord_id), display_name, char_name, job, position])
                 self.ensure_account_row(discord_id, display_name)
-                return "updated"
+                return {"status": "updated", "backfilled": 0}  # ID 沒變、位置不動，不用排序
         row_num = self._first_empty_row_from(rows)
         self.write_row(SHEET_CHARACTERS, row_num, [str(discord_id), display_name, char_name, job, position])
         self.write_row(
@@ -484,7 +503,44 @@ class SheetsStore:
             start_col=6, raw=True,
         )
         self.ensure_account_row(discord_id, display_name)
-        return "created"
+        backfilled = self.backfill_sessions_for_character(char_name, discord_id, display_name)
+        self.sort_characters()
+        return {"status": "created", "backfilled": backfilled}
+
+    def backfill_sessions_for_character(self, char_name: str, discord_id: str, display_name: str) -> int:
+        """
+        新登記角色時，把場次記錄裡「塔團是這個角色、但 Discord ID 還是空白」的舊記錄補上帳號，
+        這樣他在登記之前參加的團，出席次數、分潤、待領金額都會算進來，也能用 /claim 領。
+        已經掛在別人 ID 下的列不動（那種情況用 /fixprofile 處理）。
+        """
+        key = normalize_name(char_name)
+        updates = [
+            (r["_row"], 4, [str(discord_id), display_name])  # D=Discord ID、E=DC名稱
+            for r in self.get_rows(SHEET_SESSIONS, key_col_index=2)
+            if not r.get("Discord ID", "").strip() and normalize_name(r.get("塔團", "")) == key
+        ]
+        if updates:
+            self.batch_update_cells(SHEET_SESSIONS, updates)
+        return len(updates)
+
+    def sort_characters(self):
+        """
+        角色資料依 Discord ID 排序（同一個人的角色再依角色名稱），同一個人的角色會排在一起。
+        排序在 Google 的伺服器上完成，機器人只送一個請求。
+        排序範圍涵蓋到這張表的最後一欄，右邊如果有自己加的欄位也會跟著整列移動，不會錯位。
+        排完把 F、G、H 三欄公式整塊重寫一次，確保每一列都指向自己那一列的資料、色碼也重新分組。
+        """
+        ws = self.ws(SHEET_CHARACTERS)
+        last_row = len(ws.col_values(1))  # A 欄＝Discord ID，最後一筆資料在哪一列
+        if last_row < 2:
+            return
+        if last_row >= 3:
+            ws.sort((1, "asc"), (3, "asc"), range=f"A2:{_col_letter(ws.col_count)}{last_row}")
+        formulas = [
+            [_char_attendance_formula(r), _char_earnings_formula(r), _char_color_formula(r)]
+            for r in range(2, last_row + 1)
+        ]
+        ws.update(f"F2:H{last_row}", formulas, value_input_option="USER_ENTERED")
 
     def delete_character(self, discord_id: str, index: int):
         """index 是這個帳號角色清單裡的第幾個（0-based，跟 !myprofiles 顯示的編號一致）。"""
@@ -493,6 +549,7 @@ class SheetsStore:
             return None
         target = chars[index]
         self.delete_row(SHEET_CHARACTERS, target["_row"])
+        self.sort_characters()
         return target
 
     def ensure_account_row(self, discord_id: str, display_name: str):
@@ -540,6 +597,7 @@ class SheetsStore:
                 updates.append((r["_row"], 4, [str(new_id), display_name]))  # D=Discord ID、E=DC名稱
         if updates:
             self.batch_update_cells(SHEET_SESSIONS, updates)
+        self.sort_characters()  # ID 改了，要重新排到新主人的其他角色旁邊
 
         return {
             "ok": True,
@@ -571,8 +629,8 @@ class SheetsStore:
                                     [_session_first_occurrence_formula, _session_color_formula]),
             "場次記錄Q": write_block(SHEET_SESSIONS, "Q", "Q", last_session,
                                      [_session_first_occurrence_by_char_formula]),
-            "角色資料": write_block(SHEET_CHARACTERS, "F", "G", last_char,
-                                    [_char_attendance_formula, _char_earnings_formula]),
+            "角色資料": write_block(SHEET_CHARACTERS, "F", "H", last_char,
+                                    [_char_attendance_formula, _char_earnings_formula, _char_color_formula]),
             "帳號基本資料": write_block(SHEET_ACCOUNTS, "F", "I", last_acct,
                                       [_account_attendance_formula, _account_earnings_formula,
                                        _account_claimed_formula, _account_pending_formula]),
