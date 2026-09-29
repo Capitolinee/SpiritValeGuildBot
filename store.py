@@ -8,7 +8,7 @@ Google Sheets 儲存層。
              F出席次數(公式) G分潤總額(公式) H色碼(公式)
 場次記錄：   A場次ID(隱藏) B日期時間 C塔團 D DiscordID(隱藏) E DC名稱 F掉落 G寶物編號(隱藏)
              H類型 I來源/貢獻者 J售出金額 K均分$$ L已領 M領取時間 N同場首筆(公式)
-             O色碼(公式) P操作者 Q同場角色首筆(公式)
+             O色碼(公式) P發錢的人 Q同場角色首筆(公式)
 職業管理：   A職業名稱 B轉職層級 C承接自 D圖片網址 E位置名稱(跟職業各自獨立管理)
 帳號基本資料：A DiscordID(隱藏) B顯示名稱 C平日可出席 D假日可出席 E其他時間備註
              F出席次數(公式) G分潤總額(公式) H已領總額(公式) I待領總額(公式)
@@ -337,8 +337,8 @@ class SheetsStore:
                 return True
         return False
 
-    # ---------- 戰鬥位置清單（存在「職業管理」表的 F 欄，跟職業本身的 A-D 欄各自獨立） ----------
-    # 用 F 欄存放，不能直接刪整列（會誤刪同一列的職業資料），刪除時只清空儲存格內容，
+    # ---------- 戰鬥位置清單（存在「職業管理」表的 E 欄，跟職業本身的 A-D 欄各自獨立） ----------
+    # 用 E 欄存放，不能直接刪整列（會誤刪同一列的職業資料），刪除時只清空儲存格內容，
     # 中間留空缺沒關係，get_positions 只回傳非空白的值。
 
     POSITION_COL = 5  # E 欄
@@ -346,6 +346,21 @@ class SheetsStore:
     def get_positions(self) -> list:
         col_values = self.ws(SHEET_JOBS).col_values(self.POSITION_COL)
         return [v.strip() for v in col_values[1:] if v.strip()]
+
+    # ---------- 發錢的人清單（存在「職業管理」表的 F 欄，直接在試算表裡手動增刪） ----------
+    # 上傳寶物截圖確認時，會從這裡讀出下拉選單讓人選「這批寶物由誰發錢」，
+    # 選到的名字寫進「場次記錄」的 P 欄。F1 是標題，從 F2 往下一格填一個名字。
+
+    PAYMASTER_COL = 6  # F 欄
+
+    def get_paymasters(self) -> list:
+        col_values = self.ws(SHEET_JOBS).col_values(self.PAYMASTER_COL)
+        names = []
+        for v in col_values[1:]:
+            v = v.strip()
+            if v and v not in names:  # 去掉空白格跟重複的名字
+                names.append(v)
+        return names
 
     def add_position(self, name: str) -> str:
         """新增一個位置名稱。回傳 'added' 或 'exists'（已存在就不重複加）。"""
@@ -516,11 +531,11 @@ class SheetsStore:
         ]
         return (max(indices) + 1) if indices else 0
 
-    def record_attendance(self, session_id: str, when_iso: str, members: list, operator: str = ""):
+    def record_attendance(self, session_id: str, when_iso: str, members: list):
         """
         單純記錄出席，不綁定任何寶物。確認隊員名單的當下就寫入這筆，
         這樣就算這一場全程沒有掉寶，出席次數也還是會被正確算到。
-        operator：誰觸發了這次記錄（寫進 P 欄「操作者」，方便事後追查是誰記錄的）。
+        P 欄「發錢的人」留空（沒有寶物，不需要發錢）。
         """
         rows_data = []
         for m in members:
@@ -533,18 +548,18 @@ class SheetsStore:
             extra_formulas=[
                 (14, _session_first_occurrence_formula),
                 (15, _session_color_formula),
-                (16, lambda r: operator),
+                (16, lambda r: ""),
                 (17, _session_first_occurrence_by_char_formula),
             ],
         )
 
     def append_item_rows(self, session_id, when_iso, members, item_name, item_index, item_type, contributor,
-                          operator: str = ""):
+                          paymaster: str = ""):
         """
         members: list of {"discord_id": str|None, "name": str} — 分潤類型才需要多列。
         分潤：每個 member 各一列；公會/自用：只需要一列（塔團/DiscordID 留空）。
         這裡會把這次要新增的所有列一次性打包成一個 API 呼叫寫入，不會一列一列分開打。
-        operator：誰觸發了這次記錄（寫進 P 欄「操作者」，方便事後追查是誰記錄的）。
+        paymaster：這批寶物由誰發錢，寫進 P 欄「發錢的人」（只有上傳寶物截圖的流程會選，其他情況留空）。
         """
         rows_data = []
         if item_type == "分潤":
@@ -565,7 +580,7 @@ class SheetsStore:
             extra_formulas=[
                 (14, _session_first_occurrence_formula),
                 (15, _session_color_formula),
-                (16, lambda r: operator),
+                (16, lambda r: _sanitize(paymaster)),
                 (17, _session_first_occurrence_by_char_formula),
             ],
         )
