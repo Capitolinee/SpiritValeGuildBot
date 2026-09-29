@@ -581,6 +581,18 @@ class LootSelectView(discord.ui.View):
         self.add_item(LootSelect(store, author_id, items))
 
 
+def claim_line(item: dict) -> str:
+    """
+    /claim 顯示每一筆待領的統一格式：(場次ID) 日期 掉落：+均分
+    例如：(s1790418097) 2026/09/26 死靈卡：+5833333
+    捐獻的寶物沒有場次ID，顯示成（捐獻寶物）。
+    """
+    head = f"({item.get('session_id') or '捐獻寶物'})"
+    if item.get("date"):
+        head += f" {item['date']}"
+    return f"{head} {item.get('item_name', '')}：+{item.get('amount', 0):.0f}"
+
+
 class ClaimSelect(discord.ui.Select):
     def __init__(self, store, author_id: int, items: list):
         self.store = store
@@ -590,9 +602,7 @@ class ClaimSelect(discord.ui.Select):
         for it in items[:24]:
             key = str(it["row"])
             self.items[key] = it
-            session_label = it["session_id"] or "捐獻寶物"
-            label = f"{it['item_name']}（{session_label}，+{it['amount']:.0f}）"
-            options.append(discord.SelectOption(label=label[:100], value=key))
+            options.append(discord.SelectOption(label=claim_line(it)[:100], value=key))
         if len(items) > 1:  # 只有一筆的話，「全部一起領取」就是那一筆，不重複列出
             options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
         super().__init__(placeholder="選擇要領取哪一樣", options=options, min_values=1, max_values=1)
@@ -611,7 +621,7 @@ class ClaimSelect(discord.ui.Select):
             if not result["details"]:
                 await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
                 return
-            detail_text = "\n".join(f"{sid or '捐獻寶物'}：{name} +{amt:.0f}" for sid, name, amt in result["details"])
+            detail_text = "\n".join(claim_line(it) for it in result["items"])
             audit.audit(
                 "領取分潤", who=interaction.user.display_name,
                 detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
@@ -634,7 +644,7 @@ class ClaimSelect(discord.ui.Select):
             detail=f"{result['session_id'] or '捐獻寶物'} {result['item_name']} {result['amount']:.2f}",
         )
         await interaction.edit_original_response(
-            content=f"✅ 已領取「{result['item_name']}」：+**{result['amount']:.0f}**", view=None
+            content=f"✅ 已領取：\n```{claim_line(result)}```", view=None
         )
 
 
@@ -998,7 +1008,7 @@ class Sessions(commands.Cog):
             if not result["details"]:
                 await ctx.send(f"場次 `{session_id}` 沒有可領取的分潤。", ephemeral=True)
                 return
-            detail_text = "\n".join(f"{sid}：{name} +{amt:.0f}" for sid, name, amt in result["details"])
+            detail_text = "\n".join(claim_line(it) for it in result["items"])
             audit.audit(
                 "領取分潤", who=ctx.author.display_name,
                 detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
@@ -1012,9 +1022,7 @@ class Sessions(commands.Cog):
             await ctx.send("目前沒有可領取的分潤。", ephemeral=True)
             return
 
-        lines = "\n".join(
-            f"- {it['item_name']}（{it['session_id'] or '捐獻寶物'}）：+{it['amount']:.0f}" for it in items
-        )
+        lines = "\n".join(claim_line(it) for it in items)
         view = ClaimSelectView(self.store, ctx.author.id, items)
         await ctx.send(f"你有 {len(items)} 筆待領，請選擇要領取哪一樣：\n```{lines}```", view=view, ephemeral=True)
 
