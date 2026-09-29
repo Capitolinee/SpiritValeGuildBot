@@ -81,6 +81,7 @@ EXTENSIONS = [
     "cogs.profiles",
     "cogs.sessions",
     "cogs.access_control",
+    "cogs.panel",
     "cogs.help",
 ]
 
