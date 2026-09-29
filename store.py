@@ -159,6 +159,14 @@ def _session_color_formula(row: int) -> str:
     )
 
 
+def _to_number(value) -> float:
+    """把金額欄的內容轉成數字（處理 70,000,000 這種有千分位逗號的顯示格式）；轉不了就當 0。"""
+    try:
+        return float(str(value or "").replace(",", "").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
 def _date_part(value) -> str:
     """場次記錄「日期時間」欄只取日期部分，例如 2026/09/26 15:39:53 → 2026/09/26。"""
     text = str(value or "").strip()
@@ -1055,6 +1063,48 @@ class SheetsStore:
             "ok": True, "session_id": r.get("場次ID", ""), "date": _date_part(r.get("日期時間", "")),
             "item_name": r.get("掉落", ""), "amount": float(per_person),
         }
+
+    def sold_items_claim_status(self, session_id: str = None) -> list:
+        """
+        列出已經賣出（有售出金額）的分潤寶物，每一樣附上誰領了、誰還沒領。給 /unclaimed 用。
+        session_id 有給的話只列那一場。最新的排最前面（依寶物在表格裡的位置，越下面越新）。
+
+        回傳：[{"key": 識別字串, "session_id", "date", "item_name", "sale",
+                "claimed": [(名字, 金額), ...], "unclaimed": [(名字, 金額), ...]}, ...]
+        名字：有綁定帳號的用 DC名稱；沒綁定的在後面加「(未綁定)」。
+        同一個帳號帶兩隻角色，金額合併成一筆。
+        """
+        items = {}
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
+            if r.get("類型") != "分潤" or not str(r.get("售出金額", "")).strip():
+                continue
+            sid = r.get("場次ID", "").strip()
+            if session_id is not None and sid != session_id:
+                continue
+            key = f"{sid}|{r.get('寶物編號', '').strip()}|{r.get('掉落', '').strip()}"
+            item = items.setdefault(key, {
+                "key": key, "session_id": sid, "date": _date_part(r.get("日期時間", "")),
+                "item_name": r.get("掉落", "").strip(), "sale": _to_number(r.get("售出金額")),
+                "last_row": 0, "people": {},
+            })
+            item["last_row"] = max(item["last_row"], r["_row"])
+
+            uid = r.get("Discord ID", "").strip()
+            dc_name = r.get("DC名稱", "").strip() or r.get("塔團", "").strip()
+            person_key = uid or f"raw:{r.get('塔團', '').strip()}"
+            name = dc_name if uid else f"{dc_name}(未綁定)"
+            claimed = str(r.get("已領", "")).strip().upper() == "TRUE"
+            slot = item["people"].setdefault((person_key, claimed), [name, 0.0])
+            slot[1] += _to_number(r.get("均分$$"))
+
+        result = []
+        for item in sorted(items.values(), key=lambda x: x["last_row"], reverse=True):
+            people = item.pop("people")
+            item.pop("last_row")
+            item["claimed"] = [tuple(v) for (pk, c), v in people.items() if c]
+            item["unclaimed"] = [tuple(v) for (pk, c), v in people.items() if not c]
+            result.append(item)
+        return result
 
     def unclaimed_for_session(self, session_id: str) -> dict:
         """回傳這個場次裡，誰還沒領錢 {key: amount}，key 是 discord_id 或 "raw:名字"。"""
