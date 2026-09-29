@@ -85,11 +85,12 @@ async def build_session_members(store, guild, raw_names: list) -> list:
 
 
 async def record_items(bot, item_names: list, item_type: str = "分潤", contributor: str = None,
-                        force_no_session: bool = False, operator: str = ""):
+                        force_no_session: bool = False, operator: str = "", paymaster: str = ""):
     """
     把一批寶物名稱記錄進去。
     分潤類型需要目前有進行中的場次（bot.active_session）；公會/自用可以有場次也可以沒有（捐獻）。
-    operator：誰觸發了這次記錄，寫進場次記錄表的「操作者」欄。
+    operator：誰觸發了這次記錄，只寫進稽核記錄（查帳用）。
+    paymaster：這批寶物由誰發錢，寫進場次記錄表的 P 欄「發錢的人」（只有上傳寶物截圖時會選）。
     回傳 (成功訊息, 是否有錯誤)。
     """
     store = bot.store
@@ -110,7 +111,7 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
             else:
                 idx = None
             await asyncio.to_thread(
-                store.append_item_rows, session_id, now, members, name, idx, item_type, contributor, operator
+                store.append_item_rows, session_id, now, members, name, idx, item_type, contributor, paymaster
             )
             recorded.append(name)
 
@@ -118,9 +119,13 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
     where = f"場次 `{session_id}`" if session_id else "捐獻清單"
     audit.audit(
         "記錄寶物", who=operator or "（未知）",
-        detail=f"場次 {session_id or '（捐獻）'}｜類型 {item_type}｜{summary}",
+        detail=f"場次 {session_id or '（捐獻）'}｜類型 {item_type}｜{summary}"
+               + (f"｜發錢的人 {paymaster}" if paymaster else ""),
     )
-    return f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```", None
+    reply = f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```"
+    if paymaster:
+        reply += f"\n💰 發錢的人：**{paymaster}**"
+    return reply, None
 
 
 class EditModal(discord.ui.Modal):
@@ -148,8 +153,26 @@ class EditModal(discord.ui.Modal):
         self.view_ref.stop()
 
 
+class PaymasterSelect(discord.ui.Select):
+    """上傳寶物截圖確認時，選這批寶物由誰發錢（名單來自「職業管理」表的 F 欄）。"""
+
+    def __init__(self, names: list):
+        options = [discord.SelectOption(label=n[:100], value=n[:100]) for n in names[:25]]
+        super().__init__(placeholder="💰 選擇發錢的人", options=options, min_values=1, max_values=1, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "ConfirmView" = self.view
+        if interaction.user.id != view.author_id:
+            await interaction.response.send_message("只有上傳圖片的人可以選喔。", ephemeral=True)
+            return
+        view.paymaster = self.values[0]
+        for opt in self.options:  # 讓選單保持顯示剛選的名字
+            opt.default = (opt.value == view.paymaster)
+        await interaction.response.edit_message(content=view.preview_text(), view=view)
+
+
 class ConfirmView(discord.ui.View):
-    def __init__(self, bot, kind: str, payload: list, author_id: int, guild):
+    def __init__(self, bot, kind: str, payload: list, author_id: int, guild, paymasters: list = None):
         super().__init__(timeout=300)
         self.bot = bot
         self.kind = kind
@@ -157,10 +180,15 @@ class ConfirmView(discord.ui.View):
         self.author_id = author_id
         self.guild = guild
         self.message: discord.Message | None = None
+        self.paymasters = paymasters or []
+        self.paymaster = None
+
+        if kind == "item" and self.paymasters:
+            self.add_item(PaymasterSelect(self.paymasters))
 
         if kind == "member":
             no_loot_button = discord.ui.Button(
-                label="📋 這場沒有掉落寶物", style=discord.ButtonStyle.secondary
+                label="📋 這場沒有掉落寶物", style=discord.ButtonStyle.secondary, row=1
             )
             no_loot_button.callback = self.no_loot_callback
             self.add_item(no_loot_button)
@@ -179,7 +207,7 @@ class ConfirmView(discord.ui.View):
 
         async with store.lock:
             await asyncio.to_thread(
-                store.record_attendance, session_id, now, members, interaction.user.display_name
+                store.record_attendance, session_id, now, members
             )
 
         names = "、".join(m["display_name"] for m in members)
@@ -197,7 +225,24 @@ class ConfirmView(discord.ui.View):
     def preview_text(self) -> str:
         body = "、".join(self.payload) if self.payload else "（無）"
         label = "隊員名單" if self.kind == "member" else "寶物記錄"
-        return f"**🔍 辨識為{label}：**\n```{body}```\n請確認是否正確？"
+        text = f"**🔍 辨識為{label}：**\n```{body}```\n"
+        if self.kind == "item" and self.paymasters:
+            if self.paymaster:
+                text += f"💰 發錢的人：**{self.paymaster}**\n請確認是否正確？"
+            else:
+                text += "請先在下面選擇**發錢的人**，再按確認。"
+        elif self.kind == "item":
+            text += "請確認是否正確？（「職業管理」F 欄還沒設定發錢的人，這批會留空）"
+        else:
+            text += "請確認是否正確？"
+        return text
+
+    async def _needs_paymaster(self, interaction: discord.Interaction) -> bool:
+        """寶物截圖有設定發錢的人名單、但還沒選的話，擋下來提醒。"""
+        if self.kind == "item" and self.paymasters and not self.paymaster:
+            await interaction.response.send_message("⚠️ 請先在選單裡選擇**發錢的人**。", ephemeral=True)
+            return True
+        return False
 
     async def save(self, interaction: discord.Interaction) -> str:
         store = self.bot.store
@@ -217,24 +262,29 @@ class ConfirmView(discord.ui.View):
             )
         else:
             reply, err = await record_items(
-                self.bot, self.payload, item_type="分潤", operator=interaction.user.display_name
+                self.bot, self.payload, item_type="分潤", operator=interaction.user.display_name,
+                paymaster=self.paymaster or "",
             )
             return err or reply
 
-    @discord.ui.button(label="✅ 確認正確", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="✅ 確認正確", style=discord.ButtonStyle.success, row=1)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("只有上傳圖片的人可以確認喔。", ephemeral=True)
+            return
+        if await self._needs_paymaster(interaction):
             return
         await interaction.response.defer()
         reply = await self.save(interaction)
         await interaction.edit_original_response(content=reply, view=None)
         self.stop()
 
-    @discord.ui.button(label="✏️ 修改後再存", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="✏️ 修改後再存", style=discord.ButtonStyle.primary, row=1)
     async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("只有上傳圖片的人可以修改喔。", ephemeral=True)
+            return
+        if await self._needs_paymaster(interaction):
             return
         await interaction.response.send_modal(EditModal(self))
 
@@ -648,7 +698,10 @@ class Sessions(commands.Cog):
                     await message.channel.send("⚠️ 無法判斷這張圖片是隊員名單還是寶物記錄，或內容為空。")
                     continue
 
-                view = ConfirmView(self.bot, kind, payload, message.author.id, message.guild)
+                paymasters = []
+                if kind == "item":
+                    paymasters = await asyncio.to_thread(self.bot.store.get_paymasters)
+                view = ConfirmView(self.bot, kind, payload, message.author.id, message.guild, paymasters)
                 sent = await message.channel.send(view.preview_text(), view=view)
                 view.message = sent
 
@@ -717,7 +770,6 @@ class Sessions(commands.Cog):
         async with self.store.lock:
             await asyncio.to_thread(
                 self.store.record_attendance, session["id"], now_str(), session["members"],
-                ctx.author.display_name,
             )
         audit.audit(
             "補記出席（無掉落）", who=ctx.author.display_name,
