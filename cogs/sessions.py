@@ -724,31 +724,43 @@ class UnclaimedView(discord.ui.View):
         self.add_item(UnclaimedSelect(store, author_id, items, session_id))
 
 
-def session_summary_label(info: dict) -> str:
-    return f"({info['session_id']}) {info['date']}　出席 {len(info['members'])} 人、寶物 {len(info['items'])} 樣"
+def record_label(e: dict) -> str:
+    """/deletesession 選項：(場次ID)日期 掉落，例如 (s1790418097)2026/09/26 死靈卡"""
+    dup = f"（{e['dup_no']}）" if e.get("dup_no") else ""
+    return f"({e['session_id']}){e['date']} {e['item_name']}{dup}"
 
 
-def delete_confirm_text(info: dict) -> str:
-    members = "、".join(info["members"][:30]) + ("…" if len(info["members"]) > 30 else "")
-    items = "、".join(info["items"][:30]) + ("…" if len(info["items"]) > 30 else "") or "（沒有寶物，只有出席）"
-    text = (f"**🗑️ 確定要刪除這一場嗎？**\n"
-            f"場次：`{info['session_id']}`　{info['date']}\n"
-            f"共 **{info['rows']}** 列資料會被刪除，後面的記錄會自動往上補。\n"
-            f"出席（{len(info['members'])} 人）：{members or '（無）'}\n"
-            f"寶物（{len(info['items'])} 樣）：{items}\n")
-    if info["sold"] or info["claimed"]:
-        text += (f"\n⚠️ **這場有 {info['sold']} 樣寶物已經賣出、{info['claimed']} 筆分潤已經有人領了。**\n"
-                 f"刪除後，這些錢會從大家的分潤總額、已領、待領裡消失，就像這場沒發生過。\n")
-    text += "\n刪除前會自動備份，刪完會檢查其他資料是否完整，有問題會自動還原。"
+def record_counts(e: dict) -> str:
+    """/deletesession 選項下方的小字：出席n人 | 已領n人 | 未領n人"""
+    return f"出席{len(e['people'])}人 | 已領{e['claimed']}人 | 未領{e['unclaimed']}人"
+
+
+def delete_confirm_text(e: dict) -> str:
+    people = "、".join(e["people"][:30]) + ("…" if len(e["people"]) > 30 else "")
+    text = (f"**🗑️ 確定要刪除這筆記錄嗎？**\n"
+            f"`{record_label(e)}`\n"
+            f"{record_counts(e)}\n"
+            f"共 **{e['rows']}** 列資料會被刪除，後面的記錄會自動往上補。\n"
+            f"相關的人：{people or '（無）'}\n")
+    warnings = []
+    if e["claimed"]:
+        warnings.append(f"已經有 **{e['claimed']}** 人領了這樣寶物的分潤。刪除後，這些錢會從他們的已領、分潤總額裡消失。")
+    elif e["sold"]:
+        warnings.append("這樣寶物已經賣出了。刪除後，大家這筆的待領金額會消失。")
+    if e["last_item"]:
+        warnings.append("這是這一場**最後一筆記錄**，刪除後這場的出席也會一起消失，大家的出席次數會少一次。")
+    if warnings:
+        text += "\n" + "\n".join(f"⚠️ {w}" for w in warnings) + "\n"
+    text += "\n只會刪這一筆，這場的其他寶物不會動到。刪除前會自動備份，刪完會檢查其他資料是否完整，有問題會自動還原。"
     return text
 
 
-class DeleteSessionConfirmView(discord.ui.View):
-    def __init__(self, bot, author_id: int, info: dict):
+class DeleteRecordConfirmView(discord.ui.View):
+    def __init__(self, bot, author_id: int, entry: dict):
         super().__init__(timeout=120)
         self.bot = bot
         self.author_id = author_id
-        self.info = info
+        self.entry = entry
 
     async def _check(self, interaction):
         if interaction.user.id != self.author_id:
@@ -762,32 +774,28 @@ class DeleteSessionConfirmView(discord.ui.View):
             return
         await interaction.response.defer()
         await interaction.edit_original_response(content="⏳ 刪除中，正在備份與檢查資料…", view=None)
-        sid = self.info["session_id"]
+        e = self.entry
         store = self.bot.store
         async with store.lock:
-            result = await asyncio.to_thread(store.delete_session, sid, self.info["rows"])
+            result = await asyncio.to_thread(
+                store.delete_record, e["session_id"], e["kind"], e["item_index"], e["item_name"], e["rows"])
+        label = record_label(e)
         if not result["ok"]:
-            audit.audit("刪除場次失敗", who=interaction.user.display_name, detail=f"{sid}｜{result['reason']}")
+            audit.audit("刪除記錄失敗", who=interaction.user.display_name, detail=f"{label}｜{result['reason']}")
             await interaction.edit_original_response(
                 content=f"⚠️ 沒有刪除，資料維持原樣。\n原因：{result['reason']}", view=None)
             self.stop()
             return
-
-        cleared = False
-        if self.bot.active_session and self.bot.active_session.get("id") == sid:
-            self.bot.active_session = None  # 刪的是進行中的場次，避免下一個 /item 掛到已刪除的場次
-            cleared = True
         # 稽核記錄保留每一列被刪掉的內容，萬一刪錯了查得到原本是什麼
         rows_text = "；".join(
             f"{r.get('塔團') or '-'}/{r.get('掉落') or '-'}/{r.get('類型') or '-'}/售出{r.get('售出金額') or '-'}"
             f"/均分{r.get('均分$$') or '-'}/已領{r.get('已領') or '-'}/發錢{r.get('發錢的人') or '-'}"
             for r in result["rows"])
-        audit.audit("刪除場次", who=interaction.user.display_name,
-                    detail=f"{sid}（{self.info['date']}）｜{result['deleted']} 列｜{rows_text}")
-        msg = f"✅ 已刪除場次 `{sid}`（{result['deleted']} 列），後面的記錄已經往上補，其他資料檢查無誤。"
-        if cleared:
-            msg += "\n這是目前進行中的場次，已經一併結束，要繼續記錄請重新開場。"
-        await interaction.edit_original_response(content=msg, view=None)
+        audit.audit("刪除記錄", who=interaction.user.display_name,
+                    detail=f"{label}｜{result['deleted']} 列｜{rows_text}")
+        await interaction.edit_original_response(
+            content=f"✅ 已刪除 `{label}`（{result['deleted']} 列），後面的記錄已經往上補，其他資料檢查無誤。",
+            view=None)
         self.stop()
 
     @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
@@ -798,33 +806,31 @@ class DeleteSessionConfirmView(discord.ui.View):
         self.stop()
 
 
-class DeleteSessionSelect(discord.ui.Select):
-    def __init__(self, bot, author_id: int, sessions: list):
+class DeleteRecordSelect(discord.ui.Select):
+    def __init__(self, bot, author_id: int, entries: list):
         self.bot = bot
         self.author_id = author_id
-        self.sessions = {s["session_id"]: s for s in sessions[:25]}
+        self.entries = {e["key"][:100]: e for e in entries[:25]}
         options = [
-            discord.SelectOption(
-                label=session_summary_label(info)[:100], value=info["session_id"],
-                description=f"已賣 {info['sold']} 樣｜已領 {info['claimed']} 筆｜共 {info['rows']} 列"[:100],
-            )
-            for info in sessions[:25]
+            discord.SelectOption(label=record_label(e)[:100], value=e["key"][:100],
+                                 description=record_counts(e)[:100])
+            for e in entries[:25]
         ]
-        super().__init__(placeholder="選擇要刪除的場次", options=options, min_values=1, max_values=1)
+        super().__init__(placeholder="選擇要刪除的記錄", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("這是別人發起的操作。", ephemeral=True)
             return
-        info = self.sessions[self.values[0]]
+        entry = self.entries[self.values[0]]
         await interaction.response.edit_message(
-            content=delete_confirm_text(info), view=DeleteSessionConfirmView(self.bot, self.author_id, info))
+            content=delete_confirm_text(entry), view=DeleteRecordConfirmView(self.bot, self.author_id, entry))
 
 
-class DeleteSessionView(discord.ui.View):
-    def __init__(self, bot, author_id: int, sessions: list):
+class DeleteRecordView(discord.ui.View):
+    def __init__(self, bot, author_id: int, entries: list):
         super().__init__(timeout=180)
-        self.add_item(DeleteSessionSelect(bot, author_id, sessions))
+        self.add_item(DeleteRecordSelect(bot, author_id, entries))
 
 
 class ClaimSelectView(discord.ui.View):
@@ -1163,19 +1169,21 @@ class Sessions(commands.Cog):
         await ctx.send(f"請選擇要查看的寶物：{more}",
                        view=UnclaimedView(self.store, ctx.author.id, items, session_id), ephemeral=True)
 
-    @commands.hybrid_command(name="deletesession", description="管理員：刪除整場登記錯的場次（會先確認）")
+    @commands.hybrid_command(name="deletesession", description="管理員：刪除登記錯的記錄，一次刪一樣寶物（會先確認）")
     @commands.has_permissions(manage_guild=True)
     @app_commands.default_permissions(manage_guild=True)
-    async def delete_session(self, ctx):
-        """選一場登記錯的場次整場刪除，後面的記錄往上補。刪除前會確認、備份，刪完檢查，出錯自動還原。"""
+    @app_commands.describe(session_id="只列出這一場的記錄（不填就列出最近的）")
+    async def delete_session(self, ctx, session_id: Optional[str] = None):
+        """選一筆登記錯的記錄刪除（場次ID＋寶物，一次一樣），後面的記錄往上補。會先確認、備份，刪完檢查，出錯自動還原。"""
         await ctx.defer(ephemeral=True)
-        sessions = await asyncio.to_thread(self.store.list_sessions)
-        if not sessions:
-            await ctx.send("目前沒有任何場次。", ephemeral=True)
+        entries = await asyncio.to_thread(self.store.list_records, session_id)
+        if not entries:
+            where = f"場次 `{session_id}` " if session_id else ""
+            await ctx.send(f"{where}目前沒有可以刪除的記錄。", ephemeral=True)
             return
-        more = f"（只列出最近 25 場，共 {len(sessions)} 場）" if len(sessions) > 25 else ""
-        await ctx.send(f"請選擇要刪除的場次：{more}",
-                       view=DeleteSessionView(self.bot, ctx.author.id, sessions), ephemeral=True)
+        more = f"（只列出最近 25 筆，共 {len(entries)} 筆；要看更早的，請填 session_id）" if len(entries) > 25 else ""
+        await ctx.send(f"請選擇要刪除的記錄：{more}",
+                       view=DeleteRecordView(self.bot, ctx.author.id, entries), ephemeral=True)
 
     @commands.hybrid_command(name="claim", description="領取自己的分潤")
     @app_commands.describe(session_id="只領指定場次的全部（不填就一樣一樣選）")
