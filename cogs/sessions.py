@@ -675,53 +675,79 @@ def sold_item_label(item: dict) -> str:
 
 
 def claim_status_text(item: dict) -> str:
-    """/unclaimed 選好寶物後顯示的結果：已領款、尚未領款兩區，每一行是「DC名稱：金額」。"""
+    """/unclaimed 選好寶物後顯示的結果：已領款、尚未領款兩區，每一行是「DC名稱：金額」，最後附上更新時間。"""
     def block(people):
         return "\n".join(f"{name}：{amount:.0f}" for name, amount in people) or "（無）"
     return (
         f"**{sold_item_label(item)}**（{item['session_id'] or '捐獻寶物'}）\n"
         f"✅ 已領款（{len(item['claimed'])} 人）：\n```{block(item['claimed'])}```"
         f"⏳ 尚未領款（{len(item['unclaimed'])} 人）：\n```{block(item['unclaimed'])}```"
+        f"-# 🕒 {now_str()} 更新，要看最新狀態按「🔄 重新整理」"
     )
+
+
+def _sold_item_description(it: dict) -> str:
+    """選項下方的小字：場次ID｜已領 x/y 人（分辨同一天賣了兩張一樣的寶物）"""
+    people = len(it["claimed"]) + len(it["unclaimed"])
+    return f"{it['session_id'] or '捐獻寶物'}｜已領 {len(it['claimed'])}/{people} 人"[:100]
 
 
 class UnclaimedSelect(discord.ui.Select):
     """/unclaimed 的選單：選一樣已賣出的寶物，看誰領了、誰還沒領。選完選單會留著，可以接著看下一樣。"""
 
-    def __init__(self, store, author_id: int, items: list, session_id=None):
-        self.store = store
-        self.author_id = author_id
-        self.session_id = session_id
-        options = []
-        for it in items[:25]:
-            people = len(it["claimed"]) + len(it["unclaimed"])
-            options.append(discord.SelectOption(
-                label=sold_item_label(it)[:100], value=it["key"][:100],
-                # 小字：分辨同一天賣了兩張一樣的寶物
-                description=f"{it['session_id'] or '捐獻寶物'}｜已領 {len(it['claimed'])}/{people} 人"[:100],
-            ))
-        super().__init__(placeholder="選擇一樣已賣出的寶物", options=options, min_values=1, max_values=1)
+    def __init__(self, items: list):
+        options = [discord.SelectOption(label=sold_item_label(it)[:100], value=it["key"][:100],
+                                        description=_sold_item_description(it))
+                   for it in items[:25]]
+        super().__init__(placeholder="選擇一樣已賣出的寶物", options=options, min_values=1, max_values=1, row=0)
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
+        view: UnclaimedView = self.view
+        if interaction.user.id != view.author_id:
             await interaction.response.send_message("這是別人發起的查詢，你可以自己打 `/unclaimed` 喔。", ephemeral=True)
             return
-        await interaction.response.defer()
-        # 選的當下重新讀一次，確保看到的是最新狀態（中間可能有人剛領）
-        items = await asyncio.to_thread(self.store.sold_items_claim_status, self.session_id)
-        item = next((it for it in items if it["key"][:100] == self.values[0]), None)
-        for opt in self.options:
-            opt.default = (opt.value == self.values[0])
-        if item is None:
-            await interaction.edit_original_response(content="找不到這樣寶物了（可能已經被刪除）。", view=self.view)
-            return
-        await interaction.edit_original_response(content=claim_status_text(item), view=self.view)
+        view.selected = self.values[0]
+        await view.show(interaction)
 
 
 class UnclaimedView(discord.ui.View):
+    """
+    /unclaimed 的畫面：選單＋重新整理按鈕。
+    選選項、按重新整理都會重新讀一次試算表（中間可能有人剛領），並把選單小字的已領人數一起更新。
+    """
+
     def __init__(self, store, author_id: int, items: list, session_id=None):
-        super().__init__(timeout=300)
-        self.add_item(UnclaimedSelect(store, author_id, items, session_id))
+        super().__init__(timeout=600)
+        self.store = store
+        self.author_id = author_id
+        self.session_id = session_id
+        self.selected = None
+        self.select = UnclaimedSelect(items)
+        self.add_item(self.select)
+
+    async def show(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        items = await asyncio.to_thread(self.store.sold_items_claim_status, self.session_id)
+        by_key = {it["key"][:100]: it for it in items}
+        for opt in self.select.options:
+            opt.default = (opt.value == self.selected)
+            if opt.value in by_key:
+                opt.description = _sold_item_description(by_key[opt.value])
+        item = by_key.get(self.selected)
+        if item is None:
+            await interaction.edit_original_response(content="找不到這樣寶物了（可能已經被刪除）。", view=self)
+            return
+        await interaction.edit_original_response(content=claim_status_text(item), view=self)
+
+    @discord.ui.button(label="🔄 重新整理", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("這是別人發起的查詢，你可以自己打 `/unclaimed` 喔。", ephemeral=True)
+            return
+        if self.selected is None:
+            await interaction.response.send_message("請先在選單裡選一樣寶物。", ephemeral=True)
+            return
+        await self.show(interaction)
 
 
 def record_label(e: dict) -> str:

@@ -8,7 +8,7 @@
 所以機器人重啟、重新部署之後，舊公告上的按鈕照樣能按，不用重發。
 """
 import asyncio
-from typing import Optional
+from typing import Literal, Optional
 
 import discord
 from discord import app_commands
@@ -17,7 +17,7 @@ from discord.ext import commands
 import audit
 from cogs.profiles import NameModal
 from helpers import sort_warning
-from cogs.sessions import ClaimSelectView, claim_line
+from cogs.sessions import ClaimSelectView, claim_line, SellSelectView, UnclaimedView
 
 DEFAULT_TITLE = "📋 公會常用功能"
 DEFAULT_DESCRIPTION = (
@@ -27,6 +27,13 @@ DEFAULT_DESCRIPTION = (
     "🧑 **查看我的角色**：看自己登記了哪些角色\n"
     "🕒 **設定可出席時間**：設定平日、假日能不能出席\n"
     "💰 **領取分潤**：領取出團分到的錢"
+)
+
+LOOT_TITLE = "💎 寶物結算"
+LOOT_DESCRIPTION = (
+    "點下面的按鈕就能使用，畫面只有你自己看得到。\n\n"
+    "💰 **賣掉寶物**：選一樣還沒結算的寶物，輸入賣出的金額，出席的人自動平分\n"
+    "🧾 **誰領了誰沒領**：選一樣已賣出的寶物，看誰已經領了、誰還沒領"
 )
 
 
@@ -240,40 +247,93 @@ class PanelView(discord.ui.View):
             pass
 
 
+class LootPanelView(discord.ui.View):
+    """寶物結算公告的按鈕（永久型，custom_id 發出去之後就不能改）。"""
+
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label="賣掉寶物", emoji="💰", style=discord.ButtonStyle.success,
+                       custom_id="lootpanel:sell")
+    async def sell(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        items = await asyncio.to_thread(self.bot.store.list_unsold_items)
+        if not items:
+            await interaction.followup.send("目前沒有任何還沒結算的寶物。", ephemeral=True)
+            return
+        more = f"（只顯示最近 25 筆，共 {len(items)} 筆）" if len(items) > 25 else ""
+        await interaction.followup.send(f"請選擇要結算的寶物：{more}",
+                                        view=SellSelectView(self.bot.store, interaction.user.id, items),
+                                        ephemeral=True)
+
+    @discord.ui.button(label="誰領了誰沒領", emoji="🧾", style=discord.ButtonStyle.secondary,
+                       custom_id="lootpanel:unclaimed")
+    async def unclaimed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        items = await asyncio.to_thread(self.bot.store.sold_items_claim_status, None)
+        if not items:
+            await interaction.followup.send("目前沒有已經賣出的分潤寶物。", ephemeral=True)
+            return
+        more = f"（只列出最近 25 樣，共 {len(items)} 樣）" if len(items) > 25 else ""
+        await interaction.followup.send(f"請選擇要查看的寶物：{more}",
+                                        view=UnclaimedView(self.bot.store, interaction.user.id, items),
+                                        ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        audit.error("寶物結算按鈕發生錯誤", error, who=interaction.user.display_name)
+        try:
+            send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await send(f"❌ 執行時發生錯誤：{error}", ephemeral=True)
+        except Exception:
+            pass
+
+
+# /postpanel 可以發的公告種類：(按鈕畫面, 預設標題, 預設內容)
+PANELS = {
+    "角色與分潤": (PanelView, DEFAULT_TITLE, DEFAULT_DESCRIPTION),
+    "寶物結算": (LootPanelView, LOOT_TITLE, LOOT_DESCRIPTION),
+}
+
+
 class Panel(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
     async def cog_load(self):
         # 機器人啟動時重新接上按鈕，之前發過的公告按鈕才能繼續用
-        self.bot.add_view(PanelView(self.bot))
+        for view_cls, _, _ in PANELS.values():
+            self.bot.add_view(view_cls(self.bot))
 
-    @commands.hybrid_command(name="postpanel", description="管理員：在頻道發一則附按鈕的公告（登記角色、領分潤等）")
+    @commands.hybrid_command(name="postpanel", description="管理員：在頻道發一則附按鈕的公告（角色與分潤／寶物結算）")
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
+        panel="要發哪一種公告（不填就是角色與分潤）",
         channel="要發在哪個頻道（不填就發在目前這個頻道）",
         title="公告標題（不填就用預設）",
         description="公告內容（不填就用預設的按鈕說明）",
     )
-    async def post_panel(self, ctx, channel: Optional[discord.TextChannel] = None,
+    async def post_panel(self, ctx, panel: Literal["角色與分潤", "寶物結算"] = "角色與分潤",
+                         channel: Optional[discord.TextChannel] = None,
                          title: Optional[str] = None, description: Optional[str] = None):
         """在指定頻道發一則附按鈕的公告。想放在其他頻道就去那邊再發一次；不要了直接刪掉那則訊息。"""
         await ctx.defer(ephemeral=True)
         target = channel or ctx.channel
+        view_cls, default_title, default_description = PANELS[panel]
         embed = discord.Embed(
-            title=(title or DEFAULT_TITLE)[:256],
-            description=(description.replace("\\n", "\n") if description else DEFAULT_DESCRIPTION)[:4000],
+            title=(title or default_title)[:256],
+            description=(description.replace("\\n", "\n") if description else default_description)[:4000],
             color=discord.Color.blurple(),
         )
         try:
-            msg = await target.send(embed=embed, view=PanelView(self.bot))
+            msg = await target.send(embed=embed, view=view_cls(self.bot))
         except discord.Forbidden:
             await ctx.send(f"⚠️ 機器人在 {target.mention} 沒有「傳送訊息」或「嵌入連結」權限，請先開權限再試一次。",
                            ephemeral=True)
             return
-        audit.audit("發佈按鈕公告", who=ctx.author.display_name, detail=f"#{target.name}｜{msg.jump_url}")
+        audit.audit("發佈按鈕公告", who=ctx.author.display_name, detail=f"{panel}｜#{target.name}｜{msg.jump_url}")
         await ctx.send(f"✅ 已在 {target.mention} 發佈公告：{msg.jump_url}\n"
                        f"想放在其他頻道就去那邊再打一次 `/postpanel`；不要了直接刪掉那則訊息就好。",
                        ephemeral=True)
