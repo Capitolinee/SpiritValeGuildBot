@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.jobs import get_tier1_jobs, get_children_jobs
-from helpers import resolve_display_name
+from helpers import resolve_display_name, sort_warning
 import audit
 
 
@@ -55,6 +55,7 @@ async def finalize_profile(store, interaction: discord.Interaction, name: str, j
         desc += f"\n位置：**{position}**"
     if result["backfilled"]:
         desc += f"\n\n📋 找到你登記之前參加過的 {result['backfilled']} 筆出團記錄，已經補上，出席次數跟分潤都會算進來。"
+    desc += sort_warning(result["sort"])
     embed = discord.Embed(
         title="✅ 已新增角色資料" if created else "✅ 已更新角色資料",
         description=desc,
@@ -253,7 +254,8 @@ class Profiles(commands.Cog):
             "刪除角色", who=ctx.author.display_name,
             detail=f"角色 {removed.get('角色名稱')}（{removed.get('職業')}）",
         )
-        await ctx.send(f"🗑️ 已刪除角色：{removed.get('角色名稱')}（{removed.get('職業')}）", ephemeral=True)
+        await ctx.send(f"🗑️ 已刪除角色：{removed.get('角色名稱')}（{removed.get('職業')}）"
+                       + sort_warning(removed.get("sort")), ephemeral=True)
 
     @commands.hybrid_command(name="setavailability", description="設定自己平常可出席的時段")
     @app_commands.describe(
@@ -387,7 +389,7 @@ class Profiles(commands.Cog):
         )
         await ctx.send(
             f"✅ 「{result['char_name']}」已改到 {member.mention} 名下，"
-            f"過去的出團記錄也一起改了 {result['session_rows']} 筆。",
+            f"過去的出團記錄也一起改了 {result['session_rows']} 筆。" + sort_warning(result.get("sort")),
             ephemeral=True,
         )
 

@@ -155,22 +155,34 @@ class AccessControl(commands.Cog):
             return
         await ctx.send(f"這個論壇的預設規則：{', '.join(allowed)}", ephemeral=True)
 
-    @commands.hybrid_command(name="repairformulas", description="重新寫入所有統計公式，修好 #REF! 錯誤（需管理權限）")
+    @commands.hybrid_command(name="repairformulas", description="重寫所有統計公式並依 Discord ID 排序角色資料，修好 #REF!（需管理權限）")
     @commands.has_permissions(manage_guild=True)
     @app_commands.default_permissions(manage_guild=True)
     async def repair_formulas(self, ctx):
-        """把三張表現有資料的公式欄全部重寫成最新版本，刪過列之後出現 #REF! 時用這個修。"""
+        """把三張表的公式欄重寫成最新版本，並排序角色資料（有備份、前後比對、出錯自動還原）。"""
         await ctx.defer(ephemeral=True)
         async with self.store.lock:
             result = await asyncio.to_thread(self.store.repair_formulas)
-        audit.audit("重寫統計公式", who=ctx.author.display_name,
-                    detail="｜".join(f"{k} {v} 列" for k, v in result.items()))
-        await ctx.send(
-            "✅ 公式已全部重新寫入：\n"
-            f"場次記錄 {result['場次記錄']} 列、角色資料 {result['角色資料']} 列、帳號基本資料 {result['帳號基本資料']} 列。\n"
-            "之後就算刪除中間的列，色碼欄也不會再出現 #REF!。",
-            ephemeral=True,
-        )
+        sort = result["角色資料"]
+        others = {k: v for k, v in result.items() if k != "角色資料"}
+        audit.audit("重寫統計公式＋排序角色資料", who=ctx.author.display_name,
+                    detail=(f"角色資料 {'排序完成 ' + str(sort.get('rows', 0)) + ' 列' if sort.get('ok') else '排序失敗已還原：' + str(sort.get('reason'))}｜"
+                            + "｜".join(f"{k} {v['rows']} 列" + (f"（有錯誤：{v['broken'][:10]}）" if v["broken"] else "")
+                                       for k, v in others.items())))
+
+        lines = []
+        if sort.get("ok"):
+            lines.append(f"✅ 角色資料：已依 Discord ID 排序，並重寫公式（{sort.get('rows', 0)} 列），前後資料比對一致。")
+        else:
+            lines.append(f"⚠️ 角色資料：排序時檢查沒有通過，已經自動還原成排序前的樣子，資料沒有遺失。\n　原因：{sort.get('reason')}")
+        for label, key in [("場次記錄", "場次記錄"), ("帳號基本資料", "帳號基本資料")]:
+            v = others[key]
+            broken = sorted(set(v["broken"] + (others["場次記錄Q"]["broken"] if key == "場次記錄" else [])))
+            if broken:
+                lines.append(f"⚠️ {label}：公式已重寫（{v['rows']} 列），但這幾列算出錯誤，請檢查：第 {'、'.join(map(str, broken[:10]))} 列")
+            else:
+                lines.append(f"✅ {label}：公式已重寫（{v['rows']} 列），沒有計算錯誤。")
+        await ctx.send("\n".join(lines), ephemeral=True)
 
     @commands.hybrid_command(name="viewlogs", description="讀取稽核／錯誤記錄（需管理權限）")
     @commands.has_permissions(manage_guild=True)
