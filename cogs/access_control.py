@@ -155,6 +155,23 @@ class AccessControl(commands.Cog):
             return
         await ctx.send(f"這個論壇的預設規則：{', '.join(allowed)}", ephemeral=True)
 
+    @commands.hybrid_command(name="repairformulas", description="重新寫入所有統計公式，修好 #REF! 錯誤（需管理權限）")
+    @commands.has_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
+    async def repair_formulas(self, ctx):
+        """把三張表現有資料的公式欄全部重寫成最新版本，刪過列之後出現 #REF! 時用這個修。"""
+        await ctx.defer(ephemeral=True)
+        async with self.store.lock:
+            result = await asyncio.to_thread(self.store.repair_formulas)
+        audit.audit("重寫統計公式", who=ctx.author.display_name,
+                    detail="｜".join(f"{k} {v} 列" for k, v in result.items()))
+        await ctx.send(
+            "✅ 公式已全部重新寫入：\n"
+            f"場次記錄 {result['場次記錄']} 列、角色資料 {result['角色資料']} 列、帳號基本資料 {result['帳號基本資料']} 列。\n"
+            "之後就算刪除中間的列，色碼欄也不會再出現 #REF!。",
+            ephemeral=True,
+        )
+
     @commands.hybrid_command(name="viewlogs", description="讀取稽核／錯誤記錄（需管理權限）")
     @commands.has_permissions(manage_guild=True)
     @app_commands.default_permissions(manage_guild=True)

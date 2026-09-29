@@ -1,4 +1,6 @@
 import asyncio
+import io
+import re
 from typing import Optional
 
 import discord
@@ -291,6 +293,97 @@ class Profiles(commands.Cog):
         note = stats.get("其他時間備註", "") or "（無）"
         await ctx.send(
             f"**🕒 你的可出席時間：**\n平日：{weekday}　假日：{weekend}\n其他時間備註：{note}",
+            ephemeral=True,
+        )
+
+    @commands.hybrid_command(name="checkprofiles", description="管理員：檢查每隻角色的帳號 ID 是否都對得上伺服器成員")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
+    async def check_profiles(self, ctx):
+        """
+        把「角色資料」表裡每一組 Discord ID 都實際拿去問 Discord，
+        列出對不上的角色，以及 Discord 真正的回應，方便找出「已離開的使用者」的原因。
+        只讀取、不修改任何資料。
+        """
+        await ctx.defer(ephemeral=True)
+        chars = await asyncio.to_thread(self.store.get_characters)
+        by_id = {}
+        for c in chars:
+            by_id.setdefault(c.get("Discord ID", ""), []).append(c.get("角色名稱", "") or "（無名稱）")
+
+        problems, cache_miss, ok = [], [], 0
+        for raw_id, names in by_id.items():
+            label = "、".join(names)
+            sid = raw_id.strip()
+            if not re.fullmatch(r"[0-9]{17,20}", sid):
+                problems.append(f"❌ {label}\n　ID 格式不對：{raw_id!r}（{len(raw_id)} 個字元），ID 已經被改壞了")
+                continue
+            if ctx.guild.get_member(int(sid)):
+                ok += 1
+                continue
+            try:
+                await ctx.guild.fetch_member(int(sid))
+                ok += 1
+                cache_miss.append(label)  # 查得到，只是機器人的成員快取裡沒有
+                continue
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as e:
+                problems.append(f"⚠️ {label}：{sid}\n　查詢失敗（HTTP {e.status}）：{e.text}")
+                continue
+            # 伺服器裡找不到，再確認這個帳號在 Discord 上到底存不存在
+            try:
+                user = await self.bot.fetch_user(int(sid))
+                reason = f"帳號存在（{user.name}），但 Discord 回報他不在這台伺服器"
+            except discord.NotFound:
+                reason = "Discord 上根本沒有這個帳號，ID 可能被改壞了"
+            except discord.HTTPException as e:
+                reason = f"查詢帳號失敗（HTTP {e.status}）"
+            # 被試算表改壞的 ID 只保留前 15 位，後面全部變成 0（18 位數 → 最後 3 位是 0）
+            if sid.endswith("0" * (len(sid) - 15)):
+                reason += "\n　ID 後面幾位都是 0，這是被試算表改壞的典型樣子"
+            problems.append(f"❌ {label}：{sid}\n　{reason}")
+
+        lines = [
+            f"伺服器：{ctx.guild.name}（{ctx.guild.id}）",
+            f"共 {len(by_id)} 個帳號，{ok} 個正常，{len(problems)} 個有問題",
+        ]
+        if cache_miss:
+            lines.append(f"（其中 {len(cache_miss)} 個機器人的成員快取裡沒有、但直接查得到：{'、'.join(cache_miss)}）")
+        if problems:
+            lines += ["", *problems, "", "要把某隻角色改到正確的人名下，用 /fixprofile。"]
+        text = "\n".join(lines)
+        if len(text) <= 1900:
+            await ctx.send(f"```{text}```", ephemeral=True)
+        else:
+            await ctx.send("結果比較長，整份用附件傳送：",
+                           file=discord.File(io.BytesIO(text.encode("utf-8")), filename="checkprofiles.txt"),
+                           ephemeral=True)
+
+    @commands.hybrid_command(name="fixprofile", description="管理員：把某隻角色改到正確的成員名下")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(character="角色名稱", member="這隻角色真正的主人")
+    async def fix_profile(self, ctx, character: str, member: discord.Member):
+        """把角色重新對應到正確的帳號，過去的出團記錄也會一起改過來。"""
+        await ctx.defer(ephemeral=True)
+        async with self.store.lock:
+            result = await asyncio.to_thread(
+                self.store.relink_character, character, str(member.id), member.display_name
+            )
+        if not result["ok"]:
+            await ctx.send(f"⚠️ 找不到叫「{character}」的角色，可以先用 /profiles 確認名稱。", ephemeral=True)
+            return
+        audit.audit(
+            "修正角色帳號", who=ctx.author.display_name,
+            detail=(f"角色 {result['char_name']}｜改到 {member.display_name}（{member.id}）"
+                    f"｜原本 {', '.join(result['old_ids']) or '（無）'}｜場次記錄 {result['session_rows']} 列"),
+        )
+        await ctx.send(
+            f"✅ 「{result['char_name']}」已改到 {member.mention} 名下，"
+            f"過去的出團記錄也一起改了 {result['session_rows']} 筆。",
             ephemeral=True,
         )
 
