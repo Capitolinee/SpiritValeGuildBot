@@ -15,6 +15,7 @@ Google Sheets 儲存層。
 系統設定：   A頻道/討論串ID B允許指令(逗號分隔)（機器人第一次用到時自動建立）
 """
 import os
+import re
 import base64
 import json
 import asyncio
@@ -60,6 +61,12 @@ def _sanitize(value):
     不影響其他一般文字/數字/布林值的寫入行為。
     """
     if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    # 純數字的字串（Discord 帳號 ID、頻道 ID 都是 17～19 位數）也要當文字存。
+    # 不然 Google 會把它當成數字，而試算表的數字只精確到 15 位，後面幾位會被改成 0，
+    # ID 一改就對不上人。前面的單引號只是告訴 Google「這是文字」，儲存格裡不會顯示出來。
+    # 真正的數字（int/float，例如金額）不受影響，照樣當數字存。
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
         return "'" + value
     return value
 
@@ -119,11 +126,20 @@ def _session_color_formula(row: int) -> str:
     捐獻的寶物場次ID是空的，用「donation-列號」當獨立分組鍵，不會跟別的捐獻混在一起。
     這是鏈式公式（要回頭看前一列），跟前一列比對分組鍵是否相同，相同就沿用同一個顏色，
     不同就往下一個顏色輪替（MOD ...+1,6 是 6 色循環）。純視覺效果，不影響任何金額/出席次數計算。
+
+    「前一列」不能直接寫成 O51 這種單一儲存格：第 51 列被刪掉，公式就會變成 #REF!。
+    改用 INDEX($O$1:$O51, ROWS($O$1:$O51))，也就是「第 1 列到前一列這個範圍的最後一格」。
+    範圍裡的列被刪掉時，試算表會自動把範圍縮小而不是報錯，所以永遠指到正上方那一列。
     """
     prev = row - 1
+
+    def above(col: str) -> str:
+        return f"INDEX(${col}$1:${col}{prev},ROWS(${col}$1:${col}{prev}))"
+
     return (
         f'=IF($F{row}="","",IF(IF($A{row}="","donation-"&ROW(),$A{row}&"|"&$G{row})'
-        f'=IF($A{prev}="","donation-"&ROW()-1,$A{prev}&"|"&$G{prev}),O{prev},MOD(N(O{prev})+1,6)))'
+        f'=IF({above("A")}="","donation-"&(ROW()-1),{above("A")}&"|"&{above("G")}),'
+        f'{above("O")},MOD(N({above("O")})+1,6)))'
     )
 
 
@@ -497,6 +513,70 @@ class SheetsStore:
             ],
             start_col=6, raw=True,
         )
+
+    def relink_character(self, char_name: str, new_id: str, display_name: str) -> dict:
+        """
+        把某隻角色重新對應到正確的 Discord 帳號（給管理員修正對錯人的角色用）。
+        除了「角色資料」那一列，也會把「場次記錄」裡這隻角色過去的出團記錄一起改過來，
+        這樣舊的出席次數、分潤、待領金額才會算到正確的人頭上。
+        """
+        key = normalize_name(char_name)
+        targets = [r for r in self.get_characters() if normalize_name(r.get("角色名稱", "")) == key]
+        if not targets:
+            return {"ok": False, "reason": "not_found"}
+
+        old_ids = {r.get("Discord ID", "").strip() for r in targets}
+        # A=Discord ID、B=顯示名稱（C 以後的角色名稱、職業、位置不動）
+        for r in targets:
+            self.write_row(SHEET_CHARACTERS, r["_row"], [str(new_id), display_name], start_col=1)
+        self.ensure_account_row(new_id, display_name)
+
+        # 場次記錄：這隻角色名下、而且原本掛在舊 ID（或根本沒 ID）的列，改掛到新 ID
+        updates = []
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
+            if normalize_name(r.get("塔團", "")) != key:
+                continue
+            if r.get("Discord ID", "").strip() in old_ids | {""}:
+                updates.append((r["_row"], 4, [str(new_id), display_name]))  # D=Discord ID、E=DC名稱
+        if updates:
+            self.batch_update_cells(SHEET_SESSIONS, updates)
+
+        return {
+            "ok": True,
+            "char_name": targets[0].get("角色名稱", char_name),
+            "old_ids": sorted(i for i in old_ids if i),
+            "character_rows": len(targets),
+            "session_rows": len(updates),
+        }
+
+    def repair_formulas(self) -> dict:
+        """
+        把三張表所有現有資料列的公式欄，一次重新寫成最新版本。
+        用途：修好已經出現 #REF! 的列，並把舊版公式換成「刪除列也不會壞」的新寫法。
+        只寫到每張表最後一筆資料為止，每一欄整塊一次寫入，不會一列一列打 API。
+        """
+        def write_block(sheet, first_col, last_col, last_row, makers):
+            if last_row < 2:
+                return 0
+            rows = [[make(r) for make in makers] for r in range(2, last_row + 1)]
+            self.ws(sheet).update(f"{first_col}2:{last_col}{last_row}", rows, value_input_option="USER_ENTERED")
+            return len(rows)
+
+        last_session = len(self.ws(SHEET_SESSIONS).col_values(2))   # B 欄＝日期時間
+        last_char = len(self.ws(SHEET_CHARACTERS).col_values(1))    # A 欄＝Discord ID
+        last_acct = len(self.ws(SHEET_ACCOUNTS).col_values(1))
+        return {
+            # 場次記錄：N、O 相鄰一起寫；P 是「發錢的人」資料欄不能動，所以 Q 另外寫
+            "場次記錄": write_block(SHEET_SESSIONS, "N", "O", last_session,
+                                    [_session_first_occurrence_formula, _session_color_formula]),
+            "場次記錄Q": write_block(SHEET_SESSIONS, "Q", "Q", last_session,
+                                     [_session_first_occurrence_by_char_formula]),
+            "角色資料": write_block(SHEET_CHARACTERS, "F", "G", last_char,
+                                    [_char_attendance_formula, _char_earnings_formula]),
+            "帳號基本資料": write_block(SHEET_ACCOUNTS, "F", "I", last_acct,
+                                      [_account_attendance_formula, _account_earnings_formula,
+                                       _account_claimed_formula, _account_pending_formula]),
+        }
 
     def get_account_stats(self, discord_id: str) -> dict:
         for r in self.get_rows(SHEET_ACCOUNTS):
@@ -882,10 +962,10 @@ class SheetsStore:
         values = ws.get_all_values()
         for i, row in enumerate(values[1:], start=2):
             if row and row[0].strip() == key:
-                ws.update(f"A{i}:B{i}", [[key, ",".join(allowed)]], value_input_option="USER_ENTERED")
+                ws.update(f"A{i}:B{i}", [[_sanitize(key), ",".join(allowed)]], value_input_option="USER_ENTERED")
                 return
         row_num = len(values) + 1
-        ws.update(f"A{row_num}:B{row_num}", [[key, ",".join(allowed)]], value_input_option="USER_ENTERED")
+        ws.update(f"A{row_num}:B{row_num}", [[_sanitize(key), ",".join(allowed)]], value_input_option="USER_ENTERED")
 
     def clear_channel_rules(self, key: str):
         ws = self._rules_sheet()
@@ -918,7 +998,7 @@ class SheetsStore:
         for row in values[1:]:
             if row and row[0].strip() == channel_id:
                 return  # 已經有了，不重複加
-        ws.update(f"A{len(values) + 1}", [[channel_id]], value_input_option="USER_ENTERED")
+        ws.update(f"A{len(values) + 1}", [[_sanitize(channel_id)]], value_input_option="USER_ENTERED")
 
     def remove_translate_channel(self, channel_id: str):
         ws = self._translate_sheet()
