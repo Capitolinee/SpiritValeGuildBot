@@ -648,6 +648,61 @@ class ClaimSelect(discord.ui.Select):
         )
 
 
+def sold_item_label(item: dict) -> str:
+    """/unclaimed 選項格式：日期 掉落 售出金額，例如 2026/09/26 死靈卡 70000000"""
+    return " ".join(p for p in (item["date"], item["item_name"], f"{item['sale']:.0f}") if p)
+
+
+def claim_status_text(item: dict) -> str:
+    """/unclaimed 選好寶物後顯示的結果：已領款、尚未領款兩區，每一行是「DC名稱：金額」。"""
+    def block(people):
+        return "\n".join(f"{name}：{amount:.0f}" for name, amount in people) or "（無）"
+    return (
+        f"**{sold_item_label(item)}**（{item['session_id'] or '捐獻寶物'}）\n"
+        f"✅ 已領款（{len(item['claimed'])} 人）：\n```{block(item['claimed'])}```"
+        f"⏳ 尚未領款（{len(item['unclaimed'])} 人）：\n```{block(item['unclaimed'])}```"
+    )
+
+
+class UnclaimedSelect(discord.ui.Select):
+    """/unclaimed 的選單：選一樣已賣出的寶物，看誰領了、誰還沒領。選完選單會留著，可以接著看下一樣。"""
+
+    def __init__(self, store, author_id: int, items: list, session_id=None):
+        self.store = store
+        self.author_id = author_id
+        self.session_id = session_id
+        options = []
+        for it in items[:25]:
+            people = len(it["claimed"]) + len(it["unclaimed"])
+            options.append(discord.SelectOption(
+                label=sold_item_label(it)[:100], value=it["key"][:100],
+                # 小字：分辨同一天賣了兩張一樣的寶物
+                description=f"{it['session_id'] or '捐獻寶物'}｜已領 {len(it['claimed'])}/{people} 人"[:100],
+            ))
+        super().__init__(placeholder="選擇一樣已賣出的寶物", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("這是別人發起的查詢，你可以自己打 `/unclaimed` 喔。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        # 選的當下重新讀一次，確保看到的是最新狀態（中間可能有人剛領）
+        items = await asyncio.to_thread(self.store.sold_items_claim_status, self.session_id)
+        item = next((it for it in items if it["key"][:100] == self.values[0]), None)
+        for opt in self.options:
+            opt.default = (opt.value == self.values[0])
+        if item is None:
+            await interaction.edit_original_response(content="找不到這樣寶物了（可能已經被刪除）。", view=self.view)
+            return
+        await interaction.edit_original_response(content=claim_status_text(item), view=self.view)
+
+
+class UnclaimedView(discord.ui.View):
+    def __init__(self, store, author_id: int, items: list, session_id=None):
+        super().__init__(timeout=300)
+        self.add_item(UnclaimedSelect(store, author_id, items, session_id))
+
+
 class ClaimSelectView(discord.ui.View):
     def __init__(self, store, author_id: int, items: list):
         super().__init__(timeout=120)
@@ -970,30 +1025,19 @@ class Sessions(commands.Cog):
 
         await ctx.send("```" + "\n".join(lines) + "```", ephemeral=True)
 
-    @commands.hybrid_command(name="unclaimed", description="查看場次裡還有誰沒領錢")
-    @app_commands.describe(session_id="場次ID（不填就是目前進行中的場次）")
+    @commands.hybrid_command(name="unclaimed", description="查看已賣出的寶物，誰領了、誰還沒領")
+    @app_commands.describe(session_id="只列出這一場的寶物（不填就列出最近賣出的）")
     async def show_unclaimed(self, ctx, session_id: Optional[str] = None):
-        """查看場次裡還有誰沒領錢。"""
-        if not session_id:
-            if not self.bot.active_session:
-                await ctx.send("目前沒有進行中的場次，請指定場次ID。", ephemeral=True)
-                return
-            session_id = self.bot.active_session["id"]
-
+        """選一樣已經賣出的寶物，看這樣寶物的分潤誰已經領了、誰還沒領。"""
         await ctx.defer(ephemeral=True)
-        pending = await asyncio.to_thread(self.store.unclaimed_for_session, session_id)
-        if not pending:
-            await ctx.send("✅ 這個場次目前沒有人有待領款項。", ephemeral=True)
+        items = await asyncio.to_thread(self.store.sold_items_claim_status, session_id)
+        if not items:
+            where = f"場次 `{session_id}` " if session_id else ""
+            await ctx.send(f"{where}目前沒有已經賣出的分潤寶物。", ephemeral=True)
             return
-
-        lines = []
-        for key, amount in pending.items():
-            if key.startswith("raw:"):
-                display = f"{key[4:]}（未綁定 Discord 帳號，需人工處理）"
-            else:
-                display = await resolve_display_name(key, key, ctx.guild)
-            lines.append(f"- {display}：{amount:.0f}")
-        await ctx.send("**💸 尚未領款：**\n```" + "\n".join(lines) + "```", ephemeral=True)
+        more = f"（只列出最近 25 樣，共 {len(items)} 樣；要看更早的，請填 session_id）" if len(items) > 25 else ""
+        await ctx.send(f"請選擇要查看的寶物：{more}",
+                       view=UnclaimedView(self.store, ctx.author.id, items, session_id), ephemeral=True)
 
     @commands.hybrid_command(name="claim", description="領取自己的分潤")
     @app_commands.describe(session_id="只領指定場次的全部（不填就一樣一樣選）")
