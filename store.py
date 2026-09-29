@@ -605,14 +605,18 @@ class SheetsStore:
         ss.del_worksheet(backup)
         return {"ok": True, "rows": n_rows}
 
-    def _restore_from_backup(self, ss, backup, ws, last_row, width, before, data_snapshot):
+    def _restore_from_backup(self, ss, backup, ws, last_row, width, before, data_snapshot, action="排序"):
         """
-        把備份分頁的內容（值、公式、格式）原封不動貼回「角色資料」，並確認還原後資料跟排序前一致。
+        把備份分頁的內容（值、公式、格式）原封不動貼回原本的分頁，並確認還原後資料跟操作前一致。
         還原成功就刪掉備份；還原失敗就保留備份分頁並丟出例外，讓管理員知道資料在哪裡。
+        action 只用在錯誤訊息裡（排序、刪除場次）。
         """
         grid = lambda sheet_id: {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": last_row,
                                  "startColumnIndex": 0, "endColumnIndex": width}
         try:
+            # 刪過列的話表格會變短，先確認列數夠把備份整塊貼回去
+            if ws.row_count < last_row:
+                ws.add_rows(last_row - ws.row_count)
             ss.batch_update({"requests": [{"copyPaste": {
                 "source": grid(backup.id), "destination": grid(ws.id),
                 "pasteType": "PASTE_NORMAL", "pasteOrientation": "NORMAL",
@@ -621,7 +625,7 @@ class SheetsStore:
                 raise DataIntegrityError("還原後的資料仍然不一致")
         except Exception as e:
             raise DataIntegrityError(
-                f"排序出錯，自動還原也失敗了（{e}）。排序前的完整資料保留在「{backup.title}」這個分頁，"
+                f"{action}出錯，自動還原也失敗了（{e}）。{action}前的完整資料保留在「{backup.title}」這個分頁，"
                 f"請不要刪掉它，可以從那裡複製回來，或用試算表的「檔案 → 版本記錄」還原。"
             )
         ss.del_worksheet(backup)
@@ -1066,6 +1070,133 @@ class SheetsStore:
             "item_name": r.get("掉落", ""), "amount": float(per_person),
             "paymaster": r.get("發錢的人", "").strip(),
         }
+
+    # 場次記錄 N、O、Q 三欄是公式（同場首筆、色碼、同場角色首筆），其他欄（含 P 發錢的人）都是資料
+    _SESSION_FORMULA_COLS = {13, 14, 16}   # 0 起算：N=13、O=14、Q=16
+
+    def list_sessions(self) -> list:
+        """
+        列出場次記錄裡所有場次（不含捐獻，捐獻沒有場次ID），最新的排最前面。給 /deletesession 的選單用。
+        [{"session_id", "date", "rows": 幾列, "members": [出席的人], "items": [寶物名稱],
+          "sold": 已賣出幾樣, "claimed": 已領幾筆}, ...]
+        """
+        sessions = {}
+        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
+            sid = r.get("場次ID", "").strip()
+            if not sid:
+                continue
+            info = sessions.setdefault(sid, {"session_id": sid, "date": _date_part(r.get("日期時間", "")),
+                                             "rows": 0, "members": [], "items": {}, "claimed": 0, "last_row": 0})
+            info["rows"] += 1
+            info["last_row"] = max(info["last_row"], r["_row"])
+            person = r.get("DC名稱", "").strip() or r.get("塔團", "").strip()
+            if person and person not in info["members"]:
+                info["members"].append(person)
+            item = r.get("掉落", "").strip()
+            if item and r.get("類型") != "出席":
+                key = (r.get("寶物編號", "").strip(), item)
+                info["items"][key] = info["items"].get(key, False) or bool(str(r.get("售出金額", "")).strip())
+            if str(r.get("已領", "")).strip().upper() == "TRUE":
+                info["claimed"] += 1
+        result = []
+        for info in sorted(sessions.values(), key=lambda x: x["last_row"], reverse=True):
+            items = info.pop("items")
+            info.pop("last_row")
+            info["items"] = [name for (_, name) in items]
+            info["sold"] = sum(1 for sold in items.values() if sold)
+            result.append(info)
+        return result
+
+    def delete_session(self, session_id: str, expected_rows: int) -> dict:
+        """
+        把一整場的所有列刪掉，後面的記錄自動往上補，不留空白（跟手動「刪除列」一樣）。
+
+        整個過程有保護：
+          1. 先核對這場的列數跟確認畫面上看到的一樣，不一樣代表中間有人改過資料，直接取消
+          2. 刪除前把整張「場次記錄」複製一份當備份
+          3. 所有要刪的列包在同一個請求裡送出，要嘛全部刪掉、要嘛全部不動
+          4. 刪完比對：其他每一列都還在、內容一字不差，而且這場一列都不剩
+          5. 重寫 N、O、Q 公式，確認沒有 #REF! 之類的錯誤
+          6. 任何一步出錯就從備份原封不動貼回去；全部通過才刪掉備份
+
+        回傳 {"ok": True, "deleted": 刪了幾列, "rows": [被刪掉的每一列內容]}
+        或 {"ok": False, "reason": 原因}（此時資料沒有被改動，或已經還原）。
+        """
+        if not session_id:
+            return {"ok": False, "reason": "沒有指定場次（捐獻的記錄不能用這個方式刪）"}
+        ss = self._ss()
+        ws = self.ws(SHEET_SESSIONS)
+        last_row = len(ws.col_values(2))   # B 欄＝日期時間，每一列都有
+        if last_row < 2:
+            return {"ok": False, "reason": "場次記錄是空的"}
+        width = ws.col_count
+        headers = ws.row_values(1)
+        data_range = f"A2:{_col_letter(width)}{last_row}"
+
+        def data_rows():
+            """[(列號, 整列內容), ...]，跳過整列都是空白的列。"""
+            rows = ws.get(data_range, maintain_size=True)
+            return [(i + 2, row) for i, row in enumerate(rows) if any(str(v).strip() for v in row)]
+
+        def data_key(row):
+            return tuple(v for i, v in enumerate(row) if i not in self._SESSION_FORMULA_COLS)
+
+        def data_snapshot() -> Counter:
+            return Counter(data_key(row) for _, row in data_rows())
+
+        before_rows = data_rows()
+        targets = [(n, row) for n, row in before_rows if str(row[0]).strip() == session_id]
+        if not targets:
+            return {"ok": False, "reason": f"找不到場次 {session_id}，可能已經被刪除了"}
+        if len(targets) != expected_rows:
+            return {"ok": False, "reason": (f"這場的資料在確認期間有變動（確認時是 {expected_rows} 列，現在是 "
+                                            f"{len(targets)} 列），為了安全沒有刪除，請重新操作一次")}
+        before = Counter(data_key(row) for _, row in before_rows)
+        expected_after = before - Counter(data_key(row) for _, row in targets)
+
+        # 連續的列合併成一段，從最下面那段開始刪，前面的列號才不會因為刪除而位移
+        target_nums = sorted(n for n, _ in targets)
+        spans = []
+        for n in target_nums:
+            if spans and n == spans[-1][1] + 1:
+                spans[-1][1] = n
+            else:
+                spans.append([n, n])
+        requests = [{"deleteDimension": {"range": {
+            "sheetId": ws.id, "dimension": "ROWS", "startIndex": a - 1, "endIndex": b}}}
+            for a, b in reversed(spans)]
+
+        backup = ss.duplicate_sheet(
+            ws.id, new_sheet_name=f"場次記錄_刪除前備份_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+        try:
+            ss.batch_update({"requests": requests})
+            after = data_snapshot()
+            if after != expected_after:
+                raise DataIntegrityError("刪除後的資料不一致（刪到別場的列，或有列不見、被改動）")
+            if any(str(row[0]).strip() == session_id for _, row in data_rows()):
+                raise DataIntegrityError("刪除後這場還有殘留的列")
+
+            new_last = len(ws.col_values(2))
+            if new_last >= 2:
+                for rng, makers in (
+                    (f"N2:O{new_last}", [_session_first_occurrence_formula, _session_color_formula]),
+                    (f"Q2:Q{new_last}", [_session_first_occurrence_by_char_formula]),
+                ):
+                    ws.update(rng, [[m(r) for m in makers] for r in range(2, new_last + 1)],
+                              value_input_option="USER_ENTERED")
+                    results = ws.get(rng, maintain_size=True)
+                    broken = [i + 2 for i, row in enumerate(results) if any(str(v).startswith("#") for v in row)]
+                    if broken:
+                        raise DataIntegrityError(f"刪除後公式計算出錯（第 {'、'.join(map(str, broken[:10]))} 列）")
+        except Exception as e:
+            reason = str(e) if isinstance(e, DataIntegrityError) else f"{type(e).__name__}: {e}"
+            self._restore_from_backup(ss, backup, ws, last_row, width, before, data_snapshot, action="刪除場次")
+            return {"ok": False, "reason": reason}
+
+        ss.del_worksheet(backup)
+        deleted = [dict(zip(headers, row)) for _, row in targets]
+        return {"ok": True, "deleted": len(targets), "rows": deleted}
 
     def sold_items_claim_status(self, session_id: str = None) -> list:
         """
