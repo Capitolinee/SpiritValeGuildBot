@@ -25,14 +25,14 @@ DEFAULT_DESCRIPTION = (
     "📝 **登記角色**：登記你的遊戲角色、職業、戰鬥位置（有多隻角色就每隻都點一次）\n"
     "🗑️ **刪除我的角色**：刪除登記錯、不再玩的角色\n"
     "🧑 **查看我的角色**：看自己登記了哪些角色\n"
-    "🕒 **設定可出席時間**：設定平日、假日能不能出席\n"
-    "💰 **領取分潤**：領取出團分到的錢"
+    "🕒 **設定可出席時間**：設定平日、假日能不能出席"
 )
 
 LOOT_TITLE = "💎 寶物結算"
 LOOT_DESCRIPTION = (
     "點下面的按鈕就能使用，畫面只有你自己看得到。\n\n"
     "💰 **賣掉寶物**：選一樣還沒結算的寶物，輸入賣出的金額，出席的人自動平分\n"
+    "💵 **領取分潤**：領取自己出團分到的錢\n"
     "🧾 **誰領了誰沒領**：選一樣已賣出的寶物，看誰已經領了、誰還沒領"
 )
 
@@ -225,19 +225,6 @@ class PanelView(discord.ui.View):
         await interaction.followup.send(view.status_text("用下面的選單修改，選好後按「💾 儲存」。"),
                                         view=view, ephemeral=True)
 
-    @discord.ui.button(label="領取分潤", emoji="💰", style=discord.ButtonStyle.success,
-                       custom_id="guildpanel:claim", row=1)
-    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        items = await asyncio.to_thread(self.bot.store.pending_items_for_user, str(interaction.user.id))
-        if not items:
-            await interaction.followup.send("目前沒有可領取的分潤。", ephemeral=True)
-            return
-        lines = "\n".join(claim_line(it) for it in items)
-        await interaction.followup.send(
-            f"你有 {len(items)} 筆待領，請選擇要領取哪一樣：\n```{lines}```",
-            view=ClaimSelectView(self.bot.store, interaction.user.id, items), ephemeral=True)
-
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         audit.error("公告按鈕發生錯誤", error, who=interaction.user.display_name)
         try:
@@ -267,6 +254,21 @@ class LootPanelView(discord.ui.View):
                                         view=SellSelectView(self.bot.store, interaction.user.id, items),
                                         ephemeral=True)
 
+    # 按鈕 ID 沿用 guildpanel:claim（這個按鈕原本在角色資料公告上）。
+    # 已經發出去的舊公告上還留著那顆按鈕，ID 一樣，按下去就會交給這裡處理，不會失效。
+    @discord.ui.button(label="領取分潤", emoji="💵", style=discord.ButtonStyle.success,
+                       custom_id="guildpanel:claim")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        items = await asyncio.to_thread(self.bot.store.pending_items_for_user, str(interaction.user.id))
+        if not items:
+            await interaction.followup.send("目前沒有可領取的分潤。", ephemeral=True)
+            return
+        lines = "\n".join(claim_line(it) for it in items)
+        await interaction.followup.send(
+            f"你有 {len(items)} 筆待領，請選擇要領取哪一樣：\n```{lines}```",
+            view=ClaimSelectView(self.bot.store, interaction.user.id, items), ephemeral=True)
+
     @discord.ui.button(label="誰領了誰沒領", emoji="🧾", style=discord.ButtonStyle.secondary,
                        custom_id="lootpanel:unclaimed")
     async def unclaimed(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -291,7 +293,7 @@ class LootPanelView(discord.ui.View):
 
 # /postpanel 可以發的公告種類：(按鈕畫面, 預設標題, 預設內容)
 PANELS = {
-    "角色與分潤": (PanelView, DEFAULT_TITLE, DEFAULT_DESCRIPTION),
+    "角色資料": (PanelView, DEFAULT_TITLE, DEFAULT_DESCRIPTION),
     "寶物結算": (LootPanelView, LOOT_TITLE, LOOT_DESCRIPTION),
 }
 
@@ -305,17 +307,17 @@ class Panel(commands.Cog):
         for view_cls, _, _ in PANELS.values():
             self.bot.add_view(view_cls(self.bot))
 
-    @commands.hybrid_command(name="postpanel", description="管理員：在頻道發一則附按鈕的公告（角色與分潤／寶物結算）")
+    @commands.hybrid_command(name="postpanel", description="管理員：在頻道發一則附按鈕的公告（角色資料／寶物結算）")
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
-        panel="要發哪一種公告（不填就是角色與分潤）",
+        panel="要發哪一種公告（不填就是角色資料）",
         channel="要發在哪個頻道（不填就發在目前這個頻道）",
         title="公告標題（不填就用預設）",
         description="公告內容（不填就用預設的按鈕說明）",
     )
-    async def post_panel(self, ctx, panel: Literal["角色與分潤", "寶物結算"] = "角色與分潤",
+    async def post_panel(self, ctx, panel: Literal["角色資料", "寶物結算"] = "角色資料",
                          channel: Optional[discord.TextChannel] = None,
                          title: Optional[str] = None, description: Optional[str] = None):
         """在指定頻道發一則附按鈕的公告。想放在其他頻道就去那邊再發一次；不要了直接刪掉那則訊息。"""
