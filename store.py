@@ -1074,48 +1074,74 @@ class SheetsStore:
     # 場次記錄 N、O、Q 三欄是公式（同場首筆、色碼、同場角色首筆），其他欄（含 P 發錢的人）都是資料
     _SESSION_FORMULA_COLS = {13, 14, 16}   # 0 起算：N=13、O=14、Q=16
 
-    def list_sessions(self) -> list:
+    def list_records(self, session_id: str = None) -> list:
         """
-        列出場次記錄裡所有場次（不含捐獻，捐獻沒有場次ID），最新的排最前面。給 /deletesession 的選單用。
-        [{"session_id", "date", "rows": 幾列, "members": [出席的人], "items": [寶物名稱],
-          "sold": 已賣出幾樣, "claimed": 已領幾筆}, ...]
+        列出場次記錄裡可以刪除的項目，給 /deletesession 的選單用。最新的排最前面。
+        每一樣寶物一個項目（場次ID＋寶物編號＋掉落）；只有出席、沒有寶物的場次，出席列另外一個項目。
+        捐獻（沒有場次ID）不列出。session_id 有給的話只列那一場。
+
+        [{"key", "session_id", "date", "kind": "item" 或 "attendance", "item_index", "item_name",
+          "rows": 幾列, "people": [誰], "claimed": 已領幾人, "unclaimed": 未領幾人, "sold": 是否已賣出,
+          "last_item": 刪掉之後這場是不是就沒有任何記錄了（出席也會一起消失）}, ...]
         """
-        sessions = {}
+        entries, per_session = {}, {}
         for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
             sid = r.get("場次ID", "").strip()
-            if not sid:
+            if not sid or (session_id is not None and sid != session_id):
                 continue
-            info = sessions.setdefault(sid, {"session_id": sid, "date": _date_part(r.get("日期時間", "")),
-                                             "rows": 0, "members": [], "items": {}, "claimed": 0, "last_row": 0})
-            info["rows"] += 1
-            info["last_row"] = max(info["last_row"], r["_row"])
+            if r.get("類型") == "出席":
+                kind, idx, name = "attendance", "", "出席記錄"
+            elif r.get("掉落", "").strip():
+                kind, idx, name = "item", r.get("寶物編號", "").strip(), r.get("掉落", "").strip()
+            else:
+                continue
+            key = f"{sid}|{kind}|{idx}|{name}"
+            e = entries.setdefault(key, {
+                "key": key, "session_id": sid, "date": _date_part(r.get("日期時間", "")), "kind": kind,
+                "item_index": idx, "item_name": name, "rows": 0, "people": [], "claimed": 0, "unclaimed": 0,
+                "sold": False, "last_row": 0,
+            })
+            e["rows"] += 1
+            e["last_row"] = max(e["last_row"], r["_row"])
             person = r.get("DC名稱", "").strip() or r.get("塔團", "").strip()
-            if person and person not in info["members"]:
-                info["members"].append(person)
-            item = r.get("掉落", "").strip()
-            if item and r.get("類型") != "出席":
-                key = (r.get("寶物編號", "").strip(), item)
-                info["items"][key] = info["items"].get(key, False) or bool(str(r.get("售出金額", "")).strip())
-            if str(r.get("已領", "")).strip().upper() == "TRUE":
-                info["claimed"] += 1
-        result = []
-        for info in sorted(sessions.values(), key=lambda x: x["last_row"], reverse=True):
-            items = info.pop("items")
-            info.pop("last_row")
-            info["items"] = [name for (_, name) in items]
-            info["sold"] = sum(1 for sold in items.values() if sold)
-            result.append(info)
+            if person:
+                e["people"].append(person)
+            if str(r.get("售出金額", "")).strip():
+                e["sold"] = True
+            if r.get("類型") == "分潤":
+                if str(r.get("已領", "")).strip().upper() == "TRUE":
+                    e["claimed"] += 1
+                else:
+                    e["unclaimed"] += 1
+            per_session.setdefault(sid, set()).add(key)
+
+        result = sorted(entries.values(), key=lambda x: x["last_row"], reverse=True)
+        seen = {}
+        for e in result:
+            e["last_item"] = len(per_session[e["session_id"]]) == 1
+            # 同一場有兩樣同名的寶物（例如掉了兩張死靈卡），第二個起加上（2）（3）區分
+            label_key = (e["session_id"], e["item_name"])
+            seen[label_key] = seen.get(label_key, 0) + 1
+        counts = dict(seen)
+        order = {}
+        for e in reversed(result):   # 從最舊的開始編號，比較直覺
+            label_key = (e["session_id"], e["item_name"])
+            order[label_key] = order.get(label_key, 0) + 1
+            e["dup_no"] = order[label_key] if counts[label_key] > 1 else 0
+            e.pop("last_row", None)
         return result
 
-    def delete_session(self, session_id: str, expected_rows: int) -> dict:
+    def delete_record(self, session_id: str, kind: str, item_index: str, item_name: str,
+                      expected_rows: int) -> dict:
         """
-        把一整場的所有列刪掉，後面的記錄自動往上補，不留空白（跟手動「刪除列」一樣）。
+        刪除一筆記錄：一樣寶物（場次ID＋寶物編號＋掉落）的所有列，或一場的出席列。
+        其他寶物、其他場次都不會動到。刪除後後面的記錄自動往上補，不留空白（跟手動「刪除列」一樣）。
 
         整個過程有保護：
-          1. 先核對這場的列數跟確認畫面上看到的一樣，不一樣代表中間有人改過資料，直接取消
+          1. 先核對列數跟確認畫面上看到的一樣，不一樣代表中間有人改過資料，直接取消
           2. 刪除前把整張「場次記錄」複製一份當備份
           3. 所有要刪的列包在同一個請求裡送出，要嘛全部刪掉、要嘛全部不動
-          4. 刪完比對：其他每一列都還在、內容一字不差，而且這場一列都不剩
+          4. 刪完比對：其他每一列都還在、內容一字不差，而且要刪的列一列都不剩
           5. 重寫 N、O、Q 公式，確認沒有 #REF! 之類的錯誤
           6. 任何一步出錯就從備份原封不動貼回去；全部通過才刪掉備份
 
@@ -1124,6 +1150,16 @@ class SheetsStore:
         """
         if not session_id:
             return {"ok": False, "reason": "沒有指定場次（捐獻的記錄不能用這個方式刪）"}
+
+        def is_target(row) -> bool:
+            if str(row[0]).strip() != session_id:          # A 場次ID
+                return False
+            if kind == "attendance":
+                return str(row[7]).strip() == "出席"       # H 類型
+            return (str(row[7]).strip() != "出席"
+                    and str(row[6]).strip() == item_index   # G 寶物編號
+                    and str(row[5]).strip() == item_name)   # F 掉落
+
         ss = self._ss()
         ws = self.ws(SHEET_SESSIONS)
         last_row = len(ws.col_values(2))   # B 欄＝日期時間，每一列都有
@@ -1145,11 +1181,11 @@ class SheetsStore:
             return Counter(data_key(row) for _, row in data_rows())
 
         before_rows = data_rows()
-        targets = [(n, row) for n, row in before_rows if str(row[0]).strip() == session_id]
+        targets = [(n, row) for n, row in before_rows if is_target(row)]
         if not targets:
-            return {"ok": False, "reason": f"找不到場次 {session_id}，可能已經被刪除了"}
+            return {"ok": False, "reason": f"找不到這筆記錄（{session_id} {item_name}），可能已經被刪除了"}
         if len(targets) != expected_rows:
-            return {"ok": False, "reason": (f"這場的資料在確認期間有變動（確認時是 {expected_rows} 列，現在是 "
+            return {"ok": False, "reason": (f"這筆記錄在確認期間有變動（確認時是 {expected_rows} 列，現在是 "
                                             f"{len(targets)} 列），為了安全沒有刪除，請重新操作一次")}
         before = Counter(data_key(row) for _, row in before_rows)
         expected_after = before - Counter(data_key(row) for _, row in targets)
@@ -1174,8 +1210,8 @@ class SheetsStore:
             after = data_snapshot()
             if after != expected_after:
                 raise DataIntegrityError("刪除後的資料不一致（刪到別場的列，或有列不見、被改動）")
-            if any(str(row[0]).strip() == session_id for _, row in data_rows()):
-                raise DataIntegrityError("刪除後這場還有殘留的列")
+            if any(is_target(row) for _, row in data_rows()):
+                raise DataIntegrityError("刪除後還有殘留的列")
 
             new_last = len(ws.col_values(2))
             if new_last >= 2:
@@ -1191,7 +1227,7 @@ class SheetsStore:
                         raise DataIntegrityError(f"刪除後公式計算出錯（第 {'、'.join(map(str, broken[:10]))} 列）")
         except Exception as e:
             reason = str(e) if isinstance(e, DataIntegrityError) else f"{type(e).__name__}: {e}"
-            self._restore_from_backup(ss, backup, ws, last_row, width, before, data_snapshot, action="刪除場次")
+            self._restore_from_backup(ss, backup, ws, last_row, width, before, data_snapshot, action="刪除記錄")
             return {"ok": False, "reason": reason}
 
         ss.del_worksheet(backup)
