@@ -593,6 +593,27 @@ def claim_line(item: dict) -> str:
     return f"{head} {item.get('item_name', '')}：+{item.get('amount', 0):.0f}"
 
 
+def claim_result_text(items: list) -> str:
+    """
+    /claim 領取成功的訊息：依「發錢的人」分組，直接告訴領錢的人要找誰、各拿多少。
+    沒有指定發錢的人的（用 /item 手動記錄的寶物），放在最後面另外提醒。
+    """
+    groups = {}
+    for it in items:
+        groups.setdefault(it.get("paymaster") or "", []).append(it)
+    order = [k for k in groups if k] + ([""] if "" in groups else [])  # 未指定的排最後
+
+    total = sum(it["amount"] for it in items)
+    parts = [f"✅ 已領取，共 **{total:.0f}**："]
+    for payer in order:
+        group = groups[payer]
+        subtotal = sum(it["amount"] for it in group)
+        head = (f"💰 找 **{payer}** 拿 **{subtotal:.0f}**" if payer
+                else f"⚠️ 沒有指定發錢的人 **{subtotal:.0f}**（請找幹部確認）")
+        parts.append(f"\n{head}\n```{chr(10).join(claim_line(it) for it in group)}```")
+    return "\n".join(parts)
+
+
 class ClaimSelect(discord.ui.Select):
     def __init__(self, store, author_id: int, items: list):
         self.store = store
@@ -602,7 +623,10 @@ class ClaimSelect(discord.ui.Select):
         for it in items[:24]:
             key = str(it["row"])
             self.items[key] = it
-            options.append(discord.SelectOption(label=claim_line(it)[:100], value=key))
+            options.append(discord.SelectOption(
+                label=claim_line(it)[:100], value=key,
+                description=f"發錢：{it.get('paymaster') or '未指定'}"[:100],
+            ))
         if len(items) > 1:  # 只有一筆的話，「全部一起領取」就是那一筆，不重複列出
             options.append(discord.SelectOption(label="✅ 全部一起領取", value="__ALL__"))
         super().__init__(placeholder="選擇要領取哪一樣", options=options, min_values=1, max_values=1)
@@ -621,15 +645,12 @@ class ClaimSelect(discord.ui.Select):
             if not result["details"]:
                 await interaction.edit_original_response(content="沒有可領取的分潤了（可能剛被領過）。", view=None)
                 return
-            detail_text = "\n".join(claim_line(it) for it in result["items"])
             audit.audit(
                 "領取分潤", who=interaction.user.display_name,
                 detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
                     f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
             )
-            await interaction.edit_original_response(
-                content=f"✅ 已領取，共 **{result['total']:.0f}**：\n```{detail_text}```", view=None
-            )
+            await interaction.edit_original_response(content=claim_result_text(result["items"]), view=None)
             return
 
         item = self.items[chosen]
@@ -644,7 +665,7 @@ class ClaimSelect(discord.ui.Select):
             detail=f"{result['session_id'] or '捐獻寶物'} {result['item_name']} {result['amount']:.2f}",
         )
         await interaction.edit_original_response(
-            content=f"✅ 已領取：\n```{claim_line(result)}```", view=None
+            content=claim_result_text([result]), view=None
         )
 
 
@@ -1052,13 +1073,12 @@ class Sessions(commands.Cog):
             if not result["details"]:
                 await ctx.send(f"場次 `{session_id}` 沒有可領取的分潤。", ephemeral=True)
                 return
-            detail_text = "\n".join(claim_line(it) for it in result["items"])
             audit.audit(
                 "領取分潤", who=ctx.author.display_name,
                 detail=f"共 {result['total']:.2f}｜{len(result['details'])} 筆｜" + "；".join(
                     f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
             )
-            await ctx.send(f"✅ 已領取，共 **{result['total']:.0f}**：\n```{detail_text}```", ephemeral=True)
+            await ctx.send(claim_result_text(result["items"]), ephemeral=True)
             return
 
         items = await asyncio.to_thread(self.store.pending_items_for_user, uid)
