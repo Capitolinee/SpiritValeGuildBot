@@ -639,6 +639,22 @@ class SheetsStore:
         self.delete_row(SHEET_CHARACTERS, target["_row"])
         return {**target, "sort": self.sort_characters()}
 
+    def delete_character_by_name(self, discord_id: str, char_name: str):
+        """
+        用「角色名稱」刪除自己名下的某隻角色（給公告按鈕用）。
+        不用編號，是因為角色資料會自動排序，查到編號之後、按下刪除之前如果剛好有人登記新角色，
+        順序可能改變，用編號就會刪到別隻；用名字刪，刪的一定是選的那一隻。
+        只會刪這個帳號名下的角色，別人同名的角色不會動到。找不到回傳 None。
+        """
+        key = normalize_name(char_name)
+        matches = [c for c in self.get_user_characters(discord_id)
+                   if normalize_name(c.get("角色名稱", "")) == key]
+        if len(matches) != 1:
+            return None
+        target = matches[0]
+        self.delete_row(SHEET_CHARACTERS, target["_row"])
+        return {**target, "sort": self.sort_characters()}
+
     def ensure_account_row(self, discord_id: str, display_name: str):
         """確保帳號基本資料表裡有這個 Discord ID 的列，沒有就新增一列（可出席時間留空）。"""
         rows = self.get_rows(SHEET_ACCOUNTS)
