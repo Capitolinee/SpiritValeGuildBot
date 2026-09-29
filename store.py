@@ -159,6 +159,12 @@ def _session_color_formula(row: int) -> str:
     )
 
 
+def _date_part(value) -> str:
+    """場次記錄「日期時間」欄只取日期部分，例如 2026/09/26 15:39:53 → 2026/09/26。"""
+    text = str(value or "").strip()
+    return text.split()[0] if text else ""
+
+
 class DataIntegrityError(Exception):
     """排序或寫入公式之後，檢查發現資料不一致或公式出錯。"""
 
@@ -950,6 +956,7 @@ class SheetsStore:
         now = now_str()
         total = 0.0
         details = []
+        items = []
         updates = []
         for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
             if r.get("類型") != "分潤":
@@ -967,10 +974,12 @@ class SheetsStore:
             amt = float(per_person)
             total += amt
             details.append((r.get("場次ID", ""), r.get("掉落", ""), amt))
+            items.append({"session_id": r.get("場次ID", ""), "date": _date_part(r.get("日期時間", "")),
+                          "item_name": r.get("掉落", ""), "amount": amt})
 
         if updates:
             self.batch_update_cells(SHEET_SESSIONS, updates)
-        return {"total": total, "details": details}
+        return {"total": total, "details": details, "items": items}
 
     def pending_for_user(self, discord_id: str) -> dict:
         total = 0.0
@@ -1000,7 +1009,7 @@ class SheetsStore:
     def pending_items_for_user(self, discord_id: str) -> list:
         """
         回傳這個人每一筆待領（以「每一樣寶物」為單位，不是以場次為單位）。
-        [{"row": 列號, "session_id":..., "item_name":..., "amount":...}, ...]
+        [{"row": 列號, "session_id":..., "date": 日期, "item_name":..., "amount":...}, ...]
         row 是這一列在「場次記錄」表的實際列號，用來精確指定要領哪一筆。
         """
         items = []
@@ -1017,6 +1026,7 @@ class SheetsStore:
             items.append({
                 "row": r["_row"],
                 "session_id": r.get("場次ID", ""),
+                "date": _date_part(r.get("日期時間", "")),
                 "item_name": r.get("掉落", ""),
                 "amount": float(per_person),
             })
@@ -1042,7 +1052,7 @@ class SheetsStore:
         now = now_str()
         self.batch_update_cells(SHEET_SESSIONS, [(row, 12, [True, now])])
         return {
-            "ok": True, "session_id": r.get("場次ID", ""),
+            "ok": True, "session_id": r.get("場次ID", ""), "date": _date_part(r.get("日期時間", "")),
             "item_name": r.get("掉落", ""), "amount": float(per_person),
         }
 
