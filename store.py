@@ -983,7 +983,8 @@ class SheetsStore:
             total += amt
             details.append((r.get("場次ID", ""), r.get("掉落", ""), amt))
             items.append({"session_id": r.get("場次ID", ""), "date": _date_part(r.get("日期時間", "")),
-                          "item_name": r.get("掉落", ""), "amount": amt})
+                          "item_name": r.get("掉落", ""), "amount": amt,
+                          "paymaster": r.get("發錢的人", "").strip()})
 
         if updates:
             self.batch_update_cells(SHEET_SESSIONS, updates)
@@ -1017,7 +1018,7 @@ class SheetsStore:
     def pending_items_for_user(self, discord_id: str) -> list:
         """
         回傳這個人每一筆待領（以「每一樣寶物」為單位，不是以場次為單位）。
-        [{"row": 列號, "session_id":..., "date": 日期, "item_name":..., "amount":...}, ...]
+        [{"row": 列號, "session_id":..., "date": 日期, "item_name":..., "amount":..., "paymaster": 發錢的人}, ...]
         row 是這一列在「場次記錄」表的實際列號，用來精確指定要領哪一筆。
         """
         items = []
@@ -1037,6 +1038,7 @@ class SheetsStore:
                 "date": _date_part(r.get("日期時間", "")),
                 "item_name": r.get("掉落", ""),
                 "amount": float(per_person),
+                "paymaster": r.get("發錢的人", "").strip(),
             })
         return items
 
@@ -1062,6 +1064,7 @@ class SheetsStore:
         return {
             "ok": True, "session_id": r.get("場次ID", ""), "date": _date_part(r.get("日期時間", "")),
             "item_name": r.get("掉落", ""), "amount": float(per_person),
+            "paymaster": r.get("發錢的人", "").strip(),
         }
 
     def sold_items_claim_status(self, session_id: str = None) -> list:
