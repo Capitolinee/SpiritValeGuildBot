@@ -45,6 +45,7 @@ HELP_SECTIONS = [
         ("/viewlogs", "直接在 Discord 讀取稽核/錯誤記錄（需管理權限）"),
         ("/checkprofiles", "檢查每隻角色的帳號是否對得上伺服器成員（需管理權限）"),
         ("/fixprofile", "把對錯人的角色改到正確的成員名下（需管理權限）"),
+        ("/deletesession", "整場刪除登記錯的場次，會先確認、自動備份與檢查（需管理權限）"),
         ("/repairformulas", "重寫所有統計公式、依 Discord ID 排序角色資料，出現 #REF! 時用（需管理權限）"),
         ("/setthreadrules　/clearthreadrules", "限制／解除這個討論串能用的指令（需管理權限）"),
         ("/setforumrules　/clearforumrules", "限制／解除整個論壇能用的指令（需管理權限）"),
