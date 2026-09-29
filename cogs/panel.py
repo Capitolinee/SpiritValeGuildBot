@@ -16,12 +16,14 @@ from discord.ext import commands
 
 import audit
 from cogs.profiles import NameModal
+from helpers import sort_warning
 from cogs.sessions import ClaimSelectView, claim_line
 
 DEFAULT_TITLE = "📋 公會常用功能"
 DEFAULT_DESCRIPTION = (
     "點下面的按鈕就能使用，畫面只有你自己看得到。\n\n"
     "📝 **登記角色**：登記你的遊戲角色、職業、戰鬥位置（有多隻角色就每隻都點一次）\n"
+    "🗑️ **刪除我的角色**：刪除登記錯、不再玩的角色\n"
     "🧑 **查看我的角色**：看自己登記了哪些角色\n"
     "🕒 **設定可出席時間**：設定平日、假日能不能出席\n"
     "💰 **領取分潤**：領取出團分到的錢"
@@ -104,7 +106,69 @@ class AvailabilityView(discord.ui.View):
         await interaction.response.send_modal(AvailabilityNoteModal(self))
 
 
-# ---------- 公告上的四個按鈕（永久型） ----------
+# ---------- 🗑️ 刪除我的角色：先選角色，再確認 ----------
+
+def _char_label(c: dict) -> str:
+    return f"{c.get('角色名稱')}（{c.get('職業') or '未設定職業'}）" + (f"｜{c.get('位置')}" if c.get("位置") else "")
+
+
+class DeleteCharacterConfirmView(discord.ui.View):
+    def __init__(self, bot, user_id: int, char: dict):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_id = user_id
+        self.char = char
+
+    @discord.ui.button(label="🗑️ 確認刪除", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        store = self.bot.store
+        async with store.lock:
+            removed = await asyncio.to_thread(
+                store.delete_character_by_name, str(interaction.user.id), self.char.get("角色名稱", ""))
+        if not removed:
+            await interaction.edit_original_response(
+                content="⚠️ 找不到這隻角色，可能已經被刪除了。沒有刪除任何資料。", view=None)
+            self.stop()
+            return
+        audit.audit("刪除角色（按鈕）", who=interaction.user.display_name,
+                    detail=f"角色 {removed.get('角色名稱')}（{removed.get('職業')}）")
+        await interaction.edit_original_response(
+            content=f"🗑️ 已刪除角色：{_char_label(removed)}" + sort_warning(removed.get("sort")), view=None)
+        self.stop()
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="已取消，沒有刪除任何資料。", view=None)
+        self.stop()
+
+
+class CharacterPickSelect(discord.ui.Select):
+    """選自己的一隻角色，接著顯示確認刪除。"""
+
+    def __init__(self, bot, chars: list):
+        self.bot = bot
+        # 用角色名稱當選項的值，不用列號或編號（角色資料會自動排序，列號、編號都可能變）
+        self.chars = {c.get("角色名稱", "")[:100]: c for c in chars[:25]}
+        options = [discord.SelectOption(label=_char_label(c)[:100], value=c.get("角色名稱", "")[:100])
+                   for c in chars[:25]]
+        super().__init__(placeholder="選擇要刪除的角色", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        char = self.chars[self.values[0]]
+        await interaction.response.edit_message(
+            content=(f"**🗑️ 確定要刪除這隻角色嗎？**\n{_char_label(char)}\n\n"
+                     f"過去的出團、分潤記錄**不會**被刪除，之後重新登記同名角色，統計就會恢復。"),
+            view=DeleteCharacterConfirmView(self.bot, interaction.user.id, char))
+
+
+class CharacterPickView(discord.ui.View):
+    def __init__(self, bot, chars: list):
+        super().__init__(timeout=180)
+        self.add_item(CharacterPickSelect(bot, chars))
+
+
+# ---------- 公告上的按鈕（永久型） ----------
 
 class PanelView(discord.ui.View):
     """
@@ -117,12 +181,23 @@ class PanelView(discord.ui.View):
         self.bot = bot
 
     @discord.ui.button(label="登記角色", emoji="📝", style=discord.ButtonStyle.primary,
-                       custom_id="guildpanel:profile")
+                       custom_id="guildpanel:profile", row=0)
     async def profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(NameModal(self.bot.store))
 
+    @discord.ui.button(label="刪除我的角色", emoji="🗑️", style=discord.ButtonStyle.danger,
+                       custom_id="guildpanel:delprofile", row=0)
+    async def delete_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        chars = await asyncio.to_thread(self.bot.store.get_user_characters, str(interaction.user.id))
+        if not chars:
+            await interaction.followup.send("你還沒有登記任何角色，點「📝 登記角色」開始登記。", ephemeral=True)
+            return
+        await interaction.followup.send("請選擇要刪除的角色：", view=CharacterPickView(self.bot, chars),
+                                        ephemeral=True)
+
     @discord.ui.button(label="查看我的角色", emoji="🧑", style=discord.ButtonStyle.secondary,
-                       custom_id="guildpanel:myprofiles")
+                       custom_id="guildpanel:myprofiles", row=1)
     async def my_profiles(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         chars = await asyncio.to_thread(self.bot.store.get_user_characters, str(interaction.user.id))
@@ -134,7 +209,7 @@ class PanelView(discord.ui.View):
         await interaction.followup.send("**🧑 你目前的角色：**\n```" + "\n".join(lines) + "```", ephemeral=True)
 
     @discord.ui.button(label="設定可出席時間", emoji="🕒", style=discord.ButtonStyle.secondary,
-                       custom_id="guildpanel:availability")
+                       custom_id="guildpanel:availability", row=1)
     async def availability(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         stats = await asyncio.to_thread(self.bot.store.get_account_stats, str(interaction.user.id))
@@ -144,7 +219,7 @@ class PanelView(discord.ui.View):
                                         view=view, ephemeral=True)
 
     @discord.ui.button(label="領取分潤", emoji="💰", style=discord.ButtonStyle.success,
-                       custom_id="guildpanel:claim")
+                       custom_id="guildpanel:claim", row=1)
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         items = await asyncio.to_thread(self.bot.store.pending_items_for_user, str(interaction.user.id))
