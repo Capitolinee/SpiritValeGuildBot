@@ -2,7 +2,7 @@ import asyncio
 import io
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Literal
+from typing import Literal, Optional
 
 import discord
 from discord import app_commands
@@ -37,6 +37,16 @@ class AccessControl(commands.Cog):
             )
         except Exception as e:
             print(f"⚠️ 載入頻道規則失敗：{e}", flush=True)
+
+        # 圖片辨識頻道：放在 bot 上，圖片辨識那邊直接讀，不用每張圖都去讀試算表
+        self.bot.ocr_channels = set()
+        try:
+            self.bot.ocr_channels = await asyncio.to_thread(self.store.get_ocr_channels)
+            state = (f"只辨識 {len(self.bot.ocr_channels)} 個指定頻道的圖片" if self.bot.ocr_channels
+                     else "還沒有設定辨識頻道，所有頻道的圖片都會辨識")
+            print(f"✅ 圖片辨識：{state}", flush=True)
+        except Exception as e:
+            print(f"⚠️ 載入圖片辨識頻道失敗（先維持所有頻道都辨識）：{e}", flush=True)
 
         @self.bot.check
         async def restrict_by_forum(ctx):
@@ -154,6 +164,60 @@ class AccessControl(commands.Cog):
             await ctx.send("這個論壇目前沒有預設規則。", ephemeral=True)
             return
         await ctx.send(f"這個論壇的預設規則：{', '.join(allowed)}", ephemeral=True)
+
+    @commands.hybrid_command(name="ocrchannel", description="設定哪些頻道的圖片要辨識（省 Gemini 額度，需管理權限）")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        action="開啟＝這個頻道的圖片要辨識，關閉＝不辨識，查看＝列出目前設定",
+        channel="要設定的頻道（不填就是目前這個頻道；論壇的話底下每篇貼文都算）",
+    )
+    async def ocr_channel(self, ctx, action: Literal["開啟", "關閉", "查看"],
+                          channel: Optional[discord.abc.GuildChannel] = None):
+        """
+        設定哪些頻道的圖片會送去 Gemini 辨識。
+        完全沒設定任何頻道時，所有頻道都辨識；設定了至少一個之後，只辨識那些頻道。
+        """
+        await ctx.defer(ephemeral=True)
+        target = channel or ctx.channel
+        # 在論壇貼文（討論串）裡打的話，設定的是整個論壇
+        if channel is None and getattr(target, "parent", None) is not None:
+            target = target.parent
+
+        if action == "查看":
+            if not self.bot.ocr_channels:
+                await ctx.send("目前**沒有設定**辨識頻道，所以**所有頻道**的圖片都會辨識。\n"
+                               "用 `/ocrchannel action:開啟` 在出團頻道開啟之後，就只會辨識那些頻道。", ephemeral=True)
+                return
+            names = []
+            for cid in sorted(self.bot.ocr_channels):
+                ch = self.bot.get_channel(int(cid)) if cid.isdigit() else None
+                names.append(ch.mention if ch else f"（找不到的頻道 {cid}）")
+            await ctx.send("**📸 只有這些頻道的圖片會辨識：**\n" + "\n".join(names), ephemeral=True)
+            return
+
+        cid = str(target.id)
+        async with self.store.lock:
+            if action == "開啟":
+                changed = await asyncio.to_thread(self.store.add_ocr_channel, cid)
+                if changed:
+                    self.bot.ocr_channels.add(cid)
+            else:
+                changed = await asyncio.to_thread(self.store.remove_ocr_channel, cid)
+                if changed:
+                    self.bot.ocr_channels.discard(cid)
+        if changed:
+            audit.audit(f"圖片辨識頻道{action}", who=ctx.author.display_name, detail=f"#{target.name}")
+
+        if action == "開啟":
+            msg = (f"✅ {target.mention} 的圖片會辨識。" if changed else f"{target.mention} 本來就有開啟辨識。")
+            msg += f"\n現在只有 {len(self.bot.ocr_channels)} 個頻道的圖片會辨識，其他頻道的圖片機器人會忽略。"
+        else:
+            msg = (f"✅ {target.mention} 的圖片不再辨識。" if changed else f"{target.mention} 本來就沒有開啟辨識。")
+            if not self.bot.ocr_channels:
+                msg += "\n⚠️ 現在一個辨識頻道都沒有了，所以會變回**所有頻道**的圖片都辨識。"
+        await ctx.send(msg, ephemeral=True)
 
     @commands.hybrid_command(name="repairformulas", description="重寫所有統計公式並依 Discord ID 排序角色資料，修好 #REF!（需管理權限）")
     @commands.has_permissions(manage_guild=True)

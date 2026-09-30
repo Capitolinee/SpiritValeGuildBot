@@ -8,7 +8,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.jobs import get_tier1_jobs, get_children_jobs
-from helpers import resolve_display_name, sort_warning
+from helpers import resolve_display_name, sort_warning, schedule_character_sort
+from store import looks_corrupted_id
 import audit
 
 
@@ -48,6 +49,8 @@ async def finalize_profile(store, interaction: discord.Interaction, name: str, j
 
     async with store.lock:
         result = await asyncio.to_thread(store.upsert_character, user_id, display_name, name, job, position)
+    if result["status"] == "created":
+        schedule_character_sort(interaction.client)  # 延後排序，很多人同時登記也只排一次
 
     created = result["status"] == "created"
     desc = f"名字：**{name}**\n職業：**{job}**"
@@ -250,6 +253,7 @@ class Profiles(commands.Cog):
         if not removed:
             await ctx.send(f"⚠️ 編號 {index} 不存在，請先用 /myprofiles 確認編號。", ephemeral=True)
             return
+        schedule_character_sort(self.bot)
         audit.audit(
             "刪除角色", who=ctx.author.display_name,
             detail=f"角色 {removed.get('角色名稱')}（{removed.get('職業')}）",
@@ -322,7 +326,7 @@ class Profiles(commands.Cog):
         for raw_id, names in by_id.items():
             label = "、".join(names)
             sid = raw_id.strip()
-            if not re.fullmatch(r"[0-9]{17,20}", sid):
+            if not re.fullmatch(r"[0-9]{17,20}", sid):   # 格式根本不對（例如 5.36582E+17）
                 problems.append(f"❌ {label}\n　ID 格式不對：{raw_id!r}（{len(raw_id)} 個字元），ID 已經被改壞了")
                 continue
             if ctx.guild.get_member(int(sid)):
@@ -347,7 +351,7 @@ class Profiles(commands.Cog):
             except discord.HTTPException as e:
                 reason = f"查詢帳號失敗（HTTP {e.status}）"
             # 被試算表改壞的 ID 只保留前 15 位，後面全部變成 0（18 位數 → 最後 3 位是 0）
-            if sid.endswith("0" * (len(sid) - 15)):
+            if looks_corrupted_id(sid):   # 後面幾位都是 0，被試算表改壞的典型樣子
                 reason += "\n　ID 後面幾位都是 0，這是被試算表改壞的典型樣子"
             problems.append(f"❌ {label}：{sid}\n　{reason}")
 
@@ -359,6 +363,27 @@ class Profiles(commands.Cog):
             lines.append(f"（其中 {len(cache_miss)} 個機器人的成員快取裡沒有、但直接查得到：{'、'.join(cache_miss)}）")
         if problems:
             lines += ["", *problems, "", "要把某隻角色改到正確的人名下，用 /fixprofile。"]
+
+        # 另外兩張表：在修好「ID 存成文字」之前寫進去的列，ID 也可能被改壞
+        others = await asyncio.to_thread(self.store.find_corrupted_ids)
+        bad_sessions, bad_accounts = others["場次記錄"], others["帳號基本資料"]
+        lines += ["", "【場次記錄、帳號基本資料的 ID 檢查】"]
+        if not bad_sessions and not bad_accounts:
+            lines.append("✅ 沒有發現被改壞的 ID")
+        if bad_sessions:
+            by_char = {}
+            for row, char, _ in bad_sessions:
+                by_char.setdefault(char, []).append(row)
+            lines.append(f"❌ 場次記錄有 {len(bad_sessions)} 列的 ID 被改壞，這些列的分潤主人領不到：")
+            for char, rows in by_char.items():
+                shown = "、".join(map(str, rows[:8])) + ("…" if len(rows) > 8 else "")
+                lines.append(f"　{char}：第 {shown} 列")
+            lines.append("　→ 用 /fixprofile 選這隻角色和他的主人，這些列會一起修好")
+        if bad_accounts:
+            lines.append(f"❌ 帳號基本資料有 {len(bad_accounts)} 列的 ID 被改壞：")
+            for row, name, _ in bad_accounts[:10]:
+                lines.append(f"　第 {row} 列：{name}")
+            lines.append("　→ 先用 /fixprofile 修好他的角色（會建立正確的帳號列），再手動刪掉這些舊的列")
         text = "\n".join(lines)
         if len(text) <= 1900:
             await ctx.send(f"```{text}```", ephemeral=True)

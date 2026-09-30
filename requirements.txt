@@ -1,5 +1,7 @@
-discord.py
-google-genai
-gspread
-google-auth
-requests
+# 版本範圍：最低是實際測試過的版本，最高不超過下一個大版本。
+# 部署時還是會裝到小版本的錯誤修正，但不會自動跳到可能改掉用法的大改版。
+discord.py>=2.7.1,<3
+google-genai>=2.25.0,<3    # 圖片辨識用的 interactions 功能需要比較新的版本
+gspread>=6.2.1,<7          # 讀寫 Google 試算表；程式有沿用 gspread 6 版的內部寫法
+google-auth>=2.59.0,<3
+requests>=2.33.1,<3        # gspread 連線用

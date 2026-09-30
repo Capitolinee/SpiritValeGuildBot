@@ -16,7 +16,7 @@ from discord.ext import commands
 
 import audit
 from cogs.profiles import NameModal
-from helpers import sort_warning
+from helpers import sort_warning, schedule_character_sort
 from cogs.sessions import ClaimSelectView, claim_line, SellSelectView, UnclaimedView
 
 DEFAULT_TITLE = "📋 公會常用功能"
@@ -138,6 +138,7 @@ class DeleteCharacterConfirmView(discord.ui.View):
                 content="⚠️ 找不到這隻角色，可能已經被刪除了。沒有刪除任何資料。", view=None)
             self.stop()
             return
+        schedule_character_sort(self.bot)
         audit.audit("刪除角色（按鈕）", who=interaction.user.display_name,
                     detail=f"角色 {removed.get('角色名稱')}（{removed.get('職業')}）")
         await interaction.edit_original_response(

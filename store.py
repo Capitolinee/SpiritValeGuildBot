@@ -12,7 +12,11 @@ Google Sheets 儲存層。
 職業管理：   A職業名稱 B轉職層級 C承接自 D圖片網址 E位置名稱(跟職業各自獨立管理)
 帳號基本資料：A DiscordID(隱藏) B顯示名稱 C平日可出席 D假日可出席 E其他時間備註
              F出席次數(公式) G分潤總額(公式) H已領總額(公式) I待領總額(公式)
-系統設定：   A頻道/討論串ID B允許指令(逗號分隔)（機器人第一次用到時自動建立）
+
+以下三張機器人第一次用到時會自動建立，不用手動建：
+系統設定：   A頻道/討論串ID B允許指令(逗號分隔)（/setthreadrules、/setforumrules 的設定）
+辨識頻道：   A頻道ID（/ocrchannel 開啟的頻道；完全沒設定時所有頻道的圖片都辨識）
+系統狀態：   A項目 B內容（進行中的場次，機器人重啟後接回來用，請不要手動修改）
 """
 import os
 import re
@@ -159,6 +163,20 @@ def _session_color_formula(row: int) -> str:
     )
 
 
+def looks_corrupted_id(value) -> bool:
+    """
+    判斷一個 Discord ID 是不是被試算表改壞了（空白不算）。
+    Discord ID 是 17～20 位數字；被試算表當成數字存的話，只會保留前 15 位、後面全部變成 0
+    （例如 536582078557323265 → 536582078557323000），或是變成 5.36582E+17 這種格式。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if not re.fullmatch(r"[0-9]{17,20}", text):
+        return True
+    return text.endswith("0" * (len(text) - 15))
+
+
 def _to_number(value) -> float:
     """把金額欄的內容轉成數字（處理 70,000,000 這種有千分位逗號的顯示格式）；轉不了就當 0。"""
     try:
@@ -251,16 +269,13 @@ class SheetsStore:
             rows.append(d)
         return rows
 
-    def find_first_empty_row(self, sheet_name: str, key_col_index: int = 1) -> int:
+    def next_append_row(self, sheet_name: str, key_col_index: int = 1) -> int:
         """
-        找到第一個「這個欄位是空的」列號，用來決定新資料要寫在哪一列。
-        直接照這欄實際存在多少資料來判斷，不設任何上限，資料多長都找得到正確位置。
+        回傳「最後一筆資料的下一列」，批次寫入一律從這裡開始往下寫。
+        不能去填中間的空白列：批次是一次寫一整塊連續的列（例如一場 12 人就寫 12 列），
+        如果有人把中間幾列清空，從空白處開始寫會直接蓋掉下面原本的資料。
         """
-        col_values = self.ws(sheet_name).col_values(key_col_index)
-        for r in range(2, len(col_values) + 1):
-            if not col_values[r - 1].strip():
-                return r
-        return len(col_values) + 1
+        return len(self.ws(sheet_name).col_values(key_col_index)) + 1
 
     def _ensure_row_capacity(self, sheet_name: str, needed_row: int):
         """
@@ -294,7 +309,7 @@ class SheetsStore:
         """
         if not values_list:
             return None
-        start_row = self.find_first_empty_row(sheet_name, key_col_index=key_col_index)
+        start_row = self.next_append_row(sheet_name, key_col_index=key_col_index)
         end_row = start_row + len(values_list) - 1
         self._ensure_row_capacity(sheet_name, end_row)
         sanitized = [[_sanitize(v) for v in row] for row in values_list]
@@ -503,7 +518,7 @@ class SheetsStore:
     def upsert_character(self, discord_id: str, display_name: str, char_name: str, job: str, position: str = "") -> dict:
         """
         新增或更新一隻角色。同名角色（正規化後）視為同一隻，更新職業/位置；否則新增一列。
-        新建角色時，會把場次記錄裡這隻角色還沒對應到帳號的舊記錄補上，然後重新排序角色資料。
+        新建角色時，會把場次記錄裡這隻角色還沒對應到帳號的舊記錄補上。排序由呼叫的地方預約（延後排序）。
         回傳 {"status": "created" 或 "updated", "backfilled": 補上了幾筆場次記錄}。
         """
         key = normalize_name(char_name)
@@ -516,15 +531,18 @@ class SheetsStore:
                 return {"status": "updated", "backfilled": 0, "sort": None}  # ID 沒變、位置不動，不用排序
         row_num = self._first_empty_row_from(rows)
         self.write_row(SHEET_CHARACTERS, row_num, [str(discord_id), display_name, char_name, job, position])
+        # F 出席、G 分潤、H 色碼 三欄公式一起寫（H 欄以前是排序時才補，改成延後排序後，
+        # 新角色在排序前也要有顏色，所以建立時就寫好）
         self.write_row(
             SHEET_CHARACTERS, row_num,
-            [_char_attendance_formula(row_num), _char_earnings_formula(row_num)],
+            [_char_attendance_formula(row_num), _char_earnings_formula(row_num), _char_color_formula(row_num)],
             start_col=6, raw=True,
         )
         self.ensure_account_row(discord_id, display_name)
         backfilled = self.backfill_sessions_for_character(char_name, discord_id, display_name)
-        sort = self.sort_characters()
-        return {"status": "created", "backfilled": backfilled, "sort": sort}
+        # 不在這裡馬上排序：很多人同時登記時，每一隻都排一次會撞到 Google 的速度限制。
+        # 由呼叫的地方用 schedule_character_sort 預約，等一陣子沒人登記了再排一次。
+        return {"status": "created", "backfilled": backfilled, "sort": None}
 
     def backfill_sessions_for_character(self, char_name: str, discord_id: str, display_name: str) -> int:
         """
@@ -637,7 +655,7 @@ class SheetsStore:
             return None
         target = chars[index]
         self.delete_row(SHEET_CHARACTERS, target["_row"])
-        return {**target, "sort": self.sort_characters()}
+        return {**target, "sort": None}  # 排序由呼叫的地方預約
 
     def delete_character_by_name(self, discord_id: str, char_name: str):
         """
@@ -653,7 +671,7 @@ class SheetsStore:
             return None
         target = matches[0]
         self.delete_row(SHEET_CHARACTERS, target["_row"])
-        return {**target, "sort": self.sort_characters()}
+        return {**target, "sort": None}  # 排序由呼叫的地方預約
 
     def ensure_account_row(self, discord_id: str, display_name: str):
         """確保帳號基本資料表裡有這個 Discord ID 的列，沒有就新增一列（可出席時間留空）。"""
@@ -674,6 +692,20 @@ class SheetsStore:
             start_col=6, raw=True,
         )
 
+    def find_corrupted_ids(self) -> dict:
+        """
+        找出「場次記錄」D 欄、「帳號基本資料」A 欄裡看起來被改壞的 Discord ID（給 /checkprofiles 用）。
+        角色資料那邊由 /checkprofiles 自己逐一問 Discord，這裡只檢查另外兩張表。
+        回傳 {"場次記錄": [(列號, 角色, ID), ...], "帳號基本資料": [(列號, 顯示名稱, ID), ...]}
+        """
+        sessions = [(r["_row"], r.get("塔團", "").strip() or "（無角色名）", r.get("Discord ID", "").strip())
+                    for r in self.get_rows(SHEET_SESSIONS, key_col_index=2)
+                    if looks_corrupted_id(r.get("Discord ID", ""))]
+        accounts = [(r["_row"], r.get("顯示名稱", "").strip() or "（無名稱）", r.get("Discord ID", "").strip())
+                    for r in self.get_rows(SHEET_ACCOUNTS)
+                    if looks_corrupted_id(r.get("Discord ID", ""))]
+        return {"場次記錄": sessions, "帳號基本資料": accounts}
+
     def relink_character(self, char_name: str, new_id: str, display_name: str) -> dict:
         """
         把某隻角色重新對應到正確的 Discord 帳號（給管理員修正對錯人的角色用）。
@@ -691,12 +723,13 @@ class SheetsStore:
             self.write_row(SHEET_CHARACTERS, r["_row"], [str(new_id), display_name], start_col=1)
         self.ensure_account_row(new_id, display_name)
 
-        # 場次記錄：這隻角色名下、而且原本掛在舊 ID（或根本沒 ID）的列，改掛到新 ID
+        # 場次記錄：這隻角色名下、原本掛在舊 ID、根本沒 ID、或 ID 已經被改壞的列，改掛到新 ID
         updates = []
         for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
             if normalize_name(r.get("塔團", "")) != key:
                 continue
-            if r.get("Discord ID", "").strip() in old_ids | {""}:
+            current = r.get("Discord ID", "").strip()
+            if current in old_ids | {""} or looks_corrupted_id(current):
                 updates.append((r["_row"], 4, [str(new_id), display_name]))  # D=Discord ID、E=DC名稱
         if updates:
             self.batch_update_cells(SHEET_SESSIONS, updates)
@@ -769,6 +802,40 @@ class SheetsStore:
 
     # ---------- 場次記錄 ----------
 
+    # ---------- 進行中的場次（存在「系統狀態」分頁，機器人重啟後接回來） ----------
+    # 進行中的場次原本只存在機器人的記憶體裡，Railway 每次部署都會重啟，出團到一半就會不見。
+    # 每次開場、記錄寶物之後存一份，啟動時讀回來。
+
+    def _state_sheet(self):
+        try:
+            return self.ws("系統狀態")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="系統狀態", rows=10, cols=2)
+            ws.update("A1:B1", [["項目", "內容（機器人自動維護，請不要手動修改）"]], value_input_option="RAW")
+            return ws
+
+    def save_active_session(self, session):
+        """存下進行中的場次；None 代表目前沒有進行中的場次。用 RAW 寫入，內容原封不動當文字存。"""
+        value = json.dumps(session, ensure_ascii=False) if session else ""
+        self._state_sheet().update("A2:B2", [["進行中場次", value]], value_input_option="RAW")
+
+    def load_active_session(self):
+        """
+        讀回進行中的場次，沒有或讀不懂就回傳 None。
+        寶物編號會再跟場次記錄核對一次，取比較大的那個：就算某次存檔失敗，
+        接回來之後也不會讓兩樣寶物用到同一個編號（同編號在結算時會被當成同一樣）。
+        """
+        raw = (self._state_sheet().get("B2") or [[""]])[0]
+        raw = raw[0].strip() if raw else ""
+        if not raw:
+            return None
+        session = json.loads(raw)
+        if not isinstance(session, dict) or not session.get("id") or not isinstance(session.get("members"), list):
+            return None
+        session["next_item_index"] = max(int(session.get("next_item_index", 0)),
+                                         self.next_item_index(session["id"]))
+        return session
+
     def get_session_rows(self, session_id: str) -> list:
         return [r for r in self.get_rows(SHEET_SESSIONS, key_col_index=2) if r.get("場次ID", "").strip() == session_id]
 
@@ -838,7 +905,10 @@ class SheetsStore:
         把指定場次+編號的寶物填上售出金額，分潤類型會平分給每一列。回傳結果摘要。
         item_name：捐獻的寶物場次ID跟編號都是空白，光靠編號會比對到同一批所有捐獻，
         所以選單那條路會額外傳名稱來精確定位。
+        售出金額必須大於 0：填 0 會變成「已售出、每人分 0」而且之後不能再賣；填負數會讓大家的待領變成負的。
         """
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            return {"ok": False, "reason": "invalid_amount"}
         target_rows = [
             r for r in self.get_session_rows(session_id)
             if r.get("寶物編號", "").strip() == str(item_index)
@@ -1010,31 +1080,6 @@ class SheetsStore:
             self.batch_update_cells(SHEET_SESSIONS, updates)
         return {"total": total, "details": details, "items": items}
 
-    def pending_for_user(self, discord_id: str) -> dict:
-        total = 0.0
-        details = []
-        for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
-            if r.get("類型") != "分潤":
-                continue
-            if r.get("Discord ID", "").strip() != str(discord_id):
-                continue
-            already = str(r.get("已領", "")).strip().upper() == "TRUE"
-            sale = r.get("售出金額", "").strip()
-            per_person = r.get("均分$$", "").strip()
-            if already or not sale or not per_person:
-                continue
-            amt = float(per_person)
-            total += amt
-            details.append((r.get("場次ID", ""), r.get("掉落", ""), amt))
-        return {"total": total, "details": details}
-
-    def pending_sessions_for_user(self, discord_id: str) -> list:
-        """回傳這個人有待領分潤的場次清單 [(session_id, amount), ...]。"""
-        by_session = {}
-        for session_id, item_name, amt in self.pending_for_user(discord_id)["details"]:
-            by_session[session_id] = by_session.get(session_id, 0) + amt
-        return list(by_session.items())
-
     def pending_items_for_user(self, discord_id: str) -> list:
         """
         回傳這個人每一筆待領（以「每一樣寶物」為單位，不是以場次為單位）。
@@ -1055,6 +1100,8 @@ class SheetsStore:
             items.append({
                 "row": r["_row"],
                 "session_id": r.get("場次ID", ""),
+                "item_index": r.get("寶物編號", "").strip(),
+                "character": r.get("塔團", "").strip(),
                 "date": _date_part(r.get("日期時間", "")),
                 "item_name": r.get("掉落", ""),
                 "amount": float(per_person),
@@ -1062,16 +1109,38 @@ class SheetsStore:
             })
         return items
 
-    def claim_item_row(self, discord_id: str, row: int) -> dict:
+    def claim_item_row(self, discord_id: str, row: int, expected: dict = None) -> dict:
         """
-        領取單一一筆待領（用實際列號精確指定是哪一筆，避免同場同寶物混在一起誤領）。
-        會重新核對這一列還是「未領、屬於這個人」才會標記，防止跟別的操作打架。
+        領取單一一筆待領。
+
+        row 是打開清單當下這一筆在第幾列。但清單打開之後、按下領取之前，如果有人刪除了上面的記錄，
+        下面的列會往上補，列號就不再是原本那一筆。所以 expected 帶著「場次ID＋寶物編號＋寶物名稱＋角色」，
+        先確認那一列還是同一筆；不是的話就用這些資訊重新找。
+        （要加上角色：同一個帳號帶兩隻角色出同一場，同一樣寶物會有兩筆，只看寶物分不出來。）
+        找不到、或找到不只一筆，就不領（回傳 reason="moved"），請使用者重新打開清單。
         """
-        rows = {r["_row"]: r for r in self.get_rows(SHEET_SESSIONS, key_col_index=2)}
-        r = rows.get(row)
-        if not r:
-            return {"ok": False, "reason": "not_found"}
-        if r.get("類型") != "分潤" or r.get("Discord ID", "").strip() != str(discord_id):
+        def identity(r):
+            return (r.get("場次ID", "").strip(), r.get("寶物編號", "").strip(), r.get("掉落", "").strip(),
+                    r.get("塔團", "").strip())
+
+        def is_mine_pending(r):
+            return (r.get("類型") == "分潤" and r.get("Discord ID", "").strip() == str(discord_id)
+                    and str(r.get("已領", "")).strip().upper() != "TRUE"
+                    and r.get("售出金額", "").strip() and r.get("均分$$", "").strip())
+
+        all_rows = self.get_rows(SHEET_SESSIONS, key_col_index=2)
+        r = next((x for x in all_rows if x["_row"] == row), None)
+        if expected is not None:
+            want = (str(expected.get("session_id", "")).strip(), str(expected.get("item_index", "")).strip(),
+                    str(expected.get("item_name", "")).strip(), str(expected.get("character", "")).strip())
+            if r is None or identity(r) != want:
+                # 列號已經不是原本那一筆了（上面有記錄被刪除），用場次＋寶物重新找
+                candidates = [x for x in all_rows if identity(x) == want and is_mine_pending(x)]
+                if len(candidates) != 1:
+                    return {"ok": False, "reason": "moved"}
+                r = candidates[0]
+                row = r["_row"]
+        if r is None or r.get("類型") != "分潤" or r.get("Discord ID", "").strip() != str(discord_id):
             return {"ok": False, "reason": "not_found"}
         already = str(r.get("已領", "")).strip().upper() == "TRUE"
         sale = r.get("售出金額", "").strip()
@@ -1292,23 +1361,6 @@ class SheetsStore:
             result.append(item)
         return result
 
-    def unclaimed_for_session(self, session_id: str) -> dict:
-        """回傳這個場次裡，誰還沒領錢 {key: amount}，key 是 discord_id 或 "raw:名字"。"""
-        pending = {}
-        for r in self.get_session_rows(session_id):
-            if r.get("類型") != "分潤":
-                continue
-            sale = r.get("售出金額", "").strip()
-            if not sale:
-                continue
-            already = str(r.get("已領", "")).strip().upper() == "TRUE"
-            if already:
-                continue
-            key = r.get("Discord ID", "").strip() or f"raw:{r.get('塔團', '')}"
-            per_person = float(r.get("均分$$", "0") or 0)
-            pending[key] = pending.get(key, 0) + per_person
-        return pending
-
     def guild_fund_total(self) -> float:
         total = 0.0
         for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
@@ -1327,6 +1379,40 @@ class SheetsStore:
             ws = ss.add_worksheet(title="系統設定", rows=200, cols=2)
             ws.update("A1:B1", [["頻道/討論串ID", "允許指令(逗號分隔)"]], value_input_option="USER_ENTERED")
             return ws
+
+    # ---------- 圖片辨識頻道（存在「辨識頻道」分頁，第一次用到時自動建立） ----------
+    # 一個頻道ID一列。完全沒有設定任何頻道時，所有頻道的圖片都辨識（維持原本的行為）；
+    # 設定了至少一個之後，只有這些頻道（以及它們底下的討論串／論壇貼文）的圖片才會辨識。
+
+    def _ocr_sheet(self):
+        try:
+            return self.ws("辨識頻道")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="辨識頻道", rows=200, cols=1)
+            ws.update("A1", [["頻道ID（這些頻道的圖片才會辨識）"]], value_input_option="USER_ENTERED")
+            return ws
+
+    def get_ocr_channels(self) -> set:
+        values = self._ocr_sheet().col_values(1)
+        return {v.strip() for v in values[1:] if v.strip()}
+
+    def add_ocr_channel(self, channel_id: str) -> bool:
+        """加入辨識頻道；已經在清單裡就不重複加，回傳 False。"""
+        ws = self._ocr_sheet()
+        values = ws.col_values(1)
+        if channel_id in {v.strip() for v in values[1:]}:
+            return False
+        ws.update(f"A{len(values) + 1}", [[_sanitize(channel_id)]], value_input_option="USER_ENTERED")
+        return True
+
+    def remove_ocr_channel(self, channel_id: str) -> bool:
+        """移出辨識頻道；本來就不在清單裡回傳 False。"""
+        ws = self._ocr_sheet()
+        for i, v in enumerate(ws.col_values(1)[1:], start=2):
+            if v.strip() == channel_id:
+                ws.delete_rows(i)
+                return True
+        return False
 
     def get_all_channel_rules(self) -> dict:
         ws = self._rules_sheet()
@@ -1352,38 +1438,5 @@ class SheetsStore:
         values = ws.get_all_values()
         for i, row in enumerate(values[1:], start=2):
             if row and row[0].strip() == key:
-                ws.delete_rows(i)
-                return
-
-    # ---------- 公告翻譯設定（存在「翻譯設定」分頁，第一次用到時自動建立） ----------
-
-    def _translate_sheet(self):
-        try:
-            return self.ws("翻譯設定")
-        except gspread.WorksheetNotFound:
-            ss = self._ss()
-            ws = ss.add_worksheet(title="翻譯設定", rows=200, cols=1)
-            ws.update("A1", [["自動翻譯頻道ID"]], value_input_option="USER_ENTERED")
-            return ws
-
-    def get_translate_channels(self) -> set:
-        """回傳有開啟自動翻譯的頻道ID集合。"""
-        ws = self._translate_sheet()
-        values = ws.get_all_values()
-        return {row[0].strip() for row in values[1:] if row and row[0].strip()}
-
-    def add_translate_channel(self, channel_id: str):
-        ws = self._translate_sheet()
-        values = ws.get_all_values()
-        for row in values[1:]:
-            if row and row[0].strip() == channel_id:
-                return  # 已經有了，不重複加
-        ws.update(f"A{len(values) + 1}", [[_sanitize(channel_id)]], value_input_option="USER_ENTERED")
-
-    def remove_translate_channel(self, channel_id: str):
-        ws = self._translate_sheet()
-        values = ws.get_all_values()
-        for i, row in enumerate(values[1:], start=2):
-            if row and row[0].strip() == channel_id:
                 ws.delete_rows(i)
                 return

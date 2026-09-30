@@ -84,6 +84,14 @@ async def build_session_members(store, guild, raw_names: list) -> list:
     return members
 
 
+async def persist_session(bot):
+    """把進行中的場次存進試算表，機器人重啟後才接得回來。存檔失敗不影響這次的操作，只寫進錯誤記錄。"""
+    try:
+        await asyncio.to_thread(bot.store.save_active_session, bot.active_session)
+    except Exception as e:
+        audit.error("儲存進行中的場次失敗（機器人重啟後可能要重新開場）", e)
+
+
 async def record_items(bot, item_names: list, item_type: str = "分潤", contributor: str = None,
                         force_no_session: bool = False, operator: str = "", paymaster: str = ""):
     """
@@ -114,6 +122,8 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
                 store.append_item_rows, session_id, now, members, name, idx, item_type, contributor, paymaster
             )
             recorded.append(name)
+        if session:
+            await persist_session(bot)  # 寶物編號往前推了，存下來
 
     summary = "、".join(recorded)
     where = f"場次 `{session_id}`" if session_id else "捐獻清單"
@@ -204,6 +214,7 @@ class ConfirmView(discord.ui.View):
         session_id = new_session_id()
         now = now_str()
         self.bot.active_session = {"id": session_id, "members": members, "next_item_index": 0}
+        await persist_session(self.bot)
 
         async with store.lock:
             await asyncio.to_thread(
@@ -251,6 +262,7 @@ class ConfirmView(discord.ui.View):
             self.bot.active_session = {
                 "id": new_session_id(), "members": members, "next_item_index": 0,
             }
+            await persist_session(self.bot)
             names = "、".join(m["display_name"] for m in members)
             audit.audit(
                 "開場（圖片辨識）", who=interaction.user.display_name,
@@ -318,6 +330,9 @@ class SellAmountModal(discord.ui.Modal):
         except ValueError:
             await interaction.response.send_message("⚠️ 金額必須是數字，請重新打一次 `/sell`。", ephemeral=True)
             return
+        if amount <= 0:
+            await interaction.response.send_message("⚠️ 售出金額必須大於 0。請重新打一次 `/sell`。", ephemeral=True)
+            return
 
         await interaction.response.defer()
         async with self.store.lock:
@@ -327,8 +342,8 @@ class SellAmountModal(discord.ui.Modal):
             )
 
         if not result["ok"]:
-            msg = ("⚠️ 找不到這樣寶物，可能已經被別人處理掉了。"
-                   if result["reason"] == "not_found" else "⚠️ 這樣寶物已經結算過了。")
+            msg = {"not_found": "⚠️ 找不到這樣寶物，可能已經被別人處理掉了。",
+                   "invalid_amount": "⚠️ 售出金額必須大於 0。"}.get(result["reason"], "⚠️ 這樣寶物已經結算過了。")
             await interaction.edit_original_response(content=msg, view=None)
             return
 
@@ -593,9 +608,10 @@ def claim_line(item: dict) -> str:
     return f"{head} {item.get('item_name', '')}：+{item.get('amount', 0):.0f}"
 
 
-def claim_result_text(items: list) -> str:
+def claim_result_text(items: list, title: str = "✅ 已領取") -> str:
     """
-    /claim 領取成功的訊息：依「發錢的人」分組，直接告訴領錢的人要找誰、各拿多少。
+    分潤明細的統一格式（/claim 領取成功、/pending 待領、/forceclaim 代領都用這個）：
+    依「發錢的人」分組，直接告訴領錢的人要找誰、各拿多少。
     沒有指定發錢的人的（用 /item 手動記錄的寶物），放在最後面另外提醒。
     """
     groups = {}
@@ -604,7 +620,7 @@ def claim_result_text(items: list) -> str:
     order = [k for k in groups if k] + ([""] if "" in groups else [])  # 未指定的排最後
 
     total = sum(it["amount"] for it in items)
-    parts = [f"✅ 已領取，共 **{total:.0f}**："]
+    parts = [f"{title}，共 **{total:.0f}**："]
     for payer in order:
         group = groups[payer]
         subtotal = sum(it["amount"] for it in group)
@@ -655,10 +671,13 @@ class ClaimSelect(discord.ui.Select):
 
         item = self.items[chosen]
         async with self.store.lock:
-            result = await asyncio.to_thread(self.store.claim_item_row, uid, item["row"])
+            result = await asyncio.to_thread(self.store.claim_item_row, uid, item["row"], item)
 
         if not result["ok"]:
-            await interaction.edit_original_response(content="這筆待領已經被處理掉了（可能剛被領過）。", view=None)
+            msg = ("⚠️ 這筆記錄在你打開清單之後有變動（可能有記錄被刪除），為了安全沒有領取，"
+                   "請重新打開清單再選一次。" if result.get("reason") == "moved"
+                   else "這筆待領已經被處理掉了（可能剛被領過）。")
+            await interaction.edit_original_response(content=msg, view=None)
             return
         audit.audit(
             "領取分潤", who=interaction.user.display_name,
@@ -866,6 +885,19 @@ class ClaimSelectView(discord.ui.View):
 
 
 class Sessions(commands.Cog):
+    async def cog_load(self):
+        # 機器人重啟前如果有進行中的場次，接回來，出團到一半部署也不用重新開場
+        if self.bot.active_session is not None:
+            return
+        try:
+            self.bot.active_session = await asyncio.to_thread(self.store.load_active_session)
+        except Exception as e:
+            audit.error("讀回進行中的場次失敗（需要重新開場）", e)
+            return
+        if self.bot.active_session:
+            s = self.bot.active_session
+            audit.system(f"接回進行中的場次 {s['id']}（{len(s['members'])} 人，下一樣寶物編號 {s['next_item_index']}）")
+
     def __init__(self, bot):
         self.bot = bot
         self.store = bot.store
@@ -877,11 +909,13 @@ class Sessions(commands.Cog):
         if not message.attachments:
             return
 
-        # 開啟自動翻譯的頻道，不要拿去做隊員/寶物圖片辨識，
-        # 否則公告裡的圖片會白白吃掉辨識額度。
-        translate_cog = self.bot.get_cog("Translate")
-        if translate_cog and str(message.channel.id) in getattr(translate_cog, "channels", set()):
-            return
+        # 只辨識用 /ocrchannel 開啟的頻道（論壇的話底下每篇貼文都算），其他頻道的圖片不送去 Gemini，
+        # 避免成員在聊天頻道隨手貼的圖把每日額度吃光。完全沒設定任何頻道時，所有頻道都辨識。
+        allowed = getattr(self.bot, "ocr_channels", set())
+        if allowed:
+            parent = getattr(message.channel, "parent", None)
+            if str(message.channel.id) not in allowed and (parent is None or str(parent.id) not in allowed):
+                return
 
         for attachment in message.attachments:
             if not any(attachment.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
@@ -963,6 +997,7 @@ class Sessions(commands.Cog):
         self.bot.active_session = {
             "id": new_session_id(), "members": members, "next_item_index": 0,
         }
+        await persist_session(self.bot)
         names_text = "、".join(m["display_name"] for m in members)
         unmatched = [m["name"] for m in members if not m["discord_id"]]
 
@@ -1069,6 +1104,9 @@ class Sessions(commands.Cog):
         if index is None or amount is None:
             await ctx.send("⚠️ 編號跟金額要一起填，或兩個都不填改用選單。", ephemeral=True)
             return
+        if amount <= 0:
+            await ctx.send("⚠️ 售出金額必須大於 0。", ephemeral=True)
+            return
         if session_id is None:
             if not self.bot.active_session:
                 await ctx.send("⚠️ 目前沒有進行中的場次，請指定場次ID，或直接用 `/sell` 跳選單。", ephemeral=True)
@@ -1082,6 +1120,8 @@ class Sessions(commands.Cog):
         if not result["ok"]:
             if result["reason"] == "not_found":
                 await ctx.send(f"⚠️ 找不到編號 {index}，請確認場次ID跟編號是否正確。")
+            elif result["reason"] == "invalid_amount":
+                await ctx.send("⚠️ 售出金額必須大於 0。")
             else:
                 await ctx.send(f"⚠️ 編號 {index} 已經賣過了，不能重複結算。")
             return
@@ -1245,12 +1285,12 @@ class Sessions(commands.Cog):
     async def pending(self, ctx):
         """查看自己目前尚未領取的分潤總額與明細。"""
         await ctx.defer(ephemeral=True)
-        result = await asyncio.to_thread(self.store.pending_for_user, str(ctx.author.id))
-        if not result["details"]:
+        items = await asyncio.to_thread(self.store.pending_items_for_user, str(ctx.author.id))
+        if not items:
             await ctx.send("目前沒有待領取的分潤。", ephemeral=True)
             return
-        text = "\n".join(f"{sid or '捐獻寶物'}：{name}（{amt:.0f}）" for sid, name, amt in result["details"])
-        await ctx.send(f"**💰 待領取分潤，共 {result['total']:.0f}：**\n```{text}```", ephemeral=True)
+        await ctx.send(claim_result_text(items, title="⏳ 待領取分潤")
+                       + "\n要領取的話打 `/claim`，或按公告上的「💵 領取分潤」。", ephemeral=True)
 
     @commands.hybrid_command(name="forceclaim", description="管理員：代為標記某人的分潤已領")
     @commands.has_permissions(manage_guild=True)
@@ -1267,15 +1307,13 @@ class Sessions(commands.Cog):
             await ctx.send(f"{member.display_name} 目前 {scope}沒有待領取的分潤。", ephemeral=True)
             return
 
-        detail_text = "\n".join(f"{sid}：{name} +{amt:.0f}" for sid, name, amt in result["details"])
         audit.audit(
             "管理員代為標記已領", who=ctx.author.display_name,
             detail=f"對象 {member.display_name}｜共 {result['total']:.2f}｜" + "；".join(
                 f"{sid} {name} {amt:.2f}" for sid, name, amt in result["details"]),
         )
         await ctx.send(
-            f"✅ 已代為標記 {member.display_name} 的分潤為已領，"
-            f"共 **{result['total']:.0f}**：\n```{detail_text}```",
+            claim_result_text(result["items"], title=f"✅ 已代為標記 {member.display_name} 的分潤為已領"),
             ephemeral=True,
         )
 
