@@ -192,7 +192,22 @@ def _date_part(value) -> str:
 
 
 class DataIntegrityError(Exception):
-    """排序或寫入公式之後，檢查發現資料不一致或公式出錯。"""
+    """排序或寫入公式之後，檢查發現資料不一致或公式出錯；或是欄位順序不對，為了安全停止寫入。"""
+
+
+# 機器人寫入這三張表時是「照固定位置」寫（例如第 F 欄就是掉落）。如果有人插入或移動過欄位，
+# 就會把資料寫進錯的欄，而且不會有任何錯誤。所以寫入前先確認這些欄的標題在正確的位置。
+# 只檢查「程式本來就照標題名稱讀取」的欄：這些標題不對的話機器人早就不能用，拿來當基準不會誤判；
+# 中間只要有任何一欄被插入或移動，至少會有一欄對不上。
+_EXPECTED_LAYOUT = {
+    # A～L 之間只要有任何一欄被插入或移動，A、D、F～H、J～L 至少會有一欄對不上；P 用來抓 M～P 之間的位移
+    "場次記錄": {1: ("場次ID",), 4: ("Discord ID",), 6: ("掉落",), 7: ("寶物編號",), 8: ("類型",),
+                 10: ("售出金額",), 11: ("均分$$",), 12: ("已領",), 16: ("發錢的人", "操作者"),
+                 17: ("同場角色首筆*",)},   # 結尾的 * 代表只比對開頭，「同場角色首筆(輔助)」也算對
+    "角色資料": {1: ("Discord ID",), 3: ("角色名稱",), 4: ("職業",), 5: ("位置",)},
+    "帳號基本資料": {1: ("Discord ID",), 3: ("平日可出席",), 4: ("假日可出席",), 5: ("其他時間備註",)},
+}
+_LAYOUT_CACHE_SECONDS = 300
 
 
 class _RetryHTTPClient(gspread.HTTPClient):
@@ -244,6 +259,33 @@ class SheetsStore:
     def ws(self, sheet_name: str):
         return self._ss().worksheet(sheet_name)
 
+    # ---------- 欄位順序檢查（寫入前） ----------
+
+    def check_layout(self, sheet_name: str):
+        """
+        確認這張表的欄位順序跟機器人預期的一樣，不一樣就丟出 DataIntegrityError、什麼都不寫。
+        通過的結果暫存 5 分鐘，不會每次寫入都多讀一次；沒通過不暫存，修好之後馬上就能用。
+        """
+        expected = _EXPECTED_LAYOUT.get(sheet_name)
+        if not expected:
+            return
+        cache = self.__dict__.setdefault("_layout_ok", {})
+        if time.monotonic() - cache.get(sheet_name, -1e9) < _LAYOUT_CACHE_SECONDS:
+            return
+        headers = self.ws(sheet_name).row_values(1)
+        problems = []
+        for col, names in expected.items():
+            actual = headers[col - 1].strip() if col <= len(headers) else ""
+            if not any(actual.startswith(n[:-1]) if n.endswith("*") else actual == n for n in names):
+                problems.append(f"第 {_col_letter(col)} 欄應該是「{names[0].rstrip('*')}」，現在是「{actual or '空白'}」")
+        if problems:
+            raise DataIntegrityError(
+                f"「{sheet_name}」的欄位順序跟機器人預期的不一樣，為了避免把資料寫進錯的欄，已經停止寫入，"
+                f"資料沒有被改動：\n" + "\n".join(problems)
+                + "\n請把欄位移回原本的位置（或刪掉中間插入的欄）之後再試一次。"
+            )
+        cache[sheet_name] = time.monotonic()
+
     # ---------- 通用 row 操作 ----------
 
     def get_rows(self, sheet_name: str, key_col_index: int = 1) -> list:
@@ -292,6 +334,7 @@ class SheetsStore:
         raw=False（預設）：自動防止公式注入，使用者輸入的文字不會被誤判成公式。
         raw=True：只在寫入「機器人自己產生的公式字串」時使用，跳過防注入處理。
         """
+        self.check_layout(sheet_name)
         self._ensure_row_capacity(sheet_name, row_number)
         if not raw:
             values = [_sanitize(v) for v in values]
@@ -307,6 +350,7 @@ class SheetsStore:
         確保機器人新增的每一列都自帶自己需要的公式，資料量再大也不會漏算。
         values_list 一律視為使用者輸入，自動防止公式注入；extra_formulas 是機器人自己產生的公式，不受影響。
         """
+        self.check_layout(sheet_name)
         if not values_list:
             return None
         start_row = self.next_append_row(sheet_name, key_col_index=key_col_index)
@@ -332,6 +376,7 @@ class SheetsStore:
         用 gspread 的 batch_update 一次送出，避免每一列各打一次 API。
         raw=False（預設）：自動防止公式注入。raw=True：寫入機器人自己產生的公式時使用。
         """
+        self.check_layout(sheet_name)
         if not updates:
             return
         self._ensure_row_capacity(sheet_name, max(row for row, _, _ in updates))
@@ -345,10 +390,12 @@ class SheetsStore:
         self.ws(sheet_name).batch_update(data, value_input_option="USER_ENTERED")
 
     def update_cell(self, sheet_name: str, row: int, col: int, value):
+        self.check_layout(sheet_name)
         letter = _col_letter(col)
         self.ws(sheet_name).update(f"{letter}{row}", [[_sanitize(value)]], value_input_option="USER_ENTERED")
 
     def delete_row(self, sheet_name: str, row_number: int):
+        self.check_layout(sheet_name)
         self.ws(sheet_name).delete_rows(row_number)
 
     @staticmethod
@@ -579,6 +626,7 @@ class SheetsStore:
         回傳 {"ok": True, "rows": 幾列} 或 {"ok": False, "reason": 原因}（此時已經還原）。
         真的連還原都失敗才會丟出例外，並告知備份分頁的名稱，資料都還在那一頁。
         """
+        self.check_layout(SHEET_CHARACTERS)
         ss = self._ss()
         ws = self.ws(SHEET_CHARACTERS)
         last_row = len(ws.col_values(1))  # A 欄＝Discord ID，最後一筆資料在哪一列
@@ -752,6 +800,8 @@ class SheetsStore:
         角色資料：走 sort_characters（有備份、前後比對、出錯自動還原）
         場次記錄、帳號基本資料：只寫公式欄、不搬動資料，寫完讀回檢查有沒有計算錯誤
         """
+        for name in (SHEET_SESSIONS, SHEET_ACCOUNTS):   # 角色資料由 sort_characters 自己檢查
+            self.check_layout(name)
         sort = self.sort_characters()
 
         def write_block(sheet, first_col, last_col, last_row, makers):
@@ -1159,6 +1209,22 @@ class SheetsStore:
     # 場次記錄 N、O、Q 三欄是公式（同場首筆、色碼、同場角色首筆），其他欄（含 P 發錢的人）都是資料
     _SESSION_FORMULA_COLS = {13, 14, 16}   # 0 起算：N=13、O=14、Q=16
 
+    @staticmethod
+    def _record_key(r: dict):
+        """
+        這一列屬於哪一筆可刪除的記錄：(場次ID, 種類, 寶物編號, 寶物名稱)；不屬於任何一筆就回傳 None。
+        /deletesession 的選單跟刪除都用這個函式認資料，保證選單列得出來的，刪除時一定找得到同一批列。
+        """
+        sid = str(r.get("場次ID", "")).strip()
+        if not sid:
+            return None   # 捐獻沒有場次ID，不用這個方式刪
+        if str(r.get("類型", "")).strip() == "出席":
+            return (sid, "attendance", "", "出席記錄")
+        name = str(r.get("掉落", "")).strip()
+        if not name:
+            return None
+        return (sid, "item", str(r.get("寶物編號", "")).strip(), name)
+
     def list_records(self, session_id: str = None) -> list:
         """
         列出場次記錄裡可以刪除的項目，給 /deletesession 的選單用。最新的排最前面。
@@ -1171,15 +1237,10 @@ class SheetsStore:
         """
         entries, per_session = {}, {}
         for r in self.get_rows(SHEET_SESSIONS, key_col_index=2):
-            sid = r.get("場次ID", "").strip()
-            if not sid or (session_id is not None and sid != session_id):
+            rk = self._record_key(r)
+            if rk is None or (session_id is not None and rk[0] != session_id):
                 continue
-            if r.get("類型") == "出席":
-                kind, idx, name = "attendance", "", "出席記錄"
-            elif r.get("掉落", "").strip():
-                kind, idx, name = "item", r.get("寶物編號", "").strip(), r.get("掉落", "").strip()
-            else:
-                continue
+            sid, kind, idx, name = rk
             key = f"{sid}|{kind}|{idx}|{name}"
             e = entries.setdefault(key, {
                 "key": key, "session_id": sid, "date": _date_part(r.get("日期時間", "")), "kind": kind,
@@ -1235,15 +1296,17 @@ class SheetsStore:
         """
         if not session_id:
             return {"ok": False, "reason": "沒有指定場次（捐獻的記錄不能用這個方式刪）"}
+        try:
+            self.check_layout(SHEET_SESSIONS)
+        except DataIntegrityError as e:
+            return {"ok": False, "reason": str(e)}
 
-        def is_target(row) -> bool:
-            if str(row[0]).strip() != session_id:          # A 場次ID
-                return False
-            if kind == "attendance":
-                return str(row[7]).strip() == "出席"       # H 類型
-            return (str(row[7]).strip() != "出席"
-                    and str(row[6]).strip() == item_index   # G 寶物編號
-                    and str(row[5]).strip() == item_name)   # F 掉落
+        wanted = (session_id, kind, str(item_index).strip(), str(item_name).strip())
+
+        def target_rows() -> set:
+            """用跟選單一模一樣的方式認資料，回傳這筆記錄現在在哪幾列。"""
+            return {r["_row"] for r in self.get_rows(SHEET_SESSIONS, key_col_index=2)
+                    if self._record_key(r) == wanted}
 
         ss = self._ss()
         ws = self.ws(SHEET_SESSIONS)
@@ -1266,9 +1329,16 @@ class SheetsStore:
             return Counter(data_key(row) for _, row in data_rows())
 
         before_rows = data_rows()
-        targets = [(n, row) for n, row in before_rows if is_target(row)]
+        target_nums = target_rows()
+        targets = [(n, row) for n, row in before_rows if n in target_nums]
         if not targets:
-            return {"ok": False, "reason": f"找不到這筆記錄（{session_id} {item_name}），可能已經被刪除了"}
+            # 列出這一場目前有哪些記錄，方便判斷是被刪了、還是名稱／編號對不上
+            present = sorted({f"{k[3]}（編號 {k[2] or '-'}）" for k in
+                              (self._record_key(r) for r in self.get_rows(SHEET_SESSIONS, key_col_index=2))
+                              if k and k[0] == session_id})
+            where = "、".join(present) if present else "（這一場已經沒有任何記錄）"
+            return {"ok": False, "reason": (f"找不到這筆記錄（{session_id} {item_name}，編號 {item_index or '-'}），"
+                                            f"可能已經被刪除了。這一場目前有：{where}")}
         if len(targets) != expected_rows:
             return {"ok": False, "reason": (f"這筆記錄在確認期間有變動（確認時是 {expected_rows} 列，現在是 "
                                             f"{len(targets)} 列），為了安全沒有刪除，請重新操作一次")}
@@ -1295,7 +1365,7 @@ class SheetsStore:
             after = data_snapshot()
             if after != expected_after:
                 raise DataIntegrityError("刪除後的資料不一致（刪到別場的列，或有列不見、被改動）")
-            if any(is_target(row) for _, row in data_rows()):
+            if target_rows():
                 raise DataIntegrityError("刪除後還有殘留的列")
 
             new_last = len(ws.col_values(2))
