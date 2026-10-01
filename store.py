@@ -1318,9 +1318,14 @@ class SheetsStore:
         data_range = f"A2:{_col_letter(width)}{last_row}"
 
         def data_rows():
-            """[(列號, 整列內容), ...]，跳過整列都是空白的列。"""
+            """
+            [(列號, 整列內容), ...]，只算日期時間（B 欄）有內容的列。
+            不能用「整列有沒有任何一格有內容」判斷：已領欄如果整欄插入了核取方塊，
+            資料下面的空白列也會有一個沒打勾的方塊（讀出來是 FALSE）。刪掉幾列之後這些空白列會往上移、
+            跑進比對範圍，被誤當成資料，比對就會失敗。機器人寫的每一列都有日期時間，預先放的方塊、公式不會有。
+            """
             rows = ws.get(data_range, maintain_size=True)
-            return [(i + 2, row) for i, row in enumerate(rows) if any(str(v).strip() for v in row)]
+            return [(i + 2, row) for i, row in enumerate(rows) if str(row[1]).strip()]
 
         def data_key(row):
             return tuple(v for i, v in enumerate(row) if i not in self._SESSION_FORMULA_COLS)
