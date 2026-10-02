@@ -1455,6 +1455,50 @@ class SheetsStore:
             ws.update("A1:B1", [["頻道/討論串ID", "允許指令(逗號分隔)"]], value_input_option="USER_ENTERED")
             return ws
 
+    # ---------- 身分組按鈕（存在「身分組按鈕」分頁，第一次用到時自動建立） ----------
+    # 一列一個按鈕：A 分組、B 身分組ID、C 表情符號、D 身分組名稱（只是方便人看，機器人以 ID 為準）。
+
+    def _role_sheet(self):
+        try:
+            return self.ws("身分組按鈕")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="身分組按鈕", rows=200, cols=4)
+            ws.update("A1:D1", [["分組", "身分組ID", "表情符號", "身分組名稱（參考用）"]], value_input_option="RAW")
+            return ws
+
+    def get_role_buttons(self) -> list:
+        """[{"group", "role_id", "emoji", "name"}, ...]，照試算表裡的順序。"""
+        out = []
+        for row in self._role_sheet().get_all_values()[1:]:
+            row = row + [""] * (4 - len(row))
+            if row[1].strip():
+                out.append({"group": row[0].strip() or "預設", "role_id": row[1].strip(),
+                            "emoji": row[2].strip(), "name": row[3].strip()})
+        return out
+
+    def set_role_button(self, group: str, role_id: str, emoji: str, name: str) -> str:
+        """新增或更新一個身分組按鈕（同一分組裡同一個身分組只會有一列）。回傳 "created" 或 "updated"。"""
+        ws = self._role_sheet()
+        values = ws.get_all_values()
+        row = [_sanitize(group), _sanitize(role_id), _sanitize(emoji), _sanitize(name)]
+        for i, r in enumerate(values[1:], start=2):
+            r = r + [""] * (4 - len(r))
+            if (r[0].strip() or "預設") == group and r[1].strip() == role_id:
+                ws.update(f"A{i}:D{i}", [row], value_input_option="USER_ENTERED")
+                return "updated"
+        n = len(values) + 1
+        ws.update(f"A{n}:D{n}", [row], value_input_option="USER_ENTERED")
+        return "created"
+
+    def remove_role_button(self, group: str, role_id: str) -> bool:
+        ws = self._role_sheet()
+        for i, r in enumerate(ws.get_all_values()[1:], start=2):
+            r = r + [""] * (4 - len(r))
+            if (r[0].strip() or "預設") == group and r[1].strip() == role_id:
+                ws.delete_rows(i)
+                return True
+        return False
+
     # ---------- 圖片辨識頻道（存在「辨識頻道」分頁，第一次用到時自動建立） ----------
     # 一個頻道ID一列。完全沒有設定任何頻道時，所有頻道的圖片都辨識（維持原本的行為）；
     # 設定了至少一個之後，只有這些頻道（以及它們底下的討論串／論壇貼文）的圖片才會辨識。
