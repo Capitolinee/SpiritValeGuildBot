@@ -93,12 +93,11 @@ async def persist_session(bot):
 
 
 async def record_items(bot, item_names: list, item_type: str = "分潤", contributor: str = None,
-                        force_no_session: bool = False, operator: str = "", paymaster: str = ""):
+                        force_no_session: bool = False, operator: str = ""):
     """
     把一批寶物名稱記錄進去。
     分潤類型需要目前有進行中的場次（bot.active_session）；公會/自用可以有場次也可以沒有（捐獻）。
     operator：誰觸發了這次記錄，只寫進稽核記錄（查帳用）。
-    paymaster：這批寶物由誰發錢，寫進場次記錄表的 P 欄「發錢的人」（只有上傳寶物截圖時會選）。
     回傳 (成功訊息, 是否有錯誤)。
     """
     store = bot.store
@@ -119,7 +118,7 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
             else:
                 idx = None
             await asyncio.to_thread(
-                store.append_item_rows, session_id, now, members, name, idx, item_type, contributor, paymaster
+                store.append_item_rows, session_id, now, members, name, idx, item_type, contributor
             )
             recorded.append(name)
         if session:
@@ -129,12 +128,9 @@ async def record_items(bot, item_names: list, item_type: str = "分潤", contrib
     where = f"場次 `{session_id}`" if session_id else "捐獻清單"
     audit.audit(
         "記錄寶物", who=operator or "（未知）",
-        detail=f"場次 {session_id or '（捐獻）'}｜類型 {item_type}｜{summary}"
-               + (f"｜發錢的人 {paymaster}" if paymaster else ""),
+        detail=f"場次 {session_id or '（捐獻）'}｜類型 {item_type}｜{summary}",
     )
     reply = f"✅ 已將以下寶物記錄進{where}（類型：{item_type}）：\n```{summary}```"
-    if paymaster:
-        reply += f"\n💰 發錢的人：**{paymaster}**"
     return reply, None
 
 
@@ -163,26 +159,8 @@ class EditModal(discord.ui.Modal):
         self.view_ref.stop()
 
 
-class PaymasterSelect(discord.ui.Select):
-    """上傳寶物截圖確認時，選這批寶物由誰發錢（名單來自「職業管理」表的 F 欄）。"""
-
-    def __init__(self, names: list):
-        options = [discord.SelectOption(label=n[:100], value=n[:100]) for n in names[:25]]
-        super().__init__(placeholder="💰 選擇發錢的人", options=options, min_values=1, max_values=1, row=0)
-
-    async def callback(self, interaction: discord.Interaction):
-        view: "ConfirmView" = self.view
-        if interaction.user.id != view.author_id:
-            await interaction.response.send_message("只有上傳圖片的人可以選喔。", ephemeral=True)
-            return
-        view.paymaster = self.values[0]
-        for opt in self.options:  # 讓選單保持顯示剛選的名字
-            opt.default = (opt.value == view.paymaster)
-        await interaction.response.edit_message(content=view.preview_text(), view=view)
-
-
 class ConfirmView(discord.ui.View):
-    def __init__(self, bot, kind: str, payload: list, author_id: int, guild, paymasters: list = None):
+    def __init__(self, bot, kind: str, payload: list, author_id: int, guild):
         super().__init__(timeout=300)
         self.bot = bot
         self.kind = kind
@@ -190,11 +168,6 @@ class ConfirmView(discord.ui.View):
         self.author_id = author_id
         self.guild = guild
         self.message: discord.Message | None = None
-        self.paymasters = paymasters or []
-        self.paymaster = None
-
-        if kind == "item" and self.paymasters:
-            self.add_item(PaymasterSelect(self.paymasters))
 
         if kind == "member":
             no_loot_button = discord.ui.Button(
@@ -236,24 +209,7 @@ class ConfirmView(discord.ui.View):
     def preview_text(self) -> str:
         body = "、".join(self.payload) if self.payload else "（無）"
         label = "隊員名單" if self.kind == "member" else "寶物記錄"
-        text = f"**🔍 辨識為{label}：**\n```{body}```\n"
-        if self.kind == "item" and self.paymasters:
-            if self.paymaster:
-                text += f"💰 發錢的人：**{self.paymaster}**\n請確認是否正確？"
-            else:
-                text += "請先在下面選擇**發錢的人**，再按確認。"
-        elif self.kind == "item":
-            text += "請確認是否正確？（「職業管理」F 欄還沒設定發錢的人，這批會留空）"
-        else:
-            text += "請確認是否正確？"
-        return text
-
-    async def _needs_paymaster(self, interaction: discord.Interaction) -> bool:
-        """寶物截圖有設定發錢的人名單、但還沒選的話，擋下來提醒。"""
-        if self.kind == "item" and self.paymasters and not self.paymaster:
-            await interaction.response.send_message("⚠️ 請先在選單裡選擇**發錢的人**。", ephemeral=True)
-            return True
-        return False
+        return f"**🔍 辨識為{label}：**\n```{body}```\n請確認是否正確？"
 
     async def save(self, interaction: discord.Interaction) -> str:
         store = self.bot.store
@@ -275,7 +231,6 @@ class ConfirmView(discord.ui.View):
         else:
             reply, err = await record_items(
                 self.bot, self.payload, item_type="分潤", operator=interaction.user.display_name,
-                paymaster=self.paymaster or "",
             )
             return err or reply
 
@@ -283,8 +238,6 @@ class ConfirmView(discord.ui.View):
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("只有上傳圖片的人可以確認喔。", ephemeral=True)
-            return
-        if await self._needs_paymaster(interaction):
             return
         await interaction.response.defer()
         reply = await self.save(interaction)
@@ -296,8 +249,6 @@ class ConfirmView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("只有上傳圖片的人可以修改喔。", ephemeral=True)
             return
-        if await self._needs_paymaster(interaction):
-            return
         await interaction.response.send_modal(EditModal(self))
 
     async def on_timeout(self):
@@ -308,13 +259,69 @@ class ConfirmView(discord.ui.View):
                 pass
 
 
-class SellAmountModal(discord.ui.Modal):
-    """選好寶物後，跳出視窗輸入金額。"""
+def sell_result_text(result: dict, amount: int) -> str:
+    text = f"💰 「{result['item_name']}」已賣出 **{amount}**"
+    if result["item_type"] == "分潤":
+        text += (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。"
+                 f"隊員可以用 `/claim` 領取。")
+    else:
+        text += "，已計入公會基金。"
+    if result.get("paymaster"):
+        text += f"\n💵 發錢的人：**{result['paymaster']}**"
+    return text
 
-    def __init__(self, store, item: dict):
-        super().__init__(title="輸入售出金額")
+
+NO_PAYMASTER = "__NONE__"
+
+
+class PaymasterPickSelect(discord.ui.Select):
+    """賣出寶物時，先選這樣寶物由誰發錢（名單來自「職業管理」F 欄），選了才跳出輸入金額的視窗。"""
+
+    def __init__(self, store, author_id: int, item: dict, names: list):
+        self.store, self.author_id, self.item = store, author_id, item
+        options = [discord.SelectOption(label=n[:100], value=n[:100], emoji="💵") for n in names[:24]]
+        options.append(discord.SelectOption(label="不指定發錢的人", value=NO_PAYMASTER,
+                                            description="之後領錢時會顯示「沒有指定發錢的人」"))
+        super().__init__(placeholder="💵 這樣寶物由誰發錢？", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("這是別人發起的結算，你可以自己打 `/sell` 喔。", ephemeral=True)
+            return
+        payer = "" if self.values[0] == NO_PAYMASTER else self.values[0]
+        await interaction.response.send_modal(SellAmountModal(self.store, self.item, payer))
+
+
+class PaymasterPickView(discord.ui.View):
+    def __init__(self, store, author_id: int, item: dict, names: list):
+        super().__init__(timeout=180)
+        self.add_item(PaymasterPickSelect(store, author_id, item, names))
+
+
+async def start_sell(interaction: discord.Interaction, store, item: dict):
+    """
+    選單版賣出的共用入口（/sell 選單、公告上的「賣掉寶物」、/loot 的「賣出分潤」都走這裡）：
+    有設定發錢的人 → 先選發錢的人，再輸入金額；沒設定 → 直接輸入金額。
+    名單用暫存的（最多 1 分鐘前），因為這裡要在 3 秒內回應 Discord。
+    """
+    names = await asyncio.to_thread(store.get_paymasters_cached)
+    if not names:
+        await interaction.response.send_modal(SellAmountModal(store, item))
+        return
+    await interaction.response.edit_message(
+        content=f"**💰 賣出「{item['name']}」**\n這樣寶物由誰發錢？選好之後輸入售出金額。",
+        view=PaymasterPickView(store, interaction.user.id, item, names),
+    )
+
+
+class SellAmountModal(discord.ui.Modal):
+    """選好寶物（跟發錢的人）後，跳出視窗輸入金額。"""
+
+    def __init__(self, store, item: dict, paymaster: str = ""):
+        super().__init__(title=f"輸入售出金額{'（' + paymaster[:20] + ' 發錢）' if paymaster else ''}"[:45])
         self.store = store
         self.item = item
+        self.paymaster = paymaster
         self.amount_input = discord.ui.TextInput(
             label=f"「{item['name'][:30]}」賣多少錢？",
             placeholder="只填數字，例如 3000",
@@ -338,7 +345,7 @@ class SellAmountModal(discord.ui.Modal):
         async with self.store.lock:
             result = await asyncio.to_thread(
                 self.store.sell_item, self.item["session_id"], self.item["item_index"], amount,
-                self.item["name"],
+                self.item["name"], self.paymaster,
             )
 
         if not result["ok"]:
@@ -351,15 +358,10 @@ class SellAmountModal(discord.ui.Modal):
             "結算寶物", who=interaction.user.display_name,
             detail=(f"{result['item_name']}｜類型 {result['item_type']}｜售出 {amount}"
                     + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.0f}"
-                       if result["item_type"] == "分潤" else "｜進公會基金")),
+                       if result["item_type"] == "分潤" else "｜進公會基金")
+                    + f"｜發錢的人 {self.paymaster or '未指定'}"),
         )
-        text = f"💰 「{result['item_name']}」已賣出 **{amount}**"
-        if result["item_type"] == "分潤":
-            text += (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。"
-                     f"隊員可以用 `/claim` 領取。")
-        else:
-            text += "，已計入公會基金。"
-        await finish_menu(interaction, text)
+        await finish_menu(interaction, sell_result_text(result, amount))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         print(f"⚠️ 結算時發生錯誤：{error!r}", flush=True)
@@ -391,7 +393,7 @@ class SellSelect(discord.ui.Select):
             await interaction.response.send_message("這是別人發起的結算，你可以自己打 `/sell` 喔。", ephemeral=True)
             return
         item = self.items[self.values[0]]
-        await interaction.response.send_modal(SellAmountModal(self.store, item))
+        await start_sell(interaction, self.store, item)
 
 
 class SellSelectView(discord.ui.View):
@@ -515,7 +517,7 @@ class LootActionView(discord.ui.View):
     async def sell(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_owner(interaction):
             return
-        await interaction.response.send_modal(SellAmountModal(self.store, self.item))
+        await start_sell(interaction, self.store, self.item)
         self.stop()
 
     @discord.ui.button(label="🎁 成員免費領取", style=discord.ButtonStyle.primary)
@@ -954,10 +956,7 @@ class Sessions(commands.Cog):
                     await message.channel.send("⚠️ 無法判斷這張圖片是隊員名單還是寶物記錄，或內容為空。")
                     continue
 
-                paymasters = []
-                if kind == "item":
-                    paymasters = await asyncio.to_thread(self.bot.store.get_paymasters)
-                view = ConfirmView(self.bot, kind, payload, message.author.id, message.guild, paymasters)
+                view = ConfirmView(self.bot, kind, payload, message.author.id, message.guild)
                 sent = await message.channel.send(view.preview_text(), view=view)
                 view.message = sent
 
@@ -1094,10 +1093,11 @@ class Sessions(commands.Cog):
         index="寶物編號（不填就跳選單）",
         amount="售出金額",
         session_id="場次ID（不填就是目前進行中的場次）",
+        paymaster="這樣寶物由誰發錢（選填，會列出職業管理 F 欄的名單）",
     )
     async def sell_item(self, ctx, index: Optional[int] = None, amount: Optional[int] = None,
-                        session_id: Optional[str] = None):
-        """結算寶物售出金額。不填參數會跳出選單。"""
+                        session_id: Optional[str] = None, paymaster: Optional[str] = None):
+        """結算寶物售出金額。不填參數會跳出選單（會先問發錢的人）。"""
         if index is None and amount is None:
             await self._send_item_picker(ctx, SellSelectView, "請選擇要結算的寶物：")
             return
@@ -1107,6 +1107,13 @@ class Sessions(commands.Cog):
         if amount <= 0:
             await ctx.send("⚠️ 售出金額必須大於 0。", ephemeral=True)
             return
+        paymaster = (paymaster or "").strip()
+        if paymaster:
+            names = await asyncio.to_thread(self.store.get_paymasters_cached)
+            if paymaster not in names:
+                listed = "、".join(names) if names else "（職業管理 F 欄還沒有設定任何人）"
+                await ctx.send(f"⚠️ 「{paymaster}」不在發錢的人名單裡。目前的名單：{listed}", ephemeral=True)
+                return
         if session_id is None:
             if not self.bot.active_session:
                 await ctx.send("⚠️ 目前沒有進行中的場次，請指定場次ID，或直接用 `/sell` 跳選單。", ephemeral=True)
@@ -1115,7 +1122,7 @@ class Sessions(commands.Cog):
 
         await ctx.defer()
         async with self.store.lock:
-            result = await asyncio.to_thread(self.store.sell_item, session_id, index, amount)
+            result = await asyncio.to_thread(self.store.sell_item, session_id, index, amount, None, paymaster)
 
         if not result["ok"]:
             if result["reason"] == "not_found":
@@ -1130,13 +1137,16 @@ class Sessions(commands.Cog):
             "結算寶物", who=ctx.author.display_name,
             detail=(f"{result['item_name']}｜類型 {result['item_type']}｜售出 {amount}"
                     + (f"｜{result['n_rows']} 人平分，每人 {result['per_person']:.2f}"
-                       if result["item_type"] == "分潤" else "｜進公會基金")),
+                       if result["item_type"] == "分潤" else "｜進公會基金")
+                    + f"｜發錢的人 {paymaster or '未指定'}"),
         )
-        await ctx.send(
-            f"💰 「{result['item_name']}」已賣出 **{amount}**"
-            + (f"，共 {result['n_rows']} 人平分，每人 **{result['per_person']:.0f}**。隊員可以用 `/claim` 領取。"
-               if result["item_type"] == "分潤" else "，已計入公會基金。")
-        )
+        await ctx.send(sell_result_text(result, amount))
+
+    @sell_item.autocomplete("paymaster")
+    async def _paymaster_autocomplete(self, interaction: discord.Interaction, current: str):
+        """打 /sell 的 paymaster 欄位時，列出職業管理 F 欄的名單讓人選。"""
+        names = await asyncio.to_thread(self.store.get_paymasters_cached)
+        return [app_commands.Choice(name=n, value=n) for n in names if current.strip() in n][:25]
 
     @commands.hybrid_command(name="giveto", description="登記寶物由成員免費領取（不填參數就跳選單）")
     @app_commands.describe(
