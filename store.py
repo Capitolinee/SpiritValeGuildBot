@@ -460,10 +460,19 @@ class SheetsStore:
         return [v.strip() for v in col_values[1:] if v.strip()]
 
     # ---------- 發錢的人清單（存在「職業管理」表的 F 欄，直接在試算表裡手動增刪） ----------
-    # 上傳寶物截圖確認時，會從這裡讀出下拉選單讓人選「這批寶物由誰發錢」，
+    # 賣出寶物（/sell、/loot、公告上的「賣掉寶物」）時，會從這裡讀出選單讓人選「這樣寶物由誰發錢」，
     # 選到的名字寫進「場次記錄」的 P 欄。F1 是標題，從 F2 往下一格填一個名字。
 
     PAYMASTER_COL = 6  # F 欄
+
+    def get_paymasters_cached(self, seconds: int = 60) -> list:
+        """跟 get_paymasters 一樣，但結果暫存一段時間。按鈕／選單要在 3 秒內回應，用這個比較保險。"""
+        cached = self.__dict__.get("_paymasters_cache")
+        if cached and time.monotonic() - cached[0] < seconds:
+            return list(cached[1])
+        names = self.get_paymasters()
+        self._paymasters_cache = (time.monotonic(), names)
+        return list(names)
 
     def get_paymasters(self) -> list:
         col_values = self.ws(SHEET_JOBS).col_values(self.PAYMASTER_COL)
@@ -950,9 +959,11 @@ class SheetsStore:
             ],
         )
 
-    def sell_item(self, session_id: str, item_index: int, amount: int, item_name: str = None) -> dict:
+    def sell_item(self, session_id: str, item_index: int, amount: int, item_name: str = None,
+                  paymaster: str = "") -> dict:
         """
         把指定場次+編號的寶物填上售出金額，分潤類型會平分給每一列。回傳結果摘要。
+        paymaster：這樣寶物由誰發錢，有填的話寫進這樣寶物每一列的 P 欄「發錢的人」；沒填就不動 P 欄。
         item_name：捐獻的寶物場次ID跟編號都是空白，光靠編號會比對到同一批所有捐獻，
         所以選單那條路會額外傳名稱來精確定位。
         售出金額必須大於 0：填 0 會變成「已售出、每人分 0」而且之後不能再賣；填負數會讓大家的待領變成負的。
@@ -979,11 +990,14 @@ class SheetsStore:
             per_person = amount
             updates = [(r["_row"], 10, [amount, "", "", ""]) for r in target_rows]
 
-        self.batch_update_cells(SHEET_SESSIONS, updates)
+        if paymaster:
+            updates += [(r["_row"], 16, [paymaster]) for r in target_rows]   # P 欄＝發錢的人
+        self.batch_update_cells(SHEET_SESSIONS, updates)   # 售出金額跟發錢的人同一次寫入
 
         return {
             "ok": True, "item_name": item_name, "item_type": item_type,
             "amount": amount, "per_person": per_person, "n_rows": len(target_rows),
+            "paymaster": paymaster,
         }
 
     def list_unsold_items(self, session_id: str = None) -> list:
