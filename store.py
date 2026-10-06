@@ -1508,6 +1508,100 @@ class SheetsStore:
             ws.update("A1:B1", [["頻道/討論串ID", "允許指令(逗號分隔)"]], value_input_option="USER_ENTERED")
             return ws
 
+    # ---------- 交易區（成員自己掛賣、以物易物） ----------
+    # 「交易區」分頁：一件商品一列，同時也是成交記錄（狀態＝已售出的那些列）。
+    # 這張表一律用 RAW 寫入：內容原封不動當文字存，ID 不會被改壞、有人在備註打公式也不會被執行。
+    # 讀寫都照標題名稱，不靠固定位置，插欄、調順序都不會出錯。
+
+    MARKET_HEADERS = ["貼文ID", "掛賣時間", "物品名稱", "分類", "大類", "交易方式", "開價", "想換", "備註",
+                      "圖片檔名", "賣家", "賣家ID", "狀態", "有興趣的人", "待確認", "成交時間", "買家", "買家ID",
+                      "成交方式", "成交價", "換得物品", "貼文連結"]
+    MARKET_CATEGORY_DEFAULTS = [
+        ("匕首", "近戰武器"), ("斧", "近戰武器"), ("長槍", "近戰武器"), ("拳刃", "近戰武器"),
+        ("釘錘", "近戰武器"), ("劍", "近戰武器"), ("雙刃", "近戰武器"), ("鐮刀", "近戰武器"),
+        ("弓", "遠程武器"), ("手槍", "遠程武器"), ("加特林機槍", "遠程武器"), ("步槍", "遠程武器"),
+        ("發射器", "遠程武器"), ("霰彈槍", "遠程武器"),
+        ("法杖", "法系武器"), ("書", "法系武器"), ("樂器", "法系武器"),
+        ("胸甲", "防具"), ("腿部裝備", "防具"), ("鞋子", "防具"),
+        ("頭飾", "頭部"), ("臉部", "頭部"),
+        ("盾牌", "副手"), ("輔助", "副手"),
+        ("飾品", "飾品"), ("卡片", "卡片"), ("其他", "其他"),
+    ]
+
+    def _market_sheet(self):
+        try:
+            return self.ws("交易區")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="交易區", rows=500, cols=len(self.MARKET_HEADERS))
+            ws.update("A1", [self.MARKET_HEADERS], value_input_option="RAW")
+            return ws
+
+    def get_market_categories(self) -> list:
+        """[(細分類, 大類), ...]，照試算表的順序。分頁不存在就用預設值建立。"""
+        try:
+            ws = self.ws("交易分類")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="交易分類", rows=100, cols=2)
+            ws.update("A1", [["細分類（貼文標題用）", "大類（論壇標籤）"]] + [list(x) for x in self.MARKET_CATEGORY_DEFAULTS],
+                      value_input_option="RAW")
+        out = []
+        for row in ws.get_all_values()[1:]:
+            row = row + ["", ""]
+            if row[0].strip() and row[1].strip():
+                out.append((row[0].strip(), row[1].strip()))
+        return out
+
+    def _market_rows(self):
+        ws = self._market_sheet()
+        values = ws.get_all_values()
+        headers = values[0] if values else list(self.MARKET_HEADERS)
+        rows = []
+        for i, row in enumerate(values[1:], start=2):
+            d = {h: (row[j] if j < len(row) else "") for j, h in enumerate(headers)}
+            if d.get("貼文ID", "").strip():
+                d["_row"] = i
+                rows.append(d)
+        return ws, headers, rows
+
+    def market_add(self, listing: dict):
+        ws, headers, rows = self._market_rows()
+        n = max([r["_row"] for r in rows], default=1) + 1
+        if ws.row_count < n:
+            ws.add_rows(n - ws.row_count + 50)
+        ws.update(f"A{n}", [[str(listing.get(h, "")) for h in headers]], value_input_option="RAW")
+
+    def market_get(self, post_id) -> dict:
+        _, _, rows = self._market_rows()
+        return next((r for r in rows if r["貼文ID"].strip() == str(post_id)), None)
+
+    def market_update(self, post_id, fields: dict) -> dict:
+        """照標題名稱更新這件商品的幾個欄位，回傳更新後的整列。找不到回傳 None。"""
+        ws, headers, rows = self._market_rows()
+        r = next((x for x in rows if x["貼文ID"].strip() == str(post_id)), None)
+        if r is None:
+            return None
+        data = []
+        for k, v in fields.items():
+            if k not in headers:
+                raise DataIntegrityError(f"「交易區」分頁少了「{k}」這一欄，請不要刪掉標題列的欄位。")
+            data.append({"range": f"{_col_letter(headers.index(k) + 1)}{r['_row']}", "values": [[str(v)]]})
+            r[k] = str(v)
+        if data:
+            ws.batch_update(data, value_input_option="RAW")
+        return r
+
+    def market_by_seller(self, seller_id: str) -> list:
+        _, _, rows = self._market_rows()
+        return [r for r in rows if r.get("賣家ID", "").strip() == str(seller_id)]
+
+    def save_market_forum(self, forum_id):
+        self._state_sheet().update("A4:B4", [["交易區論壇", str(forum_id or "")]], value_input_option="RAW")
+
+    def load_market_forum(self):
+        raw = (self._state_sheet().get("B4") or [[""]])[0]
+        raw = raw[0].strip() if raw else ""
+        return int(raw) if raw.isdigit() else None
+
     # ---------- 身分組按鈕（存在「身分組按鈕」分頁，第一次用到時自動建立） ----------
     # 一列一個按鈕：A 分組、B 身分組ID、C 表情符號、D 身分組名稱（只是方便人看，機器人以 ID 為準）。
 
