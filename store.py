@@ -259,6 +259,23 @@ class SheetsStore:
     def ws(self, sheet_name: str):
         return self._ss().worksheet(sheet_name)
 
+    # ---------- 場次記錄有變動時通知（待售物品清單靠這個即時更新） ----------
+    # 所有寫入場次記錄的動作都會經過下面幾個共用的寫入函式，在那裡統一通知，
+    # 不用在每個指令裡各自記得更新清單，之後新增的功能也自動算在內。
+    # 寫入是在背景執行緒裡做的，監聽者自己要負責切回主執行緒（用 call_soon_threadsafe）。
+
+    def add_change_listener(self, callback):
+        self.__dict__.setdefault("_change_listeners", []).append(callback)
+
+    def _notify_change(self, sheet_name: str):
+        if sheet_name != SHEET_SESSIONS:
+            return
+        for cb in self.__dict__.get("_change_listeners", []):
+            try:
+                cb()
+            except Exception as e:
+                print(f"⚠️ 通知場次記錄變動失敗：{e}", flush=True)
+
     # ---------- 欄位順序檢查（寫入前） ----------
 
     def check_layout(self, sheet_name: str):
@@ -341,6 +358,7 @@ class SheetsStore:
         start = f"{_col_letter(start_col)}{row_number}"
         end = f"{_col_letter(start_col + len(values) - 1)}{row_number}"
         self.ws(sheet_name).update(f"{start}:{end}", [values], value_input_option="USER_ENTERED")
+        self._notify_change(sheet_name)
 
     def append_rows_batch(self, sheet_name: str, values_list: list, start_col: int = 1, key_col_index: int = 1,
                            extra_formulas: list = None):
@@ -368,6 +386,7 @@ class SheetsStore:
                     updates.append((r, col, [formula_fn(r)]))
             self.batch_update_cells(sheet_name, updates, raw=True)
 
+        self._notify_change(sheet_name)
         return start_row
 
     def batch_update_cells(self, sheet_name: str, updates: list, raw: bool = False):
@@ -388,15 +407,18 @@ class SheetsStore:
             end_letter = _col_letter(start_col + len(values) - 1)
             data.append({"range": f"{start_letter}{row}:{end_letter}{row}", "values": [values]})
         self.ws(sheet_name).batch_update(data, value_input_option="USER_ENTERED")
+        self._notify_change(sheet_name)
 
     def update_cell(self, sheet_name: str, row: int, col: int, value):
         self.check_layout(sheet_name)
         letter = _col_letter(col)
         self.ws(sheet_name).update(f"{letter}{row}", [[_sanitize(value)]], value_input_option="USER_ENTERED")
+        self._notify_change(sheet_name)
 
     def delete_row(self, sheet_name: str, row_number: int):
         self.check_layout(sheet_name)
         self.ws(sheet_name).delete_rows(row_number)
+        self._notify_change(sheet_name)
 
     @staticmethod
     def _first_empty_row_from(rows: list) -> int:
@@ -877,6 +899,22 @@ class SheetsStore:
         """存下進行中的場次；None 代表目前沒有進行中的場次。用 RAW 寫入，內容原封不動當文字存。"""
         value = json.dumps(session, ensure_ascii=False) if session else ""
         self._state_sheet().update("A2:B2", [["進行中場次", value]], value_input_option="RAW")
+
+    def save_inventory_panels(self, panels: list):
+        """待售物品清單發在哪幾則訊息：[{"channel": 頻道ID, "message": 訊息ID}, ...]。"""
+        value = json.dumps(panels) if panels else ""
+        self._state_sheet().update("A3:B3", [["待售物品清單", value]], value_input_option="RAW")
+
+    def load_inventory_panels(self) -> list:
+        raw = (self._state_sheet().get("B3") or [[""]])[0]
+        raw = raw[0].strip() if raw else ""
+        if not raw:
+            return []
+        try:
+            panels = json.loads(raw)
+        except ValueError:
+            return []
+        return [p for p in panels if isinstance(p, dict) and p.get("channel") and p.get("message")]
 
     def load_active_session(self):
         """
@@ -1405,6 +1443,7 @@ class SheetsStore:
             return {"ok": False, "reason": reason}
 
         ss.del_worksheet(backup)
+        self._notify_change(SHEET_SESSIONS)
         deleted = [dict(zip(headers, row)) for _, row in targets]
         return {"ok": True, "deleted": len(targets), "rows": deleted}
 

@@ -83,6 +83,7 @@ EXTENSIONS = [
     "cogs.access_control",
     "cogs.panel",
     "cogs.roles",
+    "cogs.inventory",
     "cogs.owner",
     "cogs.help",
 ]
