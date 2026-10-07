@@ -1515,7 +1515,7 @@ class SheetsStore:
 
     MARKET_HEADERS = ["貼文ID", "掛賣時間", "物品名稱", "分類", "大類", "交易方式", "開價", "想換", "備註",
                       "圖片檔名", "賣家", "賣家ID", "狀態", "有興趣的人", "待確認", "成交時間", "買家", "買家ID",
-                      "成交方式", "成交價", "換得物品", "貼文連結"]
+                      "成交方式", "成交價", "換得物品", "貼文連結", "到期時間", "已提醒"]
     MARKET_CATEGORY_DEFAULTS = [
         ("匕首", "近戰武器"), ("斧", "近戰武器"), ("長槍", "近戰武器"), ("拳刃", "近戰武器"),
         ("釘錘", "近戰武器"), ("劍", "近戰武器"), ("雙刃", "近戰武器"), ("鐮刀", "近戰武器"),
@@ -1555,6 +1555,14 @@ class SheetsStore:
         ws = self._market_sheet()
         values = ws.get_all_values()
         headers = values[0] if values else list(self.MARKET_HEADERS)
+        # 新版本多了欄位（例如到期時間、已提醒），舊的分頁沒有的話自動補在標題列最後面，不用手動改試算表
+        missing = [h for h in self.MARKET_HEADERS if h not in headers]
+        if missing and values:
+            if ws.col_count < len(headers) + len(missing):
+                ws.add_cols(len(headers) + len(missing) - ws.col_count)
+            ws.update(f"{_col_letter(len(headers) + 1)}1", [missing], value_input_option="RAW")
+            headers = headers + missing
+            values[0] = headers
         rows = []
         for i, row in enumerate(values[1:], start=2):
             d = {h: (row[j] if j < len(row) else "") for j, h in enumerate(headers)}
