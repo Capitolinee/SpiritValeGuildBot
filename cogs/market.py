@@ -30,8 +30,8 @@ import audit
 from helpers import now_str, TW_TZ
 
 STATUS_TAGS = ("出售中", "議價中", "已售出")
-TRADE_TAGS = ("出售", "交換")
-TRADE_TYPES = ("出售", "交換", "都可以")
+TRADE_TAGS = ("出售", "交換", "贈送")
+TRADE_TYPES = ("出售", "交換", "都可以", "贈送")
 ACTIVE = ("出售中", "議價中")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 NONE_MENTIONS = discord.AllowedMentions.none()
@@ -63,52 +63,68 @@ def fmt_price(v) -> str:
         return ""
 
 
-def listing_ts(listing: dict) -> Optional[int]:
+def listing_title(l: dict) -> str:
+    trade, price = l.get("交易方式"), fmt_price(l.get("開價"))
+    prefix = {"已售出": "【已送出】" if trade == "贈送" else "【已售出】", "已下架": "【已下架】"}.get(l.get("狀態"), "")
+    tail = {"出售": price, "交換": "可交換", "都可以": f"{price}｜可交換" if price else "可交換",
+            "贈送": "免費贈送"}.get(trade, price)
+    return f"{prefix}【{l.get('分類')}】{l.get('物品名稱')}｜{tail}"[:100]
+
+
+TRADE_EMOJI = {"出售": "💰", "交換": "🔄", "都可以": "💰🔄", "贈送": "🎁"}
+STATUS_TEXT = {"出售中": "🟢 出售中", "議價中": "🤝 議價中", "已售出": "✅ 已售出", "已下架": "🗑️ 已下架"}
+METHOD_TEXT = {"金錢": "💰 金錢", "交換": "🔄 交換", "兩者都有": "🔄💰 交換＋補差價", "贈送": "🎁 贈送"}
+# 贈品的狀態用比較貼切的說法（論壇標籤名稱還是同一組）
+GIFT_STATUS_TEXT = {"出售中": "🟢 等人索取", "議價中": "🙋 有人想要", "已售出": "✅ 已送出", "已下架": "🗑️ 已下架"}
+
+
+def when_text(stored: str, ts: Optional[int]) -> str:
+    """2026/10/02 21:30（3 小時前）：前面是固定的台灣時間，括號裡是 Discord 的相對時間，會自己更新。"""
+    text = (stored or "")[:16]
+    return f"{text}（<t:{ts}:R>）" if ts else text
+
+
+def to_ts(stored: str) -> Optional[int]:
     try:
-        return int(datetime.strptime(listing.get("掛賣時間", ""), "%Y/%m/%d %H:%M:%S").replace(tzinfo=TW_TZ).timestamp())
+        return int(datetime.strptime(stored or "", "%Y/%m/%d %H:%M:%S").replace(tzinfo=TW_TZ).timestamp())
     except ValueError:
         return None
-
-
-def listing_title(l: dict) -> str:
-    prefix = {"已售出": "【已售出】", "已下架": "【已下架】"}.get(l.get("狀態"), "")
-    trade, price = l.get("交易方式"), fmt_price(l.get("開價"))
-    tail = {"出售": price, "交換": "可交換", "都可以": f"{price}｜可交換" if price else "可交換"}.get(trade, price)
-    return f"{prefix}【{l.get('分類')}】{l.get('物品名稱')}｜{tail}"[:100]
 
 
 def listing_embed(l: dict) -> discord.Embed:
     status = l.get("狀態", "")
     color = {"出售中": discord.Color.green(), "議價中": discord.Color.orange(),
              "已售出": discord.Color.dark_grey(), "已下架": discord.Color.dark_grey()}.get(status, discord.Color.blurple())
-    lines = [f"**分類**：{l.get('分類')}（{l.get('大類')}）", f"**交易方式**：{l.get('交易方式')}"]
+    trade = l.get("交易方式", "")
+    lines = [
+        f"📂 **分類**：{l.get('分類')}（{l.get('大類')}）",
+        f"{TRADE_EMOJI.get(trade, '💱')} **交易方式**：{trade}",
+    ]
     if l.get("開價"):
-        lines.append(f"**開價**：{fmt_price(l['開價'])}")
+        lines.append(f"🏷️ **開價**：{fmt_price(l['開價'])}")
     if l.get("想換"):
-        lines.append(f"**想換**：{l['想換']}")
+        lines.append(f"🎯 **想換**：{l['想換']}")
     if l.get("備註"):
-        lines.append(f"**備註**：{l['備註']}")
-    lines.append(f"**賣家**：<@{l.get('賣家ID')}>")
-    ts = listing_ts(l)
-    if ts:
-        lines.append(f"**掛賣時間**：<t:{ts}:f>（<t:{ts}:R>）")
-    lines.append(f"**狀態**：{ {'出售中': '🟢 出售中', '議價中': '🤝 議價中', '已售出': '✅ 已售出', '已下架': '🗑️ 已下架'}.get(status, status) }")
+        lines.append(f"📝 **備註**：{l['備註']}")
+    lines.append(f"👤 **賣家**：<@{l.get('賣家ID')}>")
+    lines.append(f"🕒 **掛賣時間**：{when_text(l.get('掛賣時間'), to_ts(l.get('掛賣時間')))}")
+    lines.append(f"📌 **狀態**：{(GIFT_STATUS_TEXT if trade == '贈送' else STATUS_TEXT).get(status, status)}")
     if status == "已售出":
         lines.append("")
-        lines.append(f"**買家**：<@{l.get('買家ID')}>")
-        lines.append(f"**成交方式**：{l.get('成交方式')}")
+        lines.append(f"🙋 **{'收到的人' if trade == '贈送' else '買家'}**：<@{l.get('買家ID')}>")
+        lines.append(f"🤝 **成交方式**：{METHOD_TEXT.get(l.get('成交方式'), l.get('成交方式'))}")
         if l.get("成交價"):
-            lines.append(f"**成交價**：{fmt_price(l['成交價'])}")
+            lines.append(f"💵 **成交價**：{fmt_price(l['成交價'])}")
         if l.get("換得物品"):
-            lines.append(f"**換得物品**：{l['換得物品']}")
-        lines.append(f"**成交時間**：{l.get('成交時間')}")
+            lines.append(f"🎁 **換得物品**：{l['換得物品']}")
+        lines.append(f"✅ **{'送出時間' if trade == '贈送' else '成交時間'}**：{when_text(l.get('成交時間'), to_ts(l.get('成交時間')))}")
     embed = discord.Embed(title=l.get("物品名稱", "")[:256], description="\n".join(lines)[:4000], color=color)
     if l.get("圖片檔名"):
         embed.set_image(url=f"attachment://{l['圖片檔名']}")
     return embed
 
 
-TRADE_CODE = {"出售": "s", "交換": "x", "都可以": "b"}
+TRADE_CODE = {"出售": "s", "交換": "x", "都可以": "b", "贈送": "g"}   # 寫進「我有興趣」按鈕 ID 的交易方式代碼
 
 
 def card_view(post_id: int, trade: str) -> discord.ui.View:
@@ -173,6 +189,8 @@ def tags_for(forum, l: dict) -> list:
         names.append("出售")
     if trade in ("交換", "都可以"):
         names.append("交換")
+    if trade == "贈送":
+        names.append("贈送")
     status = l.get("狀態")
     if status in STATUS_TAGS:
         names.append(status)
@@ -284,7 +302,8 @@ class SellWizardView(discord.ui.View):
         self.trade_select = discord.ui.Select(placeholder="③ 選擇交易方式", row=2, options=[
             discord.SelectOption(label="出售", value="出售", emoji="💰", description="只收錢"),
             discord.SelectOption(label="交換", value="交換", emoji="🔄", description="只接受以物易物"),
-            discord.SelectOption(label="都可以", value="都可以", emoji="🤝", description="收錢或交換都可以")])
+            discord.SelectOption(label="都可以", value="都可以", emoji="🤝", description="收錢或交換都可以"),
+            discord.SelectOption(label="贈送", value="贈送", emoji="🎁", description="免費送出，不收任何代價")])
         self.trade_select.callback = self.on_trade
         for item in (self.group_select, self.category_select, self.trade_select):
             self.add_item(item)
@@ -396,6 +415,9 @@ async def express_interest(bot, interaction: discord.Interaction, post_id: int, 
             await thread.send(text, file=file, allowed_mentions=mentions)
         else:
             await thread.send(text, allowed_mentions=mentions)
+    elif l.get("交易方式") == "贈送":
+        await thread.send(f"🙋 {interaction.user.mention} 想要「{l['物品名稱']}」！\n{seller} 決定好要送給誰之後，"
+                          f"按「⚙️ 賣家管理」→「✅ 已送出」。", allowed_mentions=mentions)
     else:
         await thread.send(f"🙋 {interaction.user.mention} 想買「{l['物品名稱']}」！\n{seller} 可以直接在這裡議價。",
                           allowed_mentions=mentions)
@@ -446,15 +468,15 @@ class BuyOrSwapView(discord.ui.View):
         await interaction.response.send_modal(OfferModal(self.bot, self.post_id))
 
 
-class InterestButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mkt:i:(?P<pid>[0-9]+):(?P<t>[sxb])"):
+class InterestButton(discord.ui.DynamicItem[discord.ui.Button], template=r"mkt:i:(?P<pid>[0-9]+):(?P<t>[sxbg])"):
     """
-    交易方式直接寫在按鈕 ID 裡（s 出售、x 交換、b 都可以）：交換的話按下去要馬上跳出輸入視窗，
+    交易方式直接寫在按鈕 ID 裡（s 出售、x 交換、b 都可以、g 贈送）：交換的話按下去要馬上跳出輸入視窗，
     輸入視窗必須是第一個回應、要在 3 秒內，不能先去查試算表。檢查（是不是自己的、結束了沒）在送出時才做。
     """
 
     def __init__(self, post_id: int, trade_code: str = "s"):
-        super().__init__(discord.ui.Button(label="我有興趣", emoji="🙋", style=discord.ButtonStyle.success,
-                                           custom_id=f"mkt:i:{post_id}:{trade_code}"))
+        super().__init__(discord.ui.Button(label="我想要" if trade_code == "g" else "我有興趣", emoji="🙋",
+                                           style=discord.ButtonStyle.success, custom_id=f"mkt:i:{post_id}:{trade_code}"))
         self.post_id, self.trade_code = post_id, trade_code
 
     @classmethod
@@ -528,6 +550,39 @@ class EditModal(discord.ui.Modal):
         await reply_error(interaction, f"❌ 修改失敗：{error}")
 
 
+async def send_deal_confirmation(bot, interaction: discord.Interaction, post_id: int, buyer, method: str,
+                                 price="", item=""):
+    """記下待確認的成交內容（附一次性驗證碼），在貼文裡請買家／收到的人確認。呼叫前要先 defer。"""
+    nonce = secrets.token_hex(3)
+    pending = {"buyer_id": str(buyer.id), "buyer": buyer.display_name, "method": method,
+               "price": price, "item": item, "nonce": nonce}
+    async with bot.store.lock:
+        l = await asyncio.to_thread(bot.store.market_get, post_id)
+        if l is None or l.get("狀態") not in ACTIVE:
+            await interaction.followup.send("這件商品已經結束了。", ephemeral=True)
+            return
+        await asyncio.to_thread(bot.store.market_update, post_id, {"待確認": json.dumps(pending, ensure_ascii=False)})
+    thread = await get_thread(bot, post_id)
+    view = discord.ui.View(timeout=None)
+    view.add_item(ConfirmDealButton(post_id, nonce))
+    view.add_item(RejectDealButton(post_id, nonce))
+    if method == "贈送":
+        text = (f"🎁 <@{l['賣家ID']}> 要把「{l['物品名稱']}」送給 {buyer.mention}！\n"
+                f"{buyer.mention} 收到之後請按「確認成交」（只有你能按）。")
+    else:
+        deal = []
+        if price:
+            deal.append(f"{'成交價' if method == '金錢' else '補差價'} **{fmt_price(price)}**")
+        if item:
+            deal.append(f"換得 **{item}**")
+        text = (f"🤝 <@{l['賣家ID']}> 確認把「{l['物品名稱']}」交易給 {buyer.mention}：{'，'.join(deal)}\n"
+                f"{buyer.mention} 請確認這筆交易（只有你能按）。")
+    await thread.send(text, view=view, allowed_mentions=discord.AllowedMentions(users=[buyer]))
+    audit.audit("交易區：送出成交確認", who=interaction.user.display_name,
+                detail=f"{l['物品名稱']}｜對象 {buyer.display_name}｜{method}｜{price or ''} {item}")
+    await interaction.followup.send(f"✅ 已經請 {buyer.display_name} 在貼文裡確認，他按下確認才算完成。", ephemeral=True)
+
+
 class DealModal(discord.ui.Modal):
     def __init__(self, bot, post_id: int, buyer: discord.abc.User, method: str):
         super().__init__(title="成交內容")
@@ -550,31 +605,7 @@ class DealModal(discord.ui.Modal):
                 return
         item = self.item_input.value.strip() if self.item_input is not None else ""
         await interaction.response.defer(ephemeral=True, thinking=True)
-        nonce = secrets.token_hex(3)
-        pending = {"buyer_id": str(self.buyer.id), "buyer": self.buyer.display_name, "method": self.method,
-                   "price": price, "item": item, "nonce": nonce}
-        async with self.bot.store.lock:
-            l = await asyncio.to_thread(self.bot.store.market_get, self.post_id)
-            if l is None or l.get("狀態") not in ACTIVE:
-                await interaction.followup.send("這件商品已經結束了。", ephemeral=True)
-                return
-            await asyncio.to_thread(self.bot.store.market_update, self.post_id, {"待確認": json.dumps(pending, ensure_ascii=False)})
-        deal = []
-        if price:
-            deal.append(f"{'成交價' if self.method == '金錢' else '補差價'} **{fmt_price(price)}**")
-        if item:
-            deal.append(f"換得 **{item}**")
-        thread = await get_thread(self.bot, self.post_id)
-        view = discord.ui.View(timeout=None)
-        view.add_item(ConfirmDealButton(self.post_id, nonce))
-        view.add_item(RejectDealButton(self.post_id, nonce))
-        await thread.send(
-            f"🤝 <@{l['賣家ID']}> 確認把「{l['物品名稱']}」交易給 {self.buyer.mention}：{'，'.join(deal)}\n"
-            f"{self.buyer.mention} 請確認這筆交易（只有你能按）。",
-            view=view, allowed_mentions=discord.AllowedMentions(users=[self.buyer]))
-        audit.audit("交易區：送出成交確認", who=interaction.user.display_name,
-                    detail=f"{l['物品名稱']}｜買家 {self.buyer.display_name}｜{self.method}｜{price or ''} {item}")
-        await interaction.followup.send(f"✅ 已經請 {self.buyer.display_name} 在貼文裡確認，他按下確認才算成交。", ephemeral=True)
+        await send_deal_confirmation(self.bot, interaction, self.post_id, self.buyer, self.method, price, item)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         audit.error("交易區：成交內容發生錯誤", error, who=interaction.user.display_name)
@@ -588,9 +619,12 @@ class DealSetupView(discord.ui.View):
         super().__init__(timeout=600)
         self.bot, self.l, self.buyer = bot, l, None
         trade = l.get("交易方式")
-        methods = {"出售": ["金錢"], "交換": ["交換", "兩者都有"], "都可以": ["金錢", "交換", "兩者都有"]}.get(trade, ["金錢"])
+        methods = {"出售": ["金錢"], "交換": ["交換", "兩者都有"], "都可以": ["金錢", "交換", "兩者都有"],
+                   "贈送": ["贈送"]}.get(trade, ["金錢"])
+        if trade == "贈送":
+            self.next_step.label = "送出：請對方確認"
         self.method = methods[0] if len(methods) == 1 else None
-        self.user_select = discord.ui.UserSelect(placeholder="選擇成交對象", row=0)
+        self.user_select = discord.ui.UserSelect(placeholder="選擇要送給誰" if trade == "贈送" else "選擇成交對象", row=0)
         self.user_select.callback = self.on_user
         self.add_item(self.user_select)
         if len(methods) > 1:
@@ -619,6 +653,10 @@ class DealSetupView(discord.ui.View):
         if self.buyer is None or self.method is None:
             await interaction.response.send_message("⚠️ 成交對象跟成交方式都要先選好。", ephemeral=True)
             return
+        if self.method == "贈送":   # 贈品沒有金額跟換得的物品，直接請對方確認
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await send_deal_confirmation(self.bot, interaction, int(self.l["貼文ID"]), self.buyer, "贈送")
+            return
         await interaction.response.send_modal(DealModal(self.bot, int(self.l["貼文ID"]), self.buyer, self.method))
 
 
@@ -626,6 +664,8 @@ class ManageView(discord.ui.View):
     def __init__(self, bot, l: dict):
         super().__init__(timeout=600)
         self.bot, self.l = bot, l
+        if l.get("交易方式") == "贈送":
+            self.deal.label, self.deal.emoji = "已送出", "🎁"
 
     @discord.ui.button(label="修改", emoji="✏️", style=discord.ButtonStyle.secondary)
     async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -634,6 +674,12 @@ class ManageView(discord.ui.View):
     @discord.ui.button(label="已成交", emoji="✅", style=discord.ButtonStyle.success)
     async def deal(self, interaction: discord.Interaction, button: discord.ui.Button):
         names = [f"<@{i}>" for i in interested_ids(self.l)]
+        if self.l.get("交易方式") == "贈送":
+            hint = f"想要的人：{'、'.join(names)}\n" if names else ""
+            await interaction.response.send_message(
+                f"**🎁 送出：{self.l['物品名稱']}**\n{hint}選好要送給誰，按「送出」。對方確認收到之後才算完成。",
+                view=DealSetupView(self.bot, self.l), ephemeral=True, allowed_mentions=NONE_MENTIONS)
+            return
         hint = f"有興趣的人：{'、'.join(names)}\n" if names else ""
         await interaction.response.send_message(
             f"**✅ 成交：{self.l['物品名稱']}**\n{hint}選好成交對象和成交方式，再按「下一步」。對方確認之後才算成交。",
