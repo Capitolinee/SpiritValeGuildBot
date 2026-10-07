@@ -1584,7 +1584,12 @@ class SheetsStore:
 
     MARKET_HEADERS = ["貼文ID", "掛賣時間", "物品名稱", "分類", "大類", "交易方式", "開價", "想換", "備註",
                       "圖片檔名", "賣家", "賣家ID", "狀態", "有興趣的人", "待確認", "成交時間", "買家", "買家ID",
-                      "成交方式", "成交價", "換得物品", "貼文連結", "到期時間", "已提醒"]
+                      "成交方式", "成交價", "換得物品", "貼文連結", "到期時間", "已提醒", "數量", "成交次數"]
+    # 「數量」：長期供貨是庫存、收購是還要收幾個。收購貼文的「賣家／賣家ID」是發文的人（也就是買家）。
+
+    # 「成交記錄」分頁：一筆成交一列（長期供貨同一篇會成交很多次）。查行情讀這張。
+    DEAL_HEADERS = ["成交時間", "貼文ID", "物品名稱", "分類", "大類", "交易方式", "賣家", "賣家ID", "買家", "買家ID",
+                    "成交方式", "數量", "單價", "成交價", "換得物品", "貼文連結", "備註"]
     MARKET_CATEGORY_DEFAULTS = [
         ("匕首", "近戰武器"), ("斧", "近戰武器"), ("長槍", "近戰武器"), ("拳刃", "近戰武器"),
         ("釘錘", "近戰武器"), ("劍", "近戰武器"), ("雙刃", "近戰武器"), ("鐮刀", "近戰武器"),
@@ -1666,6 +1671,63 @@ class SheetsStore:
         if data:
             ws.batch_update(data, value_input_option="RAW")
         return r
+
+    def _deal_sheet(self):
+        """成交記錄分頁；第一次建立時，把「交易區」裡以前成交過的搬過來，查行情才不會漏掉。"""
+        try:
+            return self.ws("成交記錄")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="成交記錄", rows=1000, cols=len(self.DEAL_HEADERS))
+            old = []
+            for r in self._market_rows()[2]:
+                if r.get("狀態") == "已售出":
+                    old.append([r.get("成交時間", ""), r.get("貼文ID", ""), r.get("物品名稱", ""), r.get("分類", ""),
+                                r.get("大類", ""), r.get("交易方式", ""), r.get("賣家", ""), r.get("賣家ID", ""),
+                                r.get("買家", ""), r.get("買家ID", ""), r.get("成交方式", ""), "1",
+                                r.get("成交價", ""), r.get("成交價", ""), r.get("換得物品", ""), r.get("貼文連結", ""), ""])
+            ws.update("A1", [self.DEAL_HEADERS] + old, value_input_option="RAW")
+            return ws
+
+    def _deal_rows(self):
+        ws = self._deal_sheet()
+        values = ws.get_all_values()
+        headers = values[0]
+        rows = []
+        for i, row in enumerate(values[1:], start=2):
+            d = {h: (row[j] if j < len(row) else "") for j, h in enumerate(headers)}
+            if d.get("貼文ID", "").strip():
+                d["_row"] = i
+                rows.append(d)
+        return ws, headers, rows
+
+    def deal_add(self, deal: dict):
+        ws, headers, rows = self._deal_rows()
+        # 保險：同一篇貼文、同一個成交時間、同一個買家、同一個金額，而且沒有取消的，就當成已經寫過（不重複寫）。
+        # 正常情況下分頁會在標記已售出之前就先建好（見 market 的確認成交），不會發生重複。
+        key = lambda r: (str(r.get("貼文ID", "")).strip(), str(r.get("成交時間", "")), str(r.get("買家ID", "")),
+                         str(r.get("成交價", "")))
+        if any(key(r) == key(deal) and r.get("備註") != "已取消" for r in rows):
+            return
+        n = max([r["_row"] for r in rows], default=1) + 1
+        if ws.row_count < n:
+            ws.add_rows(200)
+        ws.update(f"A{n}", [[str(deal.get(h, "")) for h in headers]], value_input_option="RAW")
+
+    def deals_all(self) -> list:
+        return self._deal_rows()[2]
+
+    def deal_update_last(self, post_id, fields: dict) -> bool:
+        """更新這篇貼文「最近一筆」成交（管理員修正、取消一般商品的成交時用）。"""
+        ws, headers, rows = self._deal_rows()
+        mine = [r for r in rows if r["貼文ID"].strip() == str(post_id) and r.get("備註") != "已取消"]
+        if not mine:
+            return False
+        r = mine[-1]
+        data = [{"range": f"{_col_letter(headers.index(k) + 1)}{r['_row']}", "values": [[str(v)]]}
+                for k, v in fields.items() if k in headers]
+        if data:
+            ws.batch_update(data, value_input_option="RAW")
+        return True
 
     def market_all(self) -> list:
         """交易區所有商品（含已成交、已下架），查行情用。"""
