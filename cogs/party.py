@@ -488,6 +488,24 @@ class EditWizard(discord.ui.View):
         await interaction.response.send_modal(EditModal(self.bot, self.p, self.server))
 
 
+class TransferView(discord.ui.View):
+    """轉交發起人：只能選目前隊伍裡的人（候補、中途退出的不行）。原發起人留在隊伍裡當一般隊員。"""
+
+    def __init__(self, bot, p: dict):
+        super().__init__(timeout=300)
+        self.bot, self.pid = bot, p["id"]
+        self.sel = discord.ui.Select(placeholder="要轉交給誰？", options=[
+            discord.SelectOption(label=m["char"][:100], value=m["uid"],
+                                 description="｜".join(x for x in (m.get("job"), m.get("pos")) if x)[:100] or None)
+            for m in active_members(p) if m["uid"] != p["leader_id"]][:25])
+        self.sel.callback = self.on_pick
+        self.add_item(self.sel)
+
+    async def on_pick(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await guarded(interaction, self.bot.get_cog("Party").transfer(interaction, self.pid, self.sel.values[0]), "轉交發起人")
+
+
 class RemoveView(discord.ui.View):
     def __init__(self, bot, p: dict):
         super().__init__(timeout=300)
@@ -514,7 +532,8 @@ class LeaderView(discord.ui.View):
     def __init__(self, bot, pid: str, status: str):
         super().__init__(timeout=600)
         self.bot, self.pid = bot, pid
-        keep = ("開打", "移除隊友", "修改資訊", "延長", "取消揪團") if status == "招募中" else ("補人", "移除隊友", "結束")
+        keep = (("開打", "移除隊友", "轉交發起人", "修改資訊", "延長", "取消揪團") if status == "招募中"
+                else ("補人", "移除隊友", "轉交發起人", "結束"))
         for item in list(self.children):
             if not any(k in (item.label or "") for k in keep):
                 self.remove_item(item)
@@ -545,6 +564,18 @@ class LeaderView(discord.ui.View):
             return
         await interaction.response.send_message("選擇要移除的人（被移除的人不能再加入這一場）：",
                                                 view=RemoveView(self.bot, p), ephemeral=True)
+
+    @discord.ui.button(label="轉交發起人", emoji="👑", style=discord.ButtonStyle.secondary)
+    async def transfer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = self._p()
+        if p is None or p["status"] not in ACTIVE:
+            await reply(interaction, "這個揪團已經結束了。")
+            return
+        if not [m for m in active_members(p) if m["uid"] != p["leader_id"]]:
+            await reply(interaction, "隊伍裡沒有其他人可以轉交。")
+            return
+        await interaction.response.send_message("選擇新的發起人（只能選目前隊伍裡的人）。轉交之後你會留在隊伍裡當一般隊員：",
+                                                view=TransferView(self.bot, p), ephemeral=True)
 
     @discord.ui.button(label="修改資訊", emoji="✏️", style=discord.ButtonStyle.secondary)
     async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -912,6 +943,29 @@ class Party(commands.Cog):
             await self.save(p)
         await reply(interaction, "✅ 開始叫候補，5 分鐘沒回應會自動換下一位。")
         await self.maybe_offer(pid)
+
+    async def transfer(self, interaction, pid, uid):
+        async with self.lock:
+            p = await self._lead(interaction, pid)
+            if p is None:
+                return
+            old = p["leader_id"]
+            target = next((m for m in active_members(p) if m["uid"] == uid), None)
+            if target is None or uid == old:
+                await reply(interaction, "這個人目前不在隊伍裡，不能轉交給他。")
+                return
+            p["leader_id"] = uid
+            p["warned"] = False          # 自動關閉前的提醒改發給新發起人
+            await self.save(p)
+        await self.refresh_card(p)
+        others = [i for i in everyone_in(p) if i not in (uid, str(interaction.user.id))]
+        await self.notify(f"👑 <@{uid}> {interaction.user.display_name} 把 {p['server']} {p['place']} 的揪團發起人轉交給你了，"
+                          f"之後開打、補人這些都由你按「⚙️ 發起人管理」。"
+                          + (f"\n{mention_list(others)} 發起人換人了。" if others else "") + f"\n👉 {self.card_url(p)}",
+                          mention_ids=[uid] + others)
+        audit.audit("揪團：轉交發起人", who=interaction.user.display_name,
+                    detail=f"{p['server']} {p['place']}｜原本 {old} → {target['char']}")
+        await reply(interaction, f"✅ 已經把發起人轉交給 {target['char']}，你留在隊伍裡當一般隊員，之後也可以自己退出。")
 
     async def remove_person(self, interaction, pid, uid, where):
         async with self.lock:
