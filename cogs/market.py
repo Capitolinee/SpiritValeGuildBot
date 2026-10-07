@@ -19,21 +19,25 @@ import json
 import os
 import re
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import audit
-from helpers import now_str, TW_TZ
+from helpers import TW_TZ
 
 STATUS_TAGS = ("出售中", "議價中", "已售出")
 TRADE_TAGS = ("出售", "交換", "贈送")
 TRADE_TYPES = ("出售", "交換", "都可以", "贈送")
 ACTIVE = ("出售中", "議價中")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+LISTING_DAYS = 30          # 掛賣幾天後到期
+REMIND_DAYS_BEFORE = 5     # 到期前幾天提醒賣家（第 25 天）
+ACTIVE_GRACE_DAYS = 7      # 到期時，貼文裡這幾天內還有人（不是機器人）回覆的話，代表還在談，先不下架
+TIME_FMT = "%Y/%m/%d %H:%M:%S"
 NONE_MENTIONS = discord.AllowedMentions.none()
 
 
@@ -78,6 +82,31 @@ METHOD_TEXT = {"金錢": "💰 金錢", "交換": "🔄 交換", "兩者都有":
 GIFT_STATUS_TEXT = {"出售中": "🟢 等人索取", "議價中": "🙋 有人想要", "已售出": "✅ 已送出", "已下架": "🗑️ 已下架"}
 
 
+def now_tw() -> datetime:
+    """交易區所有「現在幾點」都從這裡拿（台灣時間），時間來源統一，測試時也能快轉。"""
+    return datetime.now(TW_TZ)
+
+
+def parse_time(stored: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(stored or "", TIME_FMT).replace(tzinfo=TW_TZ)
+    except ValueError:
+        return None
+
+
+def fmt_time(dt: datetime) -> str:
+    return dt.astimezone(TW_TZ).strftime(TIME_FMT)
+
+
+def expires_at(l: dict) -> Optional[datetime]:
+    """到期時間；舊的商品沒有記到期時間，就用掛賣時間＋30 天。"""
+    exp = parse_time(l.get("到期時間"))
+    if exp is None:
+        listed = parse_time(l.get("掛賣時間"))
+        exp = listed + timedelta(days=LISTING_DAYS) if listed else None
+    return exp
+
+
 def when_text(stored: str, ts: Optional[int]) -> str:
     """2026/10/02 21:30（3 小時前）：前面是固定的台灣時間，括號裡是 Discord 的相對時間，會自己更新。"""
     text = (stored or "")[:16]
@@ -109,6 +138,9 @@ def listing_embed(l: dict) -> discord.Embed:
     lines.append(f"👤 **賣家**：<@{l.get('賣家ID')}>")
     lines.append(f"🕒 **掛賣時間**：{when_text(l.get('掛賣時間'), to_ts(l.get('掛賣時間')))}")
     lines.append(f"📌 **狀態**：{(GIFT_STATUS_TEXT if trade == '贈送' else STATUS_TEXT).get(status, status)}")
+    exp = expires_at(l)
+    if status in ACTIVE and exp is not None:
+        lines.append(f"⏳ **到期時間**：{when_text(fmt_time(exp), int(exp.timestamp()))}")
     if status == "已售出":
         lines.append("")
         lines.append(f"🙋 **{'收到的人' if trade == '贈送' else '買家'}**：<@{l.get('買家ID')}>")
@@ -260,10 +292,11 @@ class ListingModal(discord.ui.Modal):
             await interaction.followup.send("⚠️ 管理員還沒設定交易區論壇（/setmarket）。", ephemeral=True)
             return
         listing = {
-            "掛賣時間": now_str(), "物品名稱": self.name_input.value.strip(), "分類": self.category,
+            "掛賣時間": fmt_time(now_tw()), "物品名稱": self.name_input.value.strip(), "分類": self.category,
             "大類": self.group, "交易方式": self.trade, "開價": price or "", "想換": wants,
             "備註": self.note_input.value.strip(), "賣家": interaction.user.display_name,
             "賣家ID": str(interaction.user.id), "狀態": "出售中", "有興趣的人": "", "待確認": "",
+            "到期時間": fmt_time(now_tw() + timedelta(days=LISTING_DAYS)), "已提醒": "",
         }
         file = None
         if att is not None:
@@ -778,7 +811,7 @@ class ConfirmDealButton(_DealMixin, discord.ui.DynamicItem[discord.ui.Button],
             if l is None:
                 return
             l = await asyncio.to_thread(bot.store.market_update, self.post_id, {
-                "狀態": "已售出", "成交時間": now_str(), "買家": pending["buyer"], "買家ID": pending["buyer_id"],
+                "狀態": "已售出", "成交時間": fmt_time(now_tw()), "買家": pending["buyer"], "買家ID": pending["buyer_id"],
                 "成交方式": pending["method"], "成交價": pending["price"], "換得物品": pending["item"], "待確認": "",
             })
         await interaction.message.edit(content=f"{interaction.message.content}\n\n✅ **{interaction.user.display_name} 已確認成交**",
@@ -817,6 +850,101 @@ class RejectDealButton(_DealMixin, discord.ui.DynamicItem[discord.ui.Button],
         audit.audit("交易區：買家表示成交有誤", who=interaction.user.display_name, detail=l["物品名稱"])
 
 
+# ---------------- 到期提醒的按鈕：續期、讓它下架 ----------------
+
+async def take_down(bot, post_id: int, reason: str = "") -> Optional[dict]:
+    """把商品下架並鎖定貼文；已經結束的回傳 None。reason 有的話先在貼文裡說明原因（鎖定前）。"""
+    async with bot.store.lock:
+        l = await asyncio.to_thread(bot.store.market_get, post_id)
+        if l is None or l.get("狀態") not in ACTIVE:
+            return None
+        l = await asyncio.to_thread(bot.store.market_update, post_id, {"狀態": "已下架", "待確認": ""})
+    if reason:
+        thread = await get_thread(bot, post_id)
+        await thread.send(reason, allowed_mentions=discord.AllowedMentions(users=[discord.Object(int(l["賣家ID"]))]))
+    await refresh_post(bot, l)
+    return l
+
+
+class _SellerOnlyMixin:
+    """續期／讓它下架：只有賣家跟管理員能按。共用的檢查寫成混入（DynamicItem 不能有共用的父類別）。"""
+
+    async def _load(self, interaction: discord.Interaction):
+        l = await asyncio.to_thread(interaction.client.store.market_get, self.post_id)
+        if l is None:
+            await reply_error(interaction, "找不到這件商品的資料。")
+            return None
+        if not can_manage(interaction, l):
+            await reply_error(interaction, "只有賣家可以操作這個按鈕。")
+            return None
+        if l.get("狀態") not in ACTIVE:
+            await reply_error(interaction, "這件商品已經結束了，想繼續賣的話請重新掛賣一次。")
+            return None
+        return l
+
+
+class RenewButton(_SellerOnlyMixin, discord.ui.DynamicItem[discord.ui.Button], template=r"mkt:rn:(?P<pid>[0-9]+)"):
+    def __init__(self, post_id: int):
+        super().__init__(discord.ui.Button(label=f"續期 {LISTING_DAYS} 天", emoji="🔄", style=discord.ButtonStyle.success,
+                                           custom_id=f"mkt:rn:{post_id}"))
+        self.post_id = post_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["pid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await guarded(interaction, self._run(interaction), "續期")
+
+    async def _run(self, interaction: discord.Interaction):
+        bot = interaction.client
+        if await self._load(interaction) is None:
+            return
+        new_exp = now_tw() + timedelta(days=LISTING_DAYS)
+        async with bot.store.lock:
+            l = await asyncio.to_thread(bot.store.market_update, self.post_id, {"到期時間": fmt_time(new_exp), "已提醒": ""})
+        await interaction.message.edit(
+            content=f"{interaction.message.content}\n\n🔄 **已續期**，新的到期時間：{fmt_time(new_exp)[:16]}",
+            view=None, allowed_mentions=NONE_MENTIONS)
+        await refresh_post(bot, l)
+        audit.audit("交易區：續期", who=interaction.user.display_name, detail=f"{l['物品名稱']}｜到 {fmt_time(new_exp)}")
+
+
+class ExpireNowButton(_SellerOnlyMixin, discord.ui.DynamicItem[discord.ui.Button], template=r"mkt:ex:(?P<pid>[0-9]+)"):
+    def __init__(self, post_id: int):
+        super().__init__(discord.ui.Button(label="讓它下架", emoji="🗑️", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"mkt:ex:{post_id}"))
+        self.post_id = post_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["pid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await guarded(interaction, self._run(interaction), "讓它下架")
+
+    async def _run(self, interaction: discord.Interaction):
+        if await self._load(interaction) is None:
+            return
+        await interaction.message.edit(content=f"{interaction.message.content}\n\n🗑️ **賣家選擇下架**",
+                                       view=None, allowed_mentions=NONE_MENTIONS)
+        l = await take_down(interaction.client, self.post_id)
+        if l:
+            audit.audit("交易區：到期前自己下架", who=interaction.user.display_name, detail=l["物品名稱"])
+
+
+async def recent_human_activity(thread, since: datetime) -> bool:
+    """貼文裡從 since 之後，有沒有人（不是機器人）回覆過。機器人自己的訊息（例如到期提醒）不算。"""
+    async for m in thread.history(limit=50):
+        if m.created_at < since:
+            break
+        if not getattr(m.author, "bot", False):
+            return True
+    return False
+
+
 # ---------------- 指令 ----------------
 
 class Market(commands.Cog):
@@ -827,11 +955,73 @@ class Market(commands.Cog):
 
     async def cog_load(self):
         self.bot.add_view(MarketPanelView(self.bot))
-        self.bot.add_dynamic_items(InterestButton, ManageButton, ConfirmDealButton, RejectDealButton)
+        self.bot.add_dynamic_items(InterestButton, ManageButton, ConfirmDealButton, RejectDealButton,
+                                   RenewButton, ExpireNowButton)
+        self.expiry_loop.start()
         try:
             self.forum_id = await asyncio.to_thread(self.store.load_market_forum)
         except Exception as e:
             print(f"⚠️ 讀取交易區論壇設定失敗：{e}", flush=True)
+
+    async def cog_unload(self):
+        self.expiry_loop.cancel()
+
+    @tasks.loop(hours=1)
+    async def expiry_loop(self):
+        try:
+            await self.check_expiry()
+        except Exception as e:
+            audit.error("交易區：檢查到期商品失敗", e)
+
+    @expiry_loop.before_loop
+    async def _wait_ready(self):
+        await self.bot.wait_until_ready()
+
+    async def check_expiry(self, now: Optional[datetime] = None) -> dict:
+        """
+        掛賣中的商品：到期前 5 天提醒賣家（附續期／讓它下架按鈕），到期了就自動下架並通知賣家。
+        到期時如果貼文裡最近 7 天還有人回覆（不是機器人），代表還在談，先不下架，下次檢查再看。
+        """
+        now = now or now_tw()
+        _, _, rows = await asyncio.to_thread(self.store._market_rows)
+        done = {"提醒": [], "下架": [], "還在談先保留": []}
+        for l in rows:
+            if l.get("狀態") not in ACTIVE:
+                continue
+            exp = expires_at(l)
+            if exp is None:
+                continue
+            pid = int(l["貼文ID"])
+            try:
+                if now >= exp:
+                    thread = await get_thread(self.bot, pid)
+                    if await recent_human_activity(thread, now - timedelta(days=ACTIVE_GRACE_DAYS)):
+                        done["還在談先保留"].append(l["物品名稱"])
+                        continue
+                    took = await take_down(self.bot, pid, reason=(
+                        f"⏰ <@{l['賣家ID']}> 你的「{l['物品名稱']}」已經掛賣超過 {LISTING_DAYS} 天，系統自動下架了。\n"
+                        f"想繼續賣的話，可以到交易櫃檯重新掛賣一次。"))
+                    if took:
+                        done["下架"].append(l["物品名稱"])
+                        audit.audit("交易區：到期自動下架", who="系統", detail=l["物品名稱"])
+                elif now >= exp - timedelta(days=REMIND_DAYS_BEFORE) and not l.get("已提醒"):
+                    thread = await get_thread(self.bot, pid)
+                    view = discord.ui.View(timeout=None)
+                    view.add_item(RenewButton(pid))
+                    view.add_item(ExpireNowButton(pid))
+                    left = max(1, (exp - now).days + (1 if (exp - now).seconds else 0))
+                    if getattr(thread, "archived", False):
+                        await thread.edit(archived=False)
+                    await thread.send(
+                        f"⏰ <@{l['賣家ID']}> 你的「{l['物品名稱']}」再 {left} 天（{fmt_time(exp)[:16]}）就會自動下架。\n"
+                        f"如果還想繼續賣，按「續期」從今天重新算 {LISTING_DAYS} 天。",
+                        view=view, allowed_mentions=discord.AllowedMentions(users=[discord.Object(int(l["賣家ID"]))]))
+                    async with self.store.lock:
+                        await asyncio.to_thread(self.store.market_update, pid, {"已提醒": fmt_time(now)})
+                    done["提醒"].append(l["物品名稱"])
+            except Exception as e:
+                audit.error(f"交易區：處理到期商品「{l.get('物品名稱')}」失敗", e)
+        return done
 
     async def get_forum(self):
         if self.forum_id is None:
