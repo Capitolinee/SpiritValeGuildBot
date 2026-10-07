@@ -1508,6 +1508,75 @@ class SheetsStore:
             ws.update("A1:B1", [["頻道/討論串ID", "允許指令(逗號分隔)"]], value_input_option="USER_ENTERED")
             return ws
 
+    # ---------- 揪團 ----------
+    # 「揪團」分頁只放進行中的揪團（招募中、已開打），一場一列，內容是 JSON；結束、關閉、取消就刪掉，
+    # 不留永久記錄（每一場的資訊留在揪團看板頻道的卡片上）。存在試算表是為了重新部署後接得回來。
+    # 一律用 RAW 寫入，ID 不會被改壞。
+    PARTY_SERVER_DEFAULTS = ["東南亞", "亞洲", "大洋洲", "歐洲", "美洲"]
+
+    def _party_sheet(self):
+        try:
+            return self.ws("揪團")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="揪團", rows=200, cols=3)
+            ws.update("A1:C1", [["揪團ID", "狀態", "資料（機器人自動維護，請不要手動修改）"]], value_input_option="RAW")
+            return ws
+
+    def party_load_all(self) -> list:
+        out = []
+        for row in self._party_sheet().get_all_values()[1:]:
+            row = row + ["", "", ""]
+            if row[0].strip() and row[2].strip():
+                try:
+                    out.append(json.loads(row[2]))
+                except ValueError:
+                    continue
+        return out
+
+    def party_save(self, party: dict):
+        ws = self._party_sheet()
+        ids = ws.col_values(1)
+        row = [party["id"], party.get("status", ""), json.dumps(party, ensure_ascii=False)]
+        for i, v in enumerate(ids[1:], start=2):
+            if v.strip() == party["id"]:
+                ws.update(f"A{i}:C{i}", [row], value_input_option="RAW")
+                return
+        n = len(ids) + 1
+        if ws.row_count < n:
+            ws.add_rows(50)
+        ws.update(f"A{n}:C{n}", [row], value_input_option="RAW")
+
+    def party_delete(self, party_id: str):
+        ws = self._party_sheet()
+        for i, v in enumerate(ws.col_values(1)[1:], start=2):
+            if v.strip() == party_id:
+                ws.delete_rows(i)
+                return
+
+    def get_party_servers(self) -> list:
+        """揪團的伺服器選單，放在「揪團伺服器」分頁，一行一個，之後要加減直接改試算表。"""
+        try:
+            ws = self.ws("揪團伺服器")
+        except gspread.WorksheetNotFound:
+            ws = self._ss().add_worksheet(title="揪團伺服器", rows=50, cols=1)
+            ws.update("A1", [["伺服器（揪團時的下拉選單）"]] + [[x] for x in self.PARTY_SERVER_DEFAULTS],
+                      value_input_option="RAW")
+        return [v.strip() for v in ws.col_values(1)[1:] if v.strip()]
+
+    def save_party_channels(self, board_id, notify_id):
+        value = json.dumps({"board": str(board_id), "notify": str(notify_id)})
+        self._state_sheet().update("A5:B5", [["揪團頻道", value]], value_input_option="RAW")
+
+    def load_party_channels(self):
+        raw = (self._state_sheet().get("B5") or [[""]])[0]
+        raw = raw[0].strip() if raw else ""
+        try:
+            d = json.loads(raw) if raw else {}
+        except ValueError:
+            d = {}
+        return (int(d["board"]) if str(d.get("board", "")).isdigit() else None,
+                int(d["notify"]) if str(d.get("notify", "")).isdigit() else None)
+
     # ---------- 交易區（成員自己掛賣、以物易物） ----------
     # 「交易區」分頁：一件商品一列，同時也是成交記錄（狀態＝已售出的那些列）。
     # 這張表一律用 RAW 寫入：內容原封不動當文字存，ID 不會被改壞、有人在備註打公式也不會被執行。

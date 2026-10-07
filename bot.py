@@ -85,6 +85,7 @@ EXTENSIONS = [
     "cogs.roles",
     "cogs.inventory",
     "cogs.market",
+    "cogs.party",
     "cogs.owner",
     "cogs.help",
 ]
