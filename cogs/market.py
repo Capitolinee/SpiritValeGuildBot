@@ -240,7 +240,7 @@ async def refresh_post(bot, l: dict):
     await starter.edit(embed=listing_embed(l), view=None if ended else card_view(int(l["貼文ID"]), l.get("交易方式")))
     forum = thread.parent or await bot.get_cog("Market").get_forum()
     await thread.edit(name=listing_title(l), applied_tags=tags_for(forum, l),
-                      **({"archived": True, "locked": True} if ended else {}))
+                      **({"archived": True, "locked": True} if ended else {"locked": False}))
 
 
 # ---------------- 掛賣：選大類、細分類、交易方式 → 填內容 ----------------
@@ -380,6 +380,64 @@ class SellWizardView(discord.ui.View):
 
 # ---------------- 交易區公告（文字頻道裡的常駐按鈕） ----------------
 
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "")).casefold()
+
+
+def price_report(rows: list, keyword: str) -> str:
+    """用關鍵字找物品名稱或細分類，整理成交記錄（用錢成交的才算統計）跟目前在賣的。"""
+    key = _norm(keyword)
+    hits = [r for r in rows if key and (key in _norm(r.get("物品名稱")) or key == _norm(r.get("分類")))]
+    sold = sorted([r for r in hits if r.get("狀態") == "已售出"], key=lambda r: r.get("成交時間", ""), reverse=True)
+    selling = [r for r in hits if r.get("狀態") in ACTIVE]
+    if not sold and not selling:
+        return f"📈 找不到「{keyword}」的成交記錄或在賣的商品。可以試試只打一部分，例如「死靈」。"
+    lines = [f"**📈 「{keyword}」的行情**"]
+    money = [int(r["成交價"]) for r in sold if r.get("成交方式") == "金錢" and str(r.get("成交價", "")).isdigit()]
+    if money:
+        lines.append(f"\n💰 **用錢成交：{len(money)} 筆**\n平均 {fmt_price(sum(money) // len(money))}｜"
+                     f"最低 {fmt_price(min(money))}｜最高 {fmt_price(max(money))}")
+    else:
+        lines.append("\n💰 還沒有用錢成交的記錄")
+    if sold:
+        lines.append("\n**最近的成交：**")
+        for r in sold[:10]:
+            date = (r.get("成交時間") or "")[5:10].replace("/", "/")
+            method = r.get("成交方式")
+            if method == "金錢":
+                deal = f"💰 {fmt_price(r.get('成交價'))}" + (f"（開價 {fmt_price(r['開價'])}）" if r.get("開價") else "")
+            elif method == "贈送":
+                deal = "🎁 送出"
+            else:
+                deal = f"🔄 換到 {r.get('換得物品')}" + (f"＋補 {fmt_price(r['成交價'])}" if r.get("成交價") else "")
+            lines.append(f"・{date}　{r.get('物品名稱')}　{deal}")
+        if len(sold) > 10:
+            lines.append(f"…還有 {len(sold) - 10} 筆更早的")
+    if selling:
+        lines.append("\n**目前在賣：**")
+        for r in selling[:8]:
+            ask = f"開價 {fmt_price(r['開價'])}" if r.get("開價") else ("免費贈送" if r.get("交易方式") == "贈送" else "可交換")
+            lines.append(f"・{r.get('物品名稱')}　{ask}　{r.get('貼文連結', '')}")
+    return "\n".join(lines)[:1900]
+
+
+class PriceSearchModal(discord.ui.Modal):
+    def __init__(self, bot):
+        super().__init__(title="查行情")
+        self.bot = bot
+        self.keyword = discord.ui.TextInput(placeholder="例如：死靈、屠龍刀、弓", max_length=40)
+        self.add_item(discord.ui.Label(text="物品名稱（打一部分就可以）", component=self.keyword))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await asyncio.to_thread(self.bot.store.market_all)
+        await interaction.followup.send(price_report(rows, self.keyword.value.strip()), ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        audit.error("交易區：查行情發生錯誤", error, who=interaction.user.display_name)
+        await reply_error(interaction, f"❌ 查詢失敗：{error}")
+
+
 class MarketPanelView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
@@ -410,6 +468,10 @@ class MarketPanelView(discord.ui.View):
         if ended:
             lines += ["", "**最近結束的**"] + [f"・{r['狀態']}　{r['物品名稱']}　{r.get('貼文連結', '')}" for r in reversed(ended)]
         await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+
+    @discord.ui.button(label="查行情", emoji="📈", style=discord.ButtonStyle.secondary, custom_id="mkt:panel:price")
+    async def price(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PriceSearchModal(self.bot))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         audit.error("交易區公告按鈕發生錯誤", error, who=interaction.user.display_name)
@@ -616,17 +678,103 @@ async def send_deal_confirmation(bot, interaction: discord.Interaction, post_id:
     await interaction.followup.send(f"✅ 已經請 {buyer.display_name} 在貼文裡確認，他按下確認才算完成。", ephemeral=True)
 
 
+def deal_summary(l: dict) -> str:
+    parts = [f"對象 <@{l.get('買家ID')}>", METHOD_TEXT.get(l.get("成交方式"), l.get("成交方式") or "")]
+    if l.get("成交價"):
+        parts.append(f"金額 {fmt_price(l['成交價'])}")
+    if l.get("換得物品"):
+        parts.append(f"換得 {l['換得物品']}")
+    return "，".join(p for p in parts if p)
+
+
+async def post_admin_note(bot, post_id: int, text: str):
+    """在已鎖定、收起來的貼文裡公開留一則說明（先打開，refresh_post 會再依狀態鎖回去）。"""
+    thread = await get_thread(bot, post_id)
+    # 先明確打開、解鎖再留言，不依賴「有管理權限的機器人能不能在鎖定的貼文發言」這種細節；
+    # 留完言之後 refresh_post 會依照狀態再鎖回去
+    if getattr(thread, "archived", False) or getattr(thread, "locked", False):
+        await thread.edit(archived=False, locked=False)
+    await thread.send(text, allowed_mentions=NONE_MENTIONS)
+
+
+async def apply_deal_fix(bot, interaction: discord.Interaction, post_id: int, buyer, method: str, price="", item=""):
+    """管理員修正已成交的內容：直接寫入，並在貼文裡公開說明改了什麼（原本 → 現在）。"""
+    async with bot.store.lock:
+        before = await asyncio.to_thread(bot.store.market_get, post_id)
+        if before is None or before.get("狀態") != "已售出":
+            await interaction.followup.send("只有已成交的商品可以修正。", ephemeral=True)
+            return
+        old = deal_summary(before)
+        l = await asyncio.to_thread(bot.store.market_update, post_id, {
+            "買家": buyer.display_name, "買家ID": str(buyer.id), "成交方式": method, "成交價": price, "換得物品": item})
+    await post_admin_note(bot, post_id, f"🛠️ 管理員 {interaction.user.display_name} 修正了成交內容：\n"
+                                        f"原本：{old}\n現在：{deal_summary(l)}")
+    await refresh_post(bot, l)
+    audit.audit("交易區：管理員修正成交", who=interaction.user.display_name,
+                detail=f"{l['物品名稱']}｜原本 {old}｜現在 {deal_summary(l)}")
+    await interaction.followup.send("✅ 已經修正成交內容，並在貼文裡留下說明。", ephemeral=True)
+
+
+async def cancel_deal(bot, interaction: discord.Interaction, post_id: int):
+    """管理員取消已成交的交易：清掉成交資料、重新上架（到期時間重新算 30 天），在貼文裡公開說明。"""
+    async with bot.store.lock:
+        before = await asyncio.to_thread(bot.store.market_get, post_id)
+        if before is None or before.get("狀態") != "已售出":
+            await interaction.followup.send("只有已成交的商品可以取消成交。", ephemeral=True)
+            return
+        old = deal_summary(before)
+        l = await asyncio.to_thread(bot.store.market_update, post_id, {
+            "狀態": "議價中" if interested_ids(before) else "出售中",
+            "成交時間": "", "買家": "", "買家ID": "", "成交方式": "", "成交價": "", "換得物品": "", "待確認": "",
+            "到期時間": fmt_time(now_tw() + timedelta(days=LISTING_DAYS)), "已提醒": ""})
+    await post_admin_note(bot, post_id, f"↩️ 管理員 {interaction.user.display_name} 取消了這筆成交（原本：{old}），"
+                                        f"商品重新上架，可以繼續交易。")
+    await refresh_post(bot, l)
+    audit.audit("交易區：管理員取消成交", who=interaction.user.display_name, detail=f"{l['物品名稱']}｜原本 {old}")
+    await interaction.followup.send("✅ 已經取消成交，商品重新上架，並在貼文裡留下說明。", ephemeral=True)
+
+
+class FixDealView(discord.ui.View):
+    """/fixdeal 的選單（只有管理員看得到）：修改成交內容、取消成交並重新上架。"""
+
+    def __init__(self, bot, l: dict):
+        super().__init__(timeout=600)
+        self.bot, self.l = bot, l
+
+    @discord.ui.button(label="修改成交內容", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            f"**✏️ 修正：{self.l['物品名稱']}**\n已經帶入原本的內容，只改要改的地方，再按下一步。",
+            view=DealSetupView(self.bot, self.l, fix=True), ephemeral=True)
+
+    @discord.ui.button(label="取消成交，重新上架", emoji="↩️", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=120)
+        confirm = discord.ui.Button(label="確定取消成交", style=discord.ButtonStyle.danger)
+
+        async def do_cancel(inter: discord.Interaction):
+            await inter.response.defer(ephemeral=True, thinking=True)
+            await guarded(inter, cancel_deal(self.bot, inter, int(self.l["貼文ID"])), "取消成交")
+        confirm.callback = do_cancel
+        view.add_item(confirm)
+        await interaction.response.send_message(
+            f"確定要取消「{self.l['物品名稱']}」的成交嗎？試算表的成交資料會清掉、商品重新上架，貼文裡會公開留下說明。",
+            view=view, ephemeral=True)
+
+
 class DealModal(discord.ui.Modal):
-    def __init__(self, bot, post_id: int, buyer: discord.abc.User, method: str):
-        super().__init__(title="成交內容")
-        self.bot, self.post_id, self.buyer, self.method = bot, post_id, buyer, method
+    def __init__(self, bot, post_id: int, buyer: discord.abc.User, method: str, fix: bool = False, current: dict = None):
+        super().__init__(title="修正成交內容" if fix else "成交內容")
+        self.bot, self.post_id, self.buyer, self.method, self.fix = bot, post_id, buyer, method, fix
+        current = current or {}
         self.price_input = self.item_input = None
         if method in ("金錢", "兩者都有"):
-            self.price_input = discord.ui.TextInput(placeholder="例如 4500000、450萬", max_length=20)
+            self.price_input = discord.ui.TextInput(placeholder="例如 4500000、450萬", max_length=20,
+                                                    default=current.get("成交價") or None)
             self.add_item(discord.ui.Label(text="成交價" if method == "金錢" else "補差價的金額", component=self.price_input))
         if method in ("交換", "兩者都有"):
             self.item_input = discord.ui.TextInput(style=discord.TextStyle.paragraph, max_length=200,
-                                                   placeholder="例如：精靈弓 +5")
+                                                   placeholder="例如：精靈弓 +5", default=current.get("換得物品") or None)
             self.add_item(discord.ui.Label(text="換到的物品", component=self.item_input))
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -638,7 +786,10 @@ class DealModal(discord.ui.Modal):
                 return
         item = self.item_input.value.strip() if self.item_input is not None else ""
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await send_deal_confirmation(self.bot, interaction, self.post_id, self.buyer, self.method, price, item)
+        if self.fix:
+            await apply_deal_fix(self.bot, interaction, self.post_id, self.buyer, self.method, price, item)
+        else:
+            await send_deal_confirmation(self.bot, interaction, self.post_id, self.buyer, self.method, price, item)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         audit.error("交易區：成交內容發生錯誤", error, who=interaction.user.display_name)
@@ -648,9 +799,9 @@ class DealModal(discord.ui.Modal):
 class DealSetupView(discord.ui.View):
     """賣家選成交對象（Discord 內建的成員選擇器，可以搜尋）跟成交方式。"""
 
-    def __init__(self, bot, l: dict):
+    def __init__(self, bot, l: dict, fix: bool = False):
         super().__init__(timeout=600)
-        self.bot, self.l, self.buyer = bot, l, None
+        self.bot, self.l, self.buyer, self.fix = bot, l, None, fix
         trade = l.get("交易方式")
         methods = {"出售": ["金錢"], "交換": ["交換", "兩者都有"], "都可以": ["金錢", "交換", "兩者都有"],
                    "贈送": ["贈送"]}.get(trade, ["金錢"])
@@ -666,6 +817,17 @@ class DealSetupView(discord.ui.View):
                                                    options=[discord.SelectOption(label=labels[m], value=m) for m in methods])
             self.method_select.callback = self.on_method
             self.add_item(self.method_select)
+        if fix:   # 修正模式：帶入原本的買家、成交方式，只改要改的地方就好
+            self.next_step.label = "套用修正" if trade == "贈送" else "下一步：修正成交內容"
+            if l.get("買家ID", "").isdigit():
+                bid = int(l["買家ID"])
+                self.buyer = type("Buyer", (), {"id": bid, "display_name": l.get("買家", ""), "mention": f"<@{bid}>"})()
+                self.user_select.default_values = [discord.Object(bid)]
+            if l.get("成交方式") in methods:
+                self.method = l["成交方式"]
+                if len(methods) > 1:
+                    for o in self.method_select.options:
+                        o.default = (o.value == self.method)
 
     async def on_user(self, interaction: discord.Interaction):
         user = self.user_select.values[0]
@@ -686,11 +848,15 @@ class DealSetupView(discord.ui.View):
         if self.buyer is None or self.method is None:
             await interaction.response.send_message("⚠️ 成交對象跟成交方式都要先選好。", ephemeral=True)
             return
-        if self.method == "贈送":   # 贈品沒有金額跟換得的物品，直接請對方確認
+        if self.method == "贈送":   # 贈品沒有金額跟換得的物品，直接請對方確認（修正模式則直接套用）
             await interaction.response.defer(ephemeral=True, thinking=True)
-            await send_deal_confirmation(self.bot, interaction, int(self.l["貼文ID"]), self.buyer, "贈送")
+            if self.fix:
+                await apply_deal_fix(self.bot, interaction, int(self.l["貼文ID"]), self.buyer, "贈送")
+            else:
+                await send_deal_confirmation(self.bot, interaction, int(self.l["貼文ID"]), self.buyer, "贈送")
             return
-        await interaction.response.send_modal(DealModal(self.bot, int(self.l["貼文ID"]), self.buyer, self.method))
+        await interaction.response.send_modal(DealModal(self.bot, int(self.l["貼文ID"]), self.buyer, self.method,
+                                                        fix=self.fix, current=self.l if self.fix else None))
 
 
 class ManageView(discord.ui.View):
@@ -1071,6 +1237,24 @@ class Market(commands.Cog):
         msg += "\n接下來用 `/postmarket` 在文字頻道發一則「我要賣東西」的公告。"
         await ctx.send(msg, ephemeral=True)
 
+    @commands.hybrid_command(name="fixdeal", description="管理員：修正已成交的交易（在那篇貼文裡打）")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
+    async def fix_deal(self, ctx):
+        """在已成交的商品貼文裡打：修改成交內容，或取消成交並重新上架。都會在貼文裡公開留下說明。"""
+        await ctx.defer(ephemeral=True)
+        l = await asyncio.to_thread(self.store.market_get, ctx.channel.id)
+        if l is None:
+            await ctx.send("⚠️ 請在交易區**那篇已成交的商品貼文裡**打這個指令。", ephemeral=True)
+            return
+        if l.get("狀態") != "已售出":
+            await ctx.send(f"這件商品目前是「{l.get('狀態')}」，不是已成交的。還在賣的商品請用貼文裡的「⚙️ 賣家管理」。",
+                           ephemeral=True)
+            return
+        await ctx.send(f"**🛠️ 修正成交：{l['物品名稱']}**\n目前：{deal_summary(l)}",
+                       view=FixDealView(self.bot, l), ephemeral=True, allowed_mentions=NONE_MENTIONS)
+
     @commands.hybrid_command(name="postmarket", description="管理員：發一則交易區公告（我要賣東西、我的商品）")
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
@@ -1086,7 +1270,8 @@ class Market(commands.Cog):
             title="🛒 交易區",
             description=(f"想賣東西或以物易物，按「📸 我要賣東西」，商品會刊登在 <#{self.forum_id}>。\n\n"
                          "📸 **我要賣東西**：選分類、交易方式，填價格或想換什麼，可以附上圖片\n"
-                         "📦 **我的商品**：看自己掛賣中的商品\n\n"
+                         "📦 **我的商品**：看自己掛賣中的商品\n"
+                         "📈 **查行情**：查某件物品以前賣多少、現在有誰在賣\n\n"
                          "想買的話，到論壇裡找到商品，按「🙋 我有興趣」，就會通知賣家。"),
             color=discord.Color.green())
         try:
