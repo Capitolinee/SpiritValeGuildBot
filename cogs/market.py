@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -214,6 +215,14 @@ async def get_thread(bot, post_id: int):
     return ch if ch is not None else await bot.fetch_channel(int(post_id))
 
 
+def tag_key(name: str) -> str:
+    """
+    比對論壇標籤名稱用：只留文字跟數字（中文算文字），表情符號、符號、空白都忽略。
+    這樣標籤名稱被改成「🟢 出售中」「出售中🟢」也一樣認得出是「出售中」。
+    """
+    return "".join(ch for ch in (name or "") if unicodedata.category(ch)[0] in "LN").casefold()
+
+
 def tags_for(forum, l: dict) -> list:
     names = [l.get("大類")]
     trade = l.get("交易方式")
@@ -226,8 +235,14 @@ def tags_for(forum, l: dict) -> list:
     status = l.get("狀態")
     if status in STATUS_TAGS:
         names.append(status)
-    by_name = {t.name: t for t in forum.available_tags}
-    return [by_name[n] for n in names if n in by_name][:5]
+    by_key = {tag_key(t.name): t for t in forum.available_tags}
+    return [by_key[tag_key(n)] for n in names if tag_key(n) in by_key][:5]
+
+
+def tags_missing(forum, names) -> list:
+    """論壇裡找不到的標籤名稱（一樣忽略表情符號和空白）。"""
+    have = {tag_key(t.name) for t in forum.available_tags}
+    return [n for n in names if tag_key(n) not in have]
 
 
 async def refresh_post(bot, l: dict):
@@ -239,7 +254,8 @@ async def refresh_post(bot, l: dict):
     starter = await thread.fetch_message(int(l["貼文ID"]))
     await starter.edit(embed=listing_embed(l), view=None if ended else card_view(int(l["貼文ID"]), l.get("交易方式")))
     forum = thread.parent or await bot.get_cog("Market").get_forum()
-    await thread.edit(name=listing_title(l), applied_tags=tags_for(forum, l),
+    tags = tags_for(forum, l)
+    await thread.edit(name=listing_title(l), **({"applied_tags": tags} if tags else {}),
                       **({"archived": True, "locked": True} if ended else {"locked": False}))
 
 
@@ -298,11 +314,20 @@ class ListingModal(discord.ui.Modal):
             "賣家ID": str(interaction.user.id), "狀態": "出售中", "有興趣的人": "", "待確認": "",
             "到期時間": fmt_time(now_tw() + timedelta(days=LISTING_DAYS)), "已提醒": "",
         }
+        tags = tags_for(forum, listing)
+        if not tags and getattr(forum.flags, "require_tag", False):
+            missing = tags_missing(forum, [self.group, "出售中"])
+            audit.audit("交易區：掛賣失敗，論壇標籤對不上", who=interaction.user.display_name,
+                        detail=f"找不到的標籤：{'、'.join(missing)}")
+            await interaction.followup.send(
+                "⚠️ 交易區論壇的標籤對不上，沒辦法開貼文（論壇要求貼文一定要有標籤）。\n"
+                "請通知管理員打 `/setmarket` 檢查標籤，你填的內容沒有送出，等修好之後再掛一次。", ephemeral=True)
+            return
         file = None
         if att is not None:
             file, listing["圖片檔名"] = await image_file(att)
         created = await forum.create_thread(
-            name=listing_title(listing), embed=listing_embed(listing), applied_tags=tags_for(forum, listing),
+            name=listing_title(listing), embed=listing_embed(listing), applied_tags=tags,
             auto_archive_duration=10080, allowed_mentions=NONE_MENTIONS, **({"file": file} if file else {}))
         thread, starter = created.thread, created.message
         await starter.edit(view=card_view(thread.id, self.trade))
@@ -1210,7 +1235,7 @@ class Market(commands.Cog):
         groups = list(dict.fromkeys(g for _, g in categories))
         wanted = list(STATUS_TAGS) + list(TRADE_TAGS) + groups
         have = {t.name for t in forum.available_tags}
-        missing_tags = [n for n in wanted if n not in have]
+        missing_tags = tags_missing(forum, wanted)
         created, problems = [], []
         if missing_tags:
             if len(have) + len(missing_tags) > 20:
