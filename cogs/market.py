@@ -30,7 +30,10 @@ from discord.ext import commands, tasks
 import audit
 from helpers import TW_TZ
 
-STATUS_TAGS = ("出售中", "議價中", "已售出")
+# 內部狀態（試算表裡記的）→ 論壇標籤名稱。標籤用不分買賣的名稱，出售、收購、贈送都說得通；
+# 第二個是舊名稱：論壇還沒改名之前照舊用舊的，改名之後自動用新的，舊貼文不用處理（改名不會換掉標籤本身）。
+STATUS_TAG_NAMES = {"出售中": ("進行中", "出售中"), "議價中": ("洽談中", "議價中"), "已售出": ("已成交", "已售出")}
+STATUS_TAGS = tuple(v[0] for v in STATUS_TAG_NAMES.values())     # /setmarket 要建立的（新名稱）
 TRADE_TAGS = ("出售", "交換", "贈送", "收購", "長期")
 TRADE_TYPES = ("出售", "交換", "都可以", "贈送", "長期供貨", "收購", "長期收購")
 LONG = ("長期供貨", "長期收購")    # 成交後不鎖定，每筆成交扣數量，數量歸零自動暫停
@@ -264,9 +267,10 @@ def tags_for(forum, l: dict) -> list:
     if trade in LONG:
         names.append("長期")
     status = l.get("狀態")
-    if status in STATUS_TAGS:
-        names.append(status)
     by_key = {tag_key(t.name): t for t in forum.available_tags}
+    if status in STATUS_TAG_NAMES:
+        # 新名稱優先，論壇還沒改名的話用舊名稱
+        names.append(next((n for n in STATUS_TAG_NAMES[status] if tag_key(n) in by_key), STATUS_TAG_NAMES[status][0]))
     return [by_key[tag_key(n)] for n in names if tag_key(n) in by_key][:5]
 
 
@@ -363,7 +367,7 @@ class ListingModal(discord.ui.Modal):
         }
         tags = tags_for(forum, listing)
         if not tags and getattr(forum.flags, "require_tag", False):
-            missing = tags_missing(forum, [self.group, "出售中"])
+            missing = tags_missing(forum, [self.group, STATUS_TAGS[0]])
             audit.audit("交易區：掛賣失敗，論壇標籤對不上", who=interaction.user.display_name,
                         detail=f"找不到的標籤：{'、'.join(missing)}")
             await interaction.followup.send(
@@ -1528,9 +1532,10 @@ class Market(commands.Cog):
         missing_perms = [label for p, label in need.items() if not getattr(perms, p, False)]
         categories = await asyncio.to_thread(self.store.get_market_categories)
         groups = list(dict.fromkeys(g for _, g in categories))
-        wanted = list(STATUS_TAGS) + list(TRADE_TAGS) + groups
         have = {t.name for t in forum.available_tags}
-        missing_tags = tags_missing(forum, wanted)
+        # 狀態標籤：新名稱或舊名稱有一個在就算有（還沒改名的論壇不會被多建一組重複的）
+        missing_tags = [new for new, old in STATUS_TAG_NAMES.values() if tags_missing(forum, [new]) and tags_missing(forum, [old])]
+        missing_tags += tags_missing(forum, list(TRADE_TAGS) + groups)
         created, problems = [], []
         if missing_tags:
             if len(have) + len(missing_tags) > 20:
