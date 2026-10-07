@@ -1598,6 +1598,11 @@ class SheetsStore:
             ws.batch_update(data, value_input_option="RAW")
         return r
 
+    def market_all(self) -> list:
+        """交易區所有商品（含已成交、已下架），查行情用。"""
+        _, _, rows = self._market_rows()
+        return rows
+
     def market_by_seller(self, seller_id: str) -> list:
         _, _, rows = self._market_rows()
         return [r for r in rows if r.get("賣家ID", "").strip() == str(seller_id)]
