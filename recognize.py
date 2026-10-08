@@ -55,9 +55,11 @@ def classify(e: Exception) -> dict:
       stop：要不要直接停下來、不換模型
     """
     text = str(e)
-    code = getattr(e, "code", None)
-    if not isinstance(code, int):
-        m = re.match(r"\s*(\d{3})\b", text)
+    # 狀態碼的位置看是哪一種錯誤：圖片辨識用的 interactions 功能放在 status_code（訊息是「Error code: 429 - …」），
+    # 其他功能放在 code。兩種都認，最後才從訊息文字裡找。
+    code = next((c for c in (getattr(e, "status_code", None), getattr(e, "code", None)) if isinstance(c, int)), None)
+    if code is None:
+        m = re.search(r"(?:Error code:\s*|^\s*)(\d{3})\b", text)
         code = int(m.group(1)) if m else None
     if code == 429:
         if re.search(r"PerDay|per ?day", text, re.I):
@@ -66,6 +68,10 @@ def classify(e: Exception) -> dict:
             m = re.search(r"retry in ([\d.]+)s", text)
             wait = max(60, int(float(m.group(1))) + 1) if m else 60
             return {"kind": "minute", "reason": "一分鐘內用太多次", "cooldown": wait, "stop": False}
+        if re.search(r"exceeded a quota|quota", text, re.I):
+            # Google 只說「專案超過額度」，沒說是每分鐘還是每天：連續遇到就逐步拉長暫停時間（見 Recognizer._cool）
+            return {"kind": "quota", "reason": "專案超過額度（Google 沒說是每分鐘還是每天）", "cooldown": "escalate",
+                    "stop": False}
         return {"kind": "capacity", "reason": "Google 免費容量暫時不足", "cooldown": 300, "stop": False}
     if code == 503:
         return {"kind": "busy", "reason": "Google 伺服器忙碌（503）", "cooldown": 120, "stop": False}
@@ -91,14 +97,21 @@ class RecognitionFailed(Exception):
 
 
 class Recognizer:
+    ESCALATE = [5 * 60, 15 * 60, 60 * 60]    # 連續遇到「超過額度」：5 分鐘、15 分鐘、1 小時，再來就暫停到重置
+
     def __init__(self, client, models: list):
         self.client, self.models = client, list(models)
         self.skip_until = {}          # 模型 → 這個時間之前先跳過（UTC）
+        self.strikes = {}             # 模型 → 連續遇到「超過額度」幾次（成功一次就歸零）
 
     def _available(self, now: datetime) -> list:
         return [m for m in self.models if self.skip_until.get(m, now) <= now]
 
     def _cool(self, model: str, cooldown, now: datetime):
+        if cooldown == "escalate":
+            n = self.strikes.get(model, 0)
+            self.strikes[model] = n + 1
+            cooldown = self.ESCALATE[n] if n < len(self.ESCALATE) else "day"
         if cooldown == "day":
             self.skip_until[model] = next_quota_reset(now)
         elif cooldown:
@@ -120,7 +133,9 @@ class Recognizer:
                 result = await asyncio.to_thread(
                     self.client.interactions.create, model=model,
                     input=[{"type": "text", "text": prompt}, {"type": "image", "data": image_b64, "mime_type": mime_type}])
-                return parse(result.output_text), model, tried
+                parsed = parse(result.output_text)
+                self.strikes.pop(model, None)
+                return parsed, model, tried
             except json.JSONDecodeError:
                 tried.append((model, "回傳的內容格式不正確"))
                 kinds.append("format")
@@ -147,6 +162,10 @@ def _user_message(kinds: list, skip_until: dict, now: datetime) -> str:
     fallback = "\n這段時間可以改用 `/startsession` 手動開場、`/item` 手動記錄寶物。"
     if kinds and all(k == "day" for k in kinds):
         return f"⛔ 今天的圖片辨識額度都用完了，台灣時間 **{tw_hm(next_quota_reset(now))}** 重置。" + fallback
+    if kinds and all(k in ("day", "quota", "minute") for k in kinds):
+        times = [t for t in skip_until.values() if t > now]
+        when = f"，大約台灣時間 **{tw_hm(min(times))}** 之後再試" if times else "，請晚點再試"
+        return f"⏳ 圖片辨識的額度暫時用完了{when}。最晚台灣時間 {tw_hm(next_quota_reset(now))} 會重置。" + fallback
     if kinds and all(k in ("busy", "capacity", "server", "minute", "network") for k in kinds):
         times = [t for t in skip_until.values() if t > now]
         when = f"，大約台灣時間 **{tw_hm(min(times))}** 之後再上傳" if times else "，請過幾分鐘再上傳"
