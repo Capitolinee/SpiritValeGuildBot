@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from helpers import resolve_display_name, now_str
+from recognize import RecognitionFailed
 from store import SHEET_SESSIONS
 import audit
 
@@ -929,18 +930,11 @@ class Sessions(commands.Cog):
                 mime_type = mimetypes.guess_type(attachment.filename)[0] or "image/png"
                 image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-                # Gemini 讀一張圖要好幾秒，一定要丟到背景執行緒去跑。
-                # 直接呼叫的話整支機器人會凍住，這幾秒內別人打的 / 指令來不及在 3 秒內回應 Discord，
-                # 就會被當成「沒有反應」直接丟掉（! 指令只是晚點處理，所以看起來正常）。
-                result = await asyncio.to_thread(
-                    self.bot.gemini.interactions.create,
-                    model=self.bot.gemini_model,
-                    input=[
-                        {"type": "text", "text": PROMPT},
-                        {"type": "image", "data": image_b64, "mime_type": mime_type},
-                    ],
-                )
-                parsed = parse_gemini_json(result.output_text)
+                # 依序試主要模型、備用模型（在 recognize.py）；Gemini 讀一張圖要好幾秒，裡面是丟到背景執行緒跑的，
+                # 不會讓整支機器人凍住。用了哪個模型、前面哪些失敗，只寫進記錄，不顯示給使用者。
+                parsed, model, failed = await self.bot.recognizer.recognize(image_b64, mime_type, PROMPT, parse_gemini_json)
+                audit.audit("圖片辨識", who=message.author.display_name,
+                            detail=f"模型 {model}" + (f"｜先失敗：{'｜'.join(f'{m}：{r}' for m, r in failed)}" if failed else ""))
                 kind = parsed.get("type", "unknown")
                 # Gemini 有時候會把多個項目塞進同一個字串（例如 ["屠龍刀,精靈弓"]），
                 # 這裡再拆一次，不完全信任它有正確分項。
@@ -960,23 +954,12 @@ class Sessions(commands.Cog):
                 sent = await message.channel.send(view.preview_text(), view=view)
                 view.message = sent
 
-            except json.JSONDecodeError:
-                await message.channel.send("❌ Gemini 回傳的內容不是有效的 JSON，辨識失敗。")
+            except RecognitionFailed as rf:
+                audit.audit("圖片辨識失敗", who=message.author.display_name, detail=rf.log_detail)
+                await message.channel.send(rf.user_message)
             except Exception as e:
-                error_text = str(e)
-                if "429" in error_text or "quota" in error_text.lower() or "RESOURCE_EXHAUSTED" in error_text:
-                    match = re.search(r"retry in ([\d.]+)s", error_text)
-                    if match:
-                        seconds = int(float(match.group(1))) + 1
-                        await message.channel.send(
-                            f"⏳ 圖片辨識額度暫時用完了，請大約 **{seconds} 秒**後再重新上傳一次圖片。"
-                        )
-                    else:
-                        await message.channel.send(
-                            "⏳ 圖片辨識額度暫時用完了（免費額度是每分鐘限制次數），請稍等約 1 分鐘後再重新上傳一次圖片。"
-                        )
-                else:
-                    await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
+                audit.error("圖片辨識發生錯誤", e, who=message.author.display_name)
+                await message.channel.send(f"❌ 辨識失敗，錯誤原因：{e}")
 
     @commands.hybrid_command(name="startsession", description="手動輸入隊員名單開場（不用截圖）")
     @app_commands.describe(names="隊員角色名稱，用逗號或空白分隔，例如 熊爺,柒柒,Open匠")
