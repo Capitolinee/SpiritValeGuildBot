@@ -5,3 +5,4 @@ google-genai>=2.25.0,<3    # 圖片辨識用的 interactions 功能需要比較�
 gspread>=6.2.1,<7          # 讀寫 Google 試算表；程式有沿用 gspread 6 版的內部寫法
 google-auth>=2.59.0,<3
 requests>=2.33.1,<3        # gspread 連線用
+tzdata>=2024.1            # 算 Gemini 每日額度的重置時間（太平洋時間）；有些部署環境沒有內建時區資料

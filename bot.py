@@ -42,7 +42,11 @@ missing = [k for k, v in required_env.items() if not v]
 if missing:
     raise ValueError(f"⚠️ 缺少環境變數：{', '.join(missing)}")
 
-GEMINI_MODEL = "gemini-3.6-flash"
+# 圖片辨識用的模型，依序嘗試，主要的失敗了自動換下一個（每個模型的免費額度分開算）。
+# 想換順序或換模型：在 Railway 設定環境變數 GEMINI_MODELS，例如 gemini-3.6-flash,gemini-3.5-flash-lite
+from recognize import Recognizer, models_from_env
+GEMINI_MODELS = models_from_env(os.getenv("GEMINI_MODELS"))
+GEMINI_MODEL = GEMINI_MODELS[0]
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -72,6 +76,9 @@ async def slash_only_except_recording(ctx):
 bot.store = SheetsStore()
 bot.gemini = genai.Client(api_key=GEMINI_API_KEY)
 bot.gemini_model = GEMINI_MODEL
+bot.gemini_models = GEMINI_MODELS
+bot.recognizer = Recognizer(bot.gemini, GEMINI_MODELS)
+print(f"🔍 圖片辨識模型順序：{' → '.join(GEMINI_MODELS)}", flush=True)
 
 # 目前這一場（全域唯一，不分頻道）；記憶體狀態，重啟會遺失，見 sessions cog 說明
 bot.active_session = None  # {"id": str, "members": [{"discord_id":..,"name":..,"display_name":..}], "next_item_index": int}
